@@ -1,7 +1,7 @@
 ISO_NAME = frostbyte.iso
 KERNEL = kernel.elf
-CC = gcc
-CFLAGS = -m32 -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Iinclude
+CC = i386-elf-gcc
+CFLAGS = -m32 -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Iinclude -fno-stack-protector
 ASM = nasm
 ASMFLAGS = -f elf32
 LDFLAGS = -m32 -nostdlib -T linker.ld
