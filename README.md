@@ -7,6 +7,8 @@ FrostByte is the sucessor of CakeOS.
 - gcc
 - nasm
 - qemu-system-i386 (optional, but if you want `make run` to work)
+
+
 **recommended to build on Linux (I personally use Mint so i'm not too sure about other distros**
 ## Command
 ```bash
