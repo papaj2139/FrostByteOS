@@ -16,173 +16,205 @@ static inline uint8_t inb(uint16_t port){
     return ret;
 }
 
-void vga_set_mode_13h(){
-    static const uint8_t g_320x200x256[] = {
-        0x63,
-        0x03,0x01,0x0F,0x00,0x0E,
-        0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,
-        0x00,0x41,0x00,0x00,0x00,0x00,
-        0x9C,0x0E,0x8F,0x28,0x40,0x96,0xB9,0xA3,0xFF,
-        0x00,0x00,0x00,0x00,0x00,
-        0x00,0x00,0x00,0x00,0x00,
-        0x00,0x00,0x00,0x00,0x00,
-        0x00
-    };
+#define CURSOR_W 16
+#define CURSOR_H 24
 
-    uint8_t* registers = (uint8_t*)g_320x200x256;
-    outb(0x3C2, *registers++);
-    for (uint8_t i = 0; i < 5; i++) outb(0x3C4, i), outb(0x3C5, *registers++);
-    outb(0x3C4, 0x00); outb(0x3C5, 0x03);
-    for (uint8_t i = 0; i < 25; i++) outb(0x3D4, i), outb(0x3D5, *registers++);
-    for (uint8_t i = 0; i < 9; i++) outb(0x3C0, i), outb(0x3C0, *registers++);
-    outb(0x3C0, 0x20);
-}
-
-#define CURSOR_WIDTH  16
-#define CURSOR_HEIGHT 24
-
-static const uint8_t cursor_bitmap[CURSOR_HEIGHT][CURSOR_WIDTH] = {
-    {15,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {15,15,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {15,0,15,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    {15,0,0,15,0,0,0,0,0,0,0,0,0,0,0,0},
-    {15,0,0,0,15,0,0,0,0,0,0,0,0,0,0,0},
-    {15,0,0,0,0,15,0,0,0,0,0,0,0,0,0,0},
-    {15,0,0,0,0,0,15,0,0,0,0,0,0,0,0,0},
-    {15,0,0,0,0,0,0,15,0,0,0,0,0,0,0,0},
-    {15,0,0,0,0,0,0,0,15,0,0,0,0,0,0,0},
-    {15,0,0,0,0,0,0,0,0,15,0,0,0,0,0,0},
-    {15,0,0,0,0,0,0,0,0,0,15,0,0,0,0,0},
-    {15,0,0,0,0,0,0,0,0,0,0,15,0,0,0,0},
-    {15,0,0,0,0,0,0,0,0,0,0,0,15,0,0,0},
-    {15,0,0,0,0,0,0,0,0,0,0,0,0,15,0,0},
-    {15,0,0,0,0,0,0,0,0,0,0,0,0,0,15,0},
-    {15,0,0,0,0,0,0,0,0,0,0,0,0,0,0,15},
-    {15,0,0,0,0,0,0,0,0,0,0,0,0,0,15,0},
-    {15,0,0,0,0,0,0,0,0,0,0,0,0,15,0,0},
-    {15,0,0,0,0,0,0,0,0,0,0,0,15,0,0,0},
-    {15,0,0,0,0,0,0,0,0,0,0,15,0,0,0,0},
-    {15,0,0,0,0,0,0,0,0,0,15,0,0,0,0,0},
-    {15,0,0,0,0,0,0,0,0,15,0,0,0,0,0,0},
-    {15,0,0,0,0,0,0,0,15,0,0,0,0,0,0,0},
-    {15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15}
+static const uint8_t cursor_bitmap[CURSOR_H][CURSOR_W] = {
+    {15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15,15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15,15,15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15,15,15,15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15,15,15,15,15, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15,15,15,15,15,15, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15,15,15,15,15,15,15, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,0,0,0,0,0,0,0,0, 0, 0, 0, 0, 0, 0},
+    {15,0,0,0,0,0,0,0,0,0,0, 0, 0, 0, 0, 0},
+    { 0, 0, 0,0,0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0,0,0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0,0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 };
 
-static uint8_t cursor_bg[CURSOR_HEIGHT][CURSOR_WIDTH];
+static uint8_t cursor_bg[CURSOR_H][CURSOR_W];
 
-static int mouse_x = VGA_WIDTH / 2;
-static int mouse_y = VGA_HEIGHT / 2;
+static inline void putpx(int x, int y, uint8_t color) {
+    if ((unsigned)x < VGA_WIDTH && (unsigned)y < VGA_HEIGHT) {
+        VGA[y * VGA_WIDTH + x] = color;
+    }
+}
+static inline uint8_t getpx(int x, int y) {
+    if ((unsigned)x < VGA_WIDTH && (unsigned)y < VGA_HEIGHT) {
+        return VGA[y * VGA_WIDTH + x];
+    }
+    return 0;
+}
 
-void save_cursor_bg(int x, int y) {
-    for (int j = 0; j < CURSOR_HEIGHT; j++) {
-        for (int i = 0; i < CURSOR_WIDTH; i++) {
-            if (x + i < VGA_WIDTH && y + j < VGA_HEIGHT)
-                cursor_bg[j][i] = VGA[(y + j) * VGA_WIDTH + (x + i)];
+static void save_cursor_bg(int x, int y) {
+    for (int r = 0; r < CURSOR_H; r++) {
+        for (int c = 0; c < CURSOR_W; c++) {
+            int px = x + c, py = y + r;
+            cursor_bg[r][c] = getpx(px, py);
+        }
+    }
+}
+static void restore_cursor_bg(int x, int y) {
+    for (int r = 0; r < CURSOR_H; r++) {
+        for (int c = 0; c < CURSOR_W; c++) {
+            int px = x + c, py = y + r;
+            uint8_t col = cursor_bg[r][c];
+            putpx(px, py, col);
         }
     }
 }
 
-void restore_cursor_bg(int x, int y) {
-    for (int j = 0; j < CURSOR_HEIGHT; j++) {
-        for (int i = 0; i < CURSOR_WIDTH; i++) {
-            if (x + i < VGA_WIDTH && y + j < VGA_HEIGHT)
-                VGA[(y + j) * VGA_WIDTH + (x + i)] = cursor_bg[j][i];
-        }
-    }
-}
-
-void draw_cursor(int x, int y) {
-    for (int j = 0; j < CURSOR_HEIGHT; j++) {
-        for (int i = 0; i < CURSOR_WIDTH; i++) {
-            if (x + i < VGA_WIDTH && y + j < VGA_HEIGHT) {
-                uint8_t color = cursor_bitmap[j][i];
-                if (color != 0) VGA[(y + j) * VGA_WIDTH + (x + i)] = color;
+static void draw_cursor(int x, int y) {
+    for (int r = 0; r < CURSOR_H; r++) {
+        for (int c = 0; c < CURSOR_W; c++) {
+            uint8_t col = cursor_bitmap[r][c];
+            if (col != 0) {
+                putpx(x + c, y + r, col);
             }
         }
     }
 }
 
-void mouse_wait(uint8_t type) {
+static void vga_set_mode_13h(void) {
+    outb(0x3C2, 0x63);
+    outb(0x3C4, 0x00); outb(0x3C5, 0x03);
+    outb(0x3C4, 0x01); outb(0x3C5, 0x01);
+    outb(0x3C4, 0x02); outb(0x3C5, 0x0F);
+    outb(0x3C4, 0x03); outb(0x3C5, 0x00);
+    outb(0x3C4, 0x04); outb(0x3C5, 0x0E);
+
+    static const uint8_t crtc[] = {
+        0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,
+        0x00,0x41,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x9C,0x0E,0x8F,0x28,0x40,0x96,0xB9,0xA3,
+        0xFF
+    };
+    outb(0x3D4, 0x11);
+    outb(0x3D5, inb(0x3D5) & ~0x80);
+
+    for (uint8_t i = 0; i < sizeof(crtc); i++) {
+        outb(0x3D4, i);
+        outb(0x3D5, crtc[i]);
+    }
+
+    outb(0x3CE, 0x00); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x01); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x02); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x03); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x05); outb(0x3CF, 0x40);
+    outb(0x3CE, 0x06); outb(0x3CF, 0x05);
+    outb(0x3CE, 0x07); outb(0x3CF, 0x0F);
+    outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
+
+    for (uint8_t i = 0; i < 16; i++) {
+        inb(0x3DA);
+        outb(0x3C0, i);
+        outb(0x3C0, i);
+    }
+    inb(0x3DA);
+    outb(0x3C0, 0x10); outb(0x3C0, 0x41);
+    inb(0x3DA);
+    outb(0x3C0, 0x11); outb(0x3C0, 0x00);
+    inb(0x3DA);
+    outb(0x3C0, 0x12); outb(0x3C0, 0x0F);
+    inb(0x3DA);
+    outb(0x3C0, 0x13); outb(0x3C0, 0x00);
+    inb(0x3DA);
+    outb(0x3C0, 0x14); outb(0x3C0, 0x00);
+    inb(0x3DA);
+    outb(0x3C0, 0x20);
+}
+
+static void mouse_wait(uint8_t type) {
     uint32_t timeout = 100000;
     if (type == 0) {
-        while (timeout--) {
-            if (inb(0x64) & 1) return;
-        }
+        while (timeout--) { if (inb(0x64) & 1) return; }
     } else {
-        while (timeout--) {
-            if (!(inb(0x64) & 2)) return;
-        }
+        while (timeout--) { if ((inb(0x64) & 2) == 0) return; }
     }
 }
-
-void mouse_write(uint8_t data) {
-    mouse_wait(1);
-    outb(0x64, 0xD4);
-    mouse_wait(1);
-    outb(0x60, data);
+static void mouse_write(uint8_t val) {
+    mouse_wait(1); outb(0x64, 0xD4);
+    mouse_wait(1); outb(0x60, val);
 }
-
-uint8_t mouse_read() {
+static uint8_t mouse_read(void) {
     mouse_wait(0);
     return inb(0x60);
 }
+static void mouse_init(void) {
+    mouse_wait(1); outb(0x64, 0xA8);
+    mouse_wait(1); outb(0x64, 0x20);
+    mouse_wait(0); uint8_t status = inb(0x60) | 2;
+    mouse_wait(1); outb(0x64, 0x60);
+    mouse_wait(1); outb(0x60, status);
 
-void mouse_install() {
-    outb(0x64, 0xA8);
-    mouse_wait(1);
-    outb(0x64, 0x20);
-    mouse_wait(0);
-    uint8_t status = (inb(0x60) | 2);
-    mouse_wait(1);
-    outb(0x64, 0x60);
-    mouse_wait(1);
-    outb(0x60, status);
-    mouse_write(0xF6);
-    mouse_read();
-    mouse_write(0xF4);
-    mouse_read();
+    mouse_write(0xF6); (void)mouse_read();
+    mouse_write(0xF4); (void)mouse_read();
+}
+static uint8_t mcycle = 0;
+static int8_t  mbytes[3];
+
+static int poll_mouse_packet(void) {
+    if (!(inb(0x64) & 1)) return 0;
+    uint8_t status = inb(0x64);
+    if (!(status & 0x20)) { (void)inb(0x60); return 0; }
+    uint8_t data = inb(0x60);
+
+    if (mcycle == 0 && !(data & 0x08)) return 0;
+    mbytes[mcycle++] = (int8_t)data;
+    if (mcycle == 3) { mcycle = 0; return 1; }
+    return 0;
 }
 
-int8_t mouse_dx = 0, mouse_dy = 0;
-uint8_t mouse_cycle = 0;
-uint8_t mouse_byte[3];
+void cmd_desktop(const char *args) {
+    (void)args;
 
-void poll_mouse_packet() {
-    if (inb(0x64) & 1) {
-        int8_t data = inb(0x60);
-        if (mouse_cycle == 0 && !(data & 0x08)) return;
-        mouse_byte[mouse_cycle++] = data;
-        if (mouse_cycle == 3) {
-            mouse_dx = mouse_byte[1];
-            mouse_dy = -mouse_byte[2];
-            mouse_cycle = 0;
-        }
-    }
-}
-
-void cmd_desktop(const char* args) {
     vga_set_mode_13h();
+
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) VGA[i] = 3;
-    mouse_x = VGA_WIDTH / 2;
-    mouse_y = VGA_HEIGHT / 2;
-    save_cursor_bg(mouse_x, mouse_y);
-    draw_cursor(mouse_x, mouse_y);
-    mouse_install();
+
+    int cx = VGA_WIDTH / 2 - CURSOR_W / 2;
+    int cy = VGA_HEIGHT / 2 - CURSOR_H / 2;
+
+    save_cursor_bg(cx, cy);
+    draw_cursor(cx, cy);
+
+    mouse_init();
 
     for (;;) {
-        poll_mouse_packet();
-        if (mouse_dx || mouse_dy) {
-            restore_cursor_bg(mouse_x, mouse_y);
-            mouse_x += mouse_dx;
-            mouse_y += mouse_dy;
-            if (mouse_x < 0) mouse_x = 0;
-            if (mouse_y < 0) mouse_y = 0;
-            if (mouse_x > VGA_WIDTH - CURSOR_WIDTH) mouse_x = VGA_WIDTH - CURSOR_WIDTH;
-            if (mouse_y > VGA_HEIGHT - CURSOR_HEIGHT) mouse_y = VGA_HEIGHT - CURSOR_HEIGHT;
-            save_cursor_bg(mouse_x, mouse_y);
-            draw_cursor(mouse_x, mouse_y);
-            mouse_dx = 0;
-            mouse_dy = 0;
+        int old_cx = cx;
+        int old_cy = cy;
+
+        if (poll_mouse_packet()) {
+            old_cx = cx;
+            old_cy = cy;
+
+            cx += mbytes[1];
+            cy -= mbytes[2];
+
+            if (cx < 0) cx = 0;
+            if (cy < 0) cy = 0;
+            if (cx > VGA_WIDTH  - CURSOR_W) cx = VGA_WIDTH  - CURSOR_W;
+            if (cy > VGA_HEIGHT - CURSOR_H) cy = VGA_HEIGHT - CURSOR_H;
+
+            restore_cursor_bg(old_cx, old_cy);
+
+            save_cursor_bg(cx, cy);
+            draw_cursor(cx, cy);
         }
     }
 }
