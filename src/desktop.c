@@ -160,7 +160,7 @@ void poll_mouse_packet() {
     }
 }
 
-void cmd_desktop() {
+void cmd_desktop(const char* args) {
     vga_set_mode_13h();
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) VGA[i] = 3;
     mouse_x = VGA_WIDTH / 2;
