@@ -2,10 +2,6 @@
 #include "stdint.h"
 #include "desktop.h"
 
-typedef unsigned char  uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int   uint32_t;
-
 static inline void outw(uint16_t port, uint16_t val) {
     __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
 }
