@@ -2,6 +2,15 @@
 #include "stdint.h"
 #include "desktop.h"
 
+/* TODO LIST: 
+    - Fix memory showing as 0mb
+    - Add MiniFS (see minifs.c)
+    - Add more commands
+    - Add the Watchdog timer
+
+    Any community contribuations are welcomed and thanked upon :)
+*/
+
 static inline void outw(uint16_t port, uint16_t val) {
     __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
 }
