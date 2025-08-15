@@ -4,7 +4,7 @@ FrostByte is the sucessor of CakeOS.
 
 # Building
 ## Dependencies
-- gcc
+- i386-elf-gcc
 - nasm
 - qemu-system-i386 (optional, but if you want `make run` to work)
 
