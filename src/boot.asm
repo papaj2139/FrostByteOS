@@ -9,11 +9,10 @@ global start
 extern kmain
 
 start:
-    mov eax, [esp + 4]
-    mov ebx, [esp + 8]
     push ebx
     push eax
     call kmain
+    add esp, 8
 
     cli
     hlt

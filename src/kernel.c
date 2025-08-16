@@ -136,24 +136,6 @@ void kpanic(void) {
 
 static uint32_t total_memory_mb = 0;
 
-static void detect_memory(void) {
-    struct e820_entry {
-        uint64_t base;
-        uint64_t length;
-        uint32_t type;
-    } __attribute__((packed));
-
-    struct e820_entry *entries = (struct e820_entry *)0x8000; 
-    uint32_t num_entries = *((uint32_t*)0x7E00);
-
-    total_memory_mb = 0;
-    for (uint32_t i = 0; i < num_entries; i++) {
-        if (entries[i].type == 1) { 
-            total_memory_mb += (uint32_t)(entries[i].length / (1024 * 1024));
-        }
-    }
-}
-
 void cmd_meminfo(const char *args) {
     char buf[64];
     ksnprintf(buf, sizeof(buf), "Total memory: %u MB\n", total_memory_mb);
@@ -655,9 +637,11 @@ void kmain(uint32_t magic, uint32_t addr) {
 
         for (volatile unsigned long long i = 0; i < 10000000ULL; ++i);
     }
-
-    detect_memory();
     kclear();
+    char buf[64];
+    ksnprintf(buf, sizeof(buf), "addr=%08x, mem_lower:%u mem_higher:%u\n", total_memory_mb);
+    print(buf, 0x0F);
+    print("\n", 0x0F);
     commandLoop();
     kpanic(); //if we return here
 }
