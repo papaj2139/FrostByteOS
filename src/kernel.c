@@ -566,6 +566,16 @@ typedef void (*cmd_fn)(const char *args);
 
 struct cmd_entry { const char *name; cmd_fn fn; };
 
+void cmd_console_colour(const char* args){
+    kclear();
+    unsigned int j = 0;
+    while(j < 80 * 25){
+        VID_MEM[j * 2] = ' ';
+        VID_MEM[j * 2 + 1] = (unsigned char)args;
+        j++;
+    }
+}
+
 static struct cmd_entry commands[] = {
     {"shutdown", cmd_shutdown},
     {"minifs", cmd_minifs},
@@ -574,8 +584,11 @@ static struct cmd_entry commands[] = {
     {"echo", cmd_echo},
     {"meminfo", cmd_meminfo},
     {"desktop", cmd_desktop},
+    {"colour", cmd_console_colour},
     {0, 0}
 };
+
+
 
 void commandLoop(void){
     char buffer[128];
@@ -619,7 +632,7 @@ void kmain(uint32_t magic, uint32_t addr) {
     uint32_t mem_lower = *((uint32_t*)(addr + 4));
     uint32_t mem_upper = *((uint32_t*)(addr + 8));
 
-    total_memory_mb = (mem_lower + mem_upper) / 1024;
+    total_memory_mb = (mem_lower + mem_upper) / 1024 + 1;
 
     kclear();
     print("Loading into FrostByte...", 0x0F);
@@ -627,8 +640,7 @@ void kmain(uint32_t magic, uint32_t addr) {
     const char spinner_chars[] = { '|', '/', '-', '\\' };
     int spin_index = 0;
 
-    // Spinner always appears right after the loading text
-    int spinner_x = 25; // "Loading into FrostByte..." is 24 chars
+    int spinner_x = 25;
     int spinner_y = 0;
 
     for(int i = 0; i < 10; i++) {
