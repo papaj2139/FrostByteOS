@@ -3,7 +3,10 @@
 #include "desktop.h"
 
 /* TODO LIST: 
-    - Fix memory showing as 0mb
+    * = done
+    - = needs doing
+
+    * Fix memory showing as 0mb
     - Add MiniFS (see minifs.c)
     - Add more commands
     - Add the Watchdog timer
