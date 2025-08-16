@@ -3,10 +3,7 @@
 #include "desktop.h"
 
 /* TODO LIST: 
-    * = done
-    - = needs doing
-
-    * Fix memory showing as 0mb
+    - Fix memory showing as 0mb
     - Add MiniFS (see minifs.c)
     - Add more commands
     - Add the Watchdog timer
@@ -641,11 +638,6 @@ void kmain(uint32_t magic, uint32_t addr) {
         for (volatile unsigned long long i = 0; i < 10000000ULL; ++i);
     }
     kclear();
-    char buf[64];
-    ksnprintf(buf, sizeof(buf), "addr=%08x, mem_lower:%u mem_higher:%u\n", total_memory_mb);
-    print(buf, 0x0F);
-    print("\n", 0x0F);
     commandLoop();
     kpanic(); //if we return here
 }
-
