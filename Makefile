@@ -28,10 +28,13 @@ io.o: src/io.c
 font.o: src/font.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-keyboard.o: src/keyboard.c
+keyboard.o: src/drivers/keyboard.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o
+serial.o: src/drivers/serial.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o serial.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)
@@ -42,6 +45,9 @@ iso: $(KERNEL)
 
 run: iso
 	qemu-system-i386 -cdrom $(ISO_NAME)
+
+run-serial: iso
+	qemu-system-i386 -cdrom $(ISO_NAME) -serial stdio
 
 clean:
 	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir

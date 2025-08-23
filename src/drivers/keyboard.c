@@ -1,6 +1,6 @@
 #include "keyboard.h"
+#include "../io.h"
 #include <stdint.h>
-#include "io.h"
 
 int shift_pressed = 0;
 

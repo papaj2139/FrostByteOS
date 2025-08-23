@@ -3,7 +3,7 @@
 #include "string.h"
 #include "io.h"
 #include "font.h"
-#include "keyboard.h"
+#include "drivers/keyboard.h"
 
 #define VGA_WIDTH   320
 #define VGA_HEIGHT  200

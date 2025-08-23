@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include "desktop.h"
 #include "io.h"
+#include "drivers/serial.h"
 
 /* TODO LIST: 
     * = done
@@ -630,7 +631,7 @@ void cmd_console_colour(const char* args){
     unsigned int j = 0;
     while(j < 80 * 25){
         VID_MEM[j * 2] = ' ';
-        VID_MEM[j * 2 + 1] = (unsigned char)(uintptr_t)args; // Proper cast to avoid size warning
+        VID_MEM[j * 2 + 1] = (unsigned char)(uintptr_t)args; //proper cast to avoid size warning
         j++;
     }
 }
@@ -686,6 +687,8 @@ void kmain(uint32_t magic, uint32_t addr) {
 
     kclear();
     print("Loading into FrostByte...", 0x0F);
+    serial_init();
+    DEBUG_PRINT("FrostByteOS kernel started");
 
     const char spinner_chars[] = { '|', '/', '-', '\\' };
     int spin_index = 0;
