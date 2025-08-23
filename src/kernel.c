@@ -139,7 +139,31 @@ static void cmd_help(const char *args) {
     print("  minifs      - Show filesystem status\n", 0x0F);
     print("  shutdown    - Shutdown the system\n", 0x0F);
     print("  induce(kernel.panic()) - Trigger kernel panic\n", 0x0F);
+    print("  iceedit     - Opens the ICE (Interprated Compiled Executable) Editor", 0x0F);
     print("\n", 0x0F);
+}
+
+void cmd_iceedit(const char *args){
+    (void*)args;
+
+    DEBUG_PRINT("ICE Editor Started");
+
+    kclear();
+
+    print("ICE Editor\n", 0x0F);
+    print("F5 - Execute\n", 0x0F);
+    print("\n\n", 0x0F);
+    char buffer[128];
+
+    for(;;){
+        input(buffer, sizeof(buffer));
+        size_t i = 0;
+        while(buffer[i] && buffer[i] == ' ') i++;
+        size_t start = i;
+        while(buffer[i] && buffer[i] != ' ') i++;
+        size_t cmdlen = i - start;
+        DEBUG_PRINTF("ice: ",buffer);
+    }
 }
 
 static struct cmd_entry commands[] = {
@@ -152,6 +176,7 @@ static struct cmd_entry commands[] = {
     {"minifs", cmd_minifs},
     {"shutdown", cmd_shutdown},
     {"induce(kernel.panic())", cmd_induce},
+    {"iceedit", cmd_iceedit},
     {0, 0}
 };
 
