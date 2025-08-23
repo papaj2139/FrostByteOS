@@ -1,14 +1,12 @@
-// dekstop.h
-#ifndef DEKSTOP_H
-#define DEKSTOP_H
+
+#ifndef DESKTOP_H
+#define DESKTOP_H
 
 #include <stdint.h>
 
-
-
-// Initializes and runs the "dekstop" mode.
-// Switches to VGA 320x200x256, draws background, mouse, etc.
-// Exits back to text mode on ESC.
+//initializes and runs the desktop mode
+//switches to VGA 320x200x256 draws backgrounds mouse etc
+//exits back to text mode on ESC key
 void cmd_desktop(const char *args);
 
-#endif // DEKSTOP_H
+#endif 
