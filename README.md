@@ -24,6 +24,11 @@ make run
 ```
 *note, this'll also rebuild it*
 
+if you'd like to use i386-elf-gcc
+```bash
+make CC=i386-elf-gcc
+```
+
 # Credits
 Special thanks to:
 
