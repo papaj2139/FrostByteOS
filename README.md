@@ -1,5 +1,5 @@
 # FrostByte
-FrostBte (sometimes refered to as "FrostByte OS" or "FBOS") is a hobbyist operating system made by [HarryDoesTech](https://yt.harrydoestech.com).
+FrostByte (sometimes refered to as "FrostByte OS" or "FBOS") is a hobbyist operating system made by [HarryDoesTech](https://yt.harrydoestech.com).
 FrostByte is the sucessor of CakeOS.
 ## Issues
 If you encunter any issues please open an issue ticket or email **frostbyte.operatingsystem@gmail.com**
@@ -23,3 +23,7 @@ if you want to run it in QEMU
 make run
 ```
 *note, this'll also rebuild it*
+
+# Credits
+Special thanks to:
+@papaj2139 for helping out refactor the code
