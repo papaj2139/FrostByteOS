@@ -6,7 +6,7 @@ If you encunter any issues please open an issue ticket or email **frostbyte.oper
 
 # Building
 ## Dependencies
-- i386-elf-gcc
+- i686-elf-gcc or i386-elf-gcc
 - nasm
 - qemu-system-i386 (optional, but if you want `make run` to work)
 
@@ -26,4 +26,5 @@ make run
 
 # Credits
 Special thanks to:
+
 @papaj2139 for helping out refactor the code
