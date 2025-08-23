@@ -1,42 +1,116 @@
 #include <stdint.h>
 #include "desktop.h"
+#include "string.h"
+#include "io.h"
+#include "font.h"
 
 #define VGA_WIDTH   320
 #define VGA_HEIGHT  200
 #define VGA_ADDRESS 0xA0000
 #define TASKBAR_HEIGHT 16
+#define MAX_CONTENT 32
+#define MAX_PROCESSES 16
+#define CURSOR_W 32
+#define CURSOR_H 64
 
 // Forward declaration for kernel shutdown function
 extern void kshutdown(void);
 
-static inline void outw(uint16_t port, uint16_t val) {
-    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
-}
-static inline void outb(uint16_t port, uint8_t val){
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-static inline uint8_t inb(uint16_t port){
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
+//structs and typedefs
+typedef enum { WC_LABEL, WC_RECT } win_content_type;
+typedef struct {
+    win_content_type type;
+    int x, y, w, h;
+    uint8_t color;
+    char text[64];
+} win_content_t;
 
-void strncpy(char* dest, const char* src, unsigned int n) {
-    unsigned int i = 0;
-    while (i < n && src[i] != '\0') {
-        dest[i] = src[i];
-        i++;
-    }
-    if (i < n) dest[i] = '\0';
-}
+typedef struct {
+    int x, y, w, h;
+    uint8_t border;
+    uint8_t fill;
+    uint8_t titlebar;
+    char title[32];
+    win_content_t content[MAX_CONTENT];
+    int content_count;
+    int active;
+    int process_id;
+} window_t;
 
-unsigned int strlen(const char* str) {
-    unsigned int len = 0;
-    while (str[len] != '\0') len++;
-    return len;
-}
+typedef enum {
+    PROC_WELCOME,
+    PROC_CALCULATOR,
+    PROC_NOTEPAD,
+    PROC_ABOUT
+} process_type_t;
 
+typedef struct {
+    int pid;
+    process_type_t type;
+    window_t window;
+    int active;
+} process_t;
+
+typedef struct {
+    char name[32];
+    void (*action)(void);
+} start_menu_item_t;
+
+//global variables
 static uint8_t* const VGA = (uint8_t*)VGA_ADDRESS;
+static process_t processes[MAX_PROCESSES];
+static int next_pid = 1;
+static int process_count = 0;
+static int start_menu_open = 0;
+static int start_button_width = 50;
+static int start_menu_item_count = 4;
+static uint8_t cursor_bg[CURSOR_H][CURSOR_W];
+static uint8_t mcycle = 0;
+static int8_t  mbytes[3];
+static int win_dragging = -1;
+static int drag_offset_x = 0, drag_offset_y = 0;
+
+//arrays
+static const uint8_t cursor_bitmap[CURSOR_H][CURSOR_W] = {
+    { 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8, 7, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15, 7, 8, 8, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15, 7, 8, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15, 8, 8, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15, 7, 8, 8, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15,15, 7, 8, 8, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15,15,15, 7, 8, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15,15,15, 7, 8, 8, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15,15,15,15, 7, 8, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15,15,15,15,15, 8, 0, 0, 0},
+    { 0, 0, 0, 8,15,15,15,15,15, 8, 8, 8, 8, 0, 0, 0},
+    { 0, 0, 0, 8,15,15, 7,15,15, 8, 8, 8, 8, 0, 0, 0},
+    { 0, 0, 0, 8,15,15, 8, 7,15, 7, 8, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8,15, 7, 8, 8,15, 7, 8, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 8, 7, 8, 8, 8,15,15, 8, 8, 0, 0, 0, 0},
+    { 0, 0, 0, 8, 8, 8, 0, 8, 7,15, 7, 8, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 8, 7,15, 7, 8, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0},
+};
+
+//function declarations
+static void action_calculator(void);
+static void action_notepad(void);
+static void action_about(void);
+static void action_shutdown(void);
+static void draw_close_button(window_t *win);
+
+static start_menu_item_t start_menu_items[] = {
+    {"Calculator", action_calculator},
+    {"Notepad", action_notepad},
+    {"About", action_about},
+    {"Shutdown", action_shutdown}
+};
 
 static inline void putpx(int x, int y, uint8_t color) {
     if ((unsigned)x < VGA_WIDTH && (unsigned)y < VGA_HEIGHT)
@@ -49,95 +123,6 @@ static inline uint8_t getpx(int x, int y) {
     return 0;
 }
 
-static const uint8_t font8x8[128][8] = {
-    [0 ... 31] = {0},
-    [32] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    [33] = {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
-    [34] = {0x36,0x36,0x24,0x00,0x00,0x00,0x00,0x00},
-    [35] = {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
-    [36] = {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00},
-    [37] = {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
-    [38] = {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
-    [39] = {0x06,0x06,0x0C,0x00,0x00,0x00,0x00,0x00},
-    [40] = {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00},
-    [41] = {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
-    [42] = {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00},
-    [43] = {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00},
-    [44] = {0x00,0x00,0x00,0x00,0x0C,0x0C,0x18,0x00},
-    [45] = {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00},
-    [46] = {0x00,0x00,0x00,0x00,0x0C,0x0C,0x00,0x00},
-    [47] = {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00},
-
-    [48] = {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00},
-    [49] = {0x0C,0x0E,0x0F,0x0C,0x0C,0x0C,0x3F,0x00},
-    [50] = {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00},
-    [51] = {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
-    [52] = {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00},
-    [53] = {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
-    [54] = {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00},
-    [55] = {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
-    [56] = {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00},
-    [57] = {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
-
-    [65] = {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},
-    [66] = {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00},
-    [67] = {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00},
-    [68] = {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00},
-    [69] = {0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00},
-    [70] = {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00},
-    [71] = {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00},
-    [72] = {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00},
-    [73] = {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
-    [74] = {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00},
-    [75] = {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00},
-    [76] = {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00},
-    [77] = {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00},
-    [78] = {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00},
-    [79] = {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00},
-    [80] = {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00},
-    [81] = {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00},
-    [82] = {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00},
-    [83] = {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00},
-    [84] = {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
-    [85] = {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00},
-    [86] = {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00},
-    [87] = {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
-    [88] = {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00},
-    [89] = {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00},
-    [90] = {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00},
-
-    [97]  = {0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00},
-    [98]  = {0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00},
-    [99]  = {0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00},
-    [100] = {0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00},
-    [101] = {0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00},
-    [102] = {0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00},
-    [103] = {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F},
-    [104] = {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00},
-    [105] = {0x0C,0x00,0x1C,0x0C,0x0C,0x0C,0x1E,0x00},
-    [106] = {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E},
-    [107] = {0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00},
-    [108] = {0x1C,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
-    [109] = {0x00,0x00,0x36,0x7F,0x7F,0x6B,0x63,0x00},
-    [110] = {0x00,0x00,0x3E,0x33,0x33,0x33,0x33,0x00},
-    [111] = {0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00},
-    [112] = {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F},
-    [113] = {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78},
-    [114] = {0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00},
-    [115] = {0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00},
-    [116] = {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00},
-    [117] = {0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00},
-    [118] = {0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00},
-    [119] = {0x00,0x00,0x63,0x6B,0x7F,0x36,0x36,0x00},
-    [120] = {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00},
-    [121] = {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F},
-    [122] = {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00},
-    [123] = {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00},
-    [124] = {0x0C,0x0C,0x0C,0x00,0x0C,0x0C,0x0C,0x00},
-    [125] = {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00},
-    [126] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00},
-    [127] = {0},
-};
 
 static void draw_char_small(int x, int y, char ch, uint8_t color) {
     if ((unsigned)ch >= 128) return;
@@ -183,36 +168,13 @@ static void draw_char(int x, int y, char ch, uint8_t color) {
     }
 }
 
+static void draw_string(int x, int y, const char *str, uint8_t color) __attribute__((unused));
 static void draw_string(int x, int y, const char *str, uint8_t color) {
     while (*str) {
         draw_char(x, y, *str++, color);
         x += 8;
     }
 }
-
-typedef enum { WC_LABEL, WC_RECT } win_content_type;
-typedef struct {
-    win_content_type type;
-    int x, y, w, h;
-    uint8_t color;
-    char text[64];
-} win_content_t;
-
-#define MAX_CONTENT 32
-typedef struct {
-    int x, y, w, h;
-    uint8_t border;
-    uint8_t fill;
-    uint8_t titlebar;
-    char title[32];
-    win_content_t content[MAX_CONTENT];
-    int content_count;
-    int active;
-    int process_id;
-} window_t;
-
-// Forward declaration after window_t is defined
-static void draw_close_button(window_t *win);
 
 static void window_add_label(window_t *win, int x, int y, const char *text, uint8_t color) {
     if (win->content_count >= MAX_CONTENT) return;
@@ -256,24 +218,6 @@ static void draw_window(window_t *win) {
 }
 
 // Process Manager
-#define MAX_PROCESSES 16
-typedef enum {
-    PROC_WELCOME,
-    PROC_CALCULATOR,
-    PROC_NOTEPAD,
-    PROC_ABOUT
-} process_type_t;
-
-typedef struct {
-    int pid;
-    process_type_t type;
-    window_t window;
-    int active;
-} process_t;
-
-static process_t processes[MAX_PROCESSES];
-static int next_pid = 1;
-static int process_count = 0;
 
 static int create_process(process_type_t type, int x, int y) {
     if (process_count >= MAX_PROCESSES) return -1;
@@ -373,38 +317,6 @@ static void draw_all_windows(void) {
     }
 }
 
-#define CURSOR_W 32
-#define CURSOR_H 64
-
-static const uint8_t cursor_bitmap[CURSOR_H][CURSOR_W] = {
-    { 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8, 7, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15, 7, 8, 8, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15, 7, 8, 0, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15, 8, 8, 0, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15, 7, 8, 8, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15,15, 7, 8, 8, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15,15,15, 7, 8, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15,15,15, 7, 8, 8, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15,15,15,15, 7, 8, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15,15,15,15,15, 8, 0, 0, 0},
-    { 0, 0, 0, 8,15,15,15,15,15, 8, 8, 8, 8, 0, 0, 0},
-    { 0, 0, 0, 8,15,15, 7,15,15, 8, 8, 8, 8, 0, 0, 0},
-    { 0, 0, 0, 8,15,15, 8, 7,15, 7, 8, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8,15, 7, 8, 8,15, 7, 8, 0, 0, 0, 0, 0},
-    { 0, 0, 0, 8, 7, 8, 8, 8,15,15, 8, 8, 0, 0, 0, 0},
-    { 0, 0, 0, 8, 8, 8, 0, 8, 7,15, 7, 8, 0, 0, 0, 0},
-    { 0, 0, 0, 0, 0, 0, 0, 8, 7,15, 7, 8, 0, 0, 0, 0},
-    { 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 0, 0, 0, 0},
-    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0},
-};
-
-static uint8_t cursor_bg[CURSOR_H][CURSOR_W];
-
 static inline void save_cursor_bg(int x, int y) {
     for (int r = 0; r < CURSOR_H; r++)
         for (int c = 0; c < CURSOR_W; c++)
@@ -424,15 +336,7 @@ static void draw_cursor(int x, int y) {
                 putpx(x+c, y+r, cursor_bitmap[r][c]);
 }
 
-// Start Menu variables
-static int start_menu_open = 0;
-static int start_button_width = 50;
-
-typedef struct {
-    char name[32];
-    void (*action)(void);
-} start_menu_item_t;
-
+// Start Menu functions
 static void action_calculator(void) {
     create_process(PROC_CALCULATOR, 80, 60);
 }
@@ -448,14 +352,6 @@ static void action_about(void) {
 static void action_shutdown(void) {
     kshutdown();
 }
-
-static start_menu_item_t start_menu_items[] = {
-    {"Calculator", action_calculator},
-    {"Notepad", action_notepad},
-    {"About", action_about},
-    {"Shutdown", action_shutdown}
-};
-static int start_menu_item_count = 4;
 
 static void draw_taskbar(void) {
     draw_rect(0, VGA_HEIGHT - TASKBAR_HEIGHT, VGA_WIDTH, TASKBAR_HEIGHT, 12);
@@ -620,8 +516,6 @@ static void mouse_init(void) {
     mouse_write(0xF6); (void)mouse_read();
     mouse_write(0xF4); (void)mouse_read();
 }
-static uint8_t mcycle = 0;
-static int8_t  mbytes[3];
 
 static int poll_mouse_packet(void) {
     if (!(inb(0x64) & 1)) return 0;
@@ -634,9 +528,6 @@ static int poll_mouse_packet(void) {
     if (mcycle == 3) { mcycle = 0; return 1; }
     return 0;
 }
-
-static int win_dragging = -1;
-static int drag_offset_x = 0, drag_offset_y = 0;
 
 static int mouse_over(int mx, int my, int x, int y, int w, int h) {
     return mx >= x && my >= y && mx < x + w && my < y + h;

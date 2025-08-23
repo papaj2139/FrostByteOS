@@ -1,6 +1,7 @@
 #include "string.h"
 #include <stdint.h>
 #include "desktop.h"
+#include "io.h"
 
 /* TODO LIST: 
     * = done
@@ -13,33 +14,145 @@
     Any community contribuations are welcomed and thanked upon :)
 */
 
-static inline void outw(uint16_t port, uint16_t val) {
-    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
-}
-static inline void outb(uint16_t port, uint8_t val){
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-static inline uint8_t inb(uint16_t port){
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
 
 #define VID_MEM ((unsigned char*)0xb8000)
 #define SCREEN_WIDTH 80
 #define SCREEN_HEIGHT 25
 #define WATCHDOG_TIMEOUT 500
+#define RSDP_SIG "RSD PTR "
+#define ACPI_SIG_FADT "FACP"
+#define ACPI_SIG_RSDT "RSDT"
+#define ACPI_SIG_XSDT "XSDT"
+#define SLP_EN (1 << 13)
+#define KEYBOARD_DATA_PORT 0x60
+#define KEYBOARD_STATUS_PORT 0x64
 
+//structs and typedefs
+typedef struct __attribute__((packed)) {
+    char signature[8];
+    uint8_t checksum;
+    char oemid[6];
+    uint8_t revision;
+    uint32_t rsdt_address;
+    uint32_t length;
+    uint64_t xsdt_address;
+    uint8_t extended_checksum;
+    uint8_t reserved[3];
+} rsdp_descriptor_t;
+
+typedef struct __attribute__((packed)) {
+    char signature[4];
+    uint32_t length;
+    uint8_t revision;
+    uint8_t checksum;
+    char oemid[6];
+    char oemtableid[8];
+    uint32_t oemrevision;
+    uint32_t creatorid;
+    uint32_t creatorrev;
+} acpi_table_header_t;
+
+typedef void (*cmd_fn)(const char *args);
+struct cmd_entry { const char *name; cmd_fn fn; };
+
+//global variables
+volatile int currentTick = 0;
+static uint8_t cursor_x = 0;
+static uint8_t cursor_y = 0;
+static uint32_t total_memory_mb = 0;
+static int shift_pressed = 0;
+
+//arrays
+static const char scancode_map[128] = {
+ 0,27,'1','2','3','4','5','6','7','8','9','0','-','=', '\b',
+ '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
+ 'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\','z','x',
+ 'c','v','b','n','m',',','.','/',0,'*',0,' '
+};
+
+static const char scancode_map_shift[128] = {
+ 0,27,'!','@','#','$','%','^','&','*','(',')','_','+','\b',
+ '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
+ 'A','S','D','F','G','H','J','K','L',':','"','~',0,'|','Z','X',
+ 'C','V','B','N','M','<','>','?',0,'*',0,' '
+};
+
+//function declarations
 void kpanic(void);
 void kshutdown(void);
 
-volatile int currentTick = 0;
-void watchdogTick(void){ currentTick++; }
-void petWatchdog(void){ currentTick = 0; }
-void watchdogCheck(void){ if(currentTick > WATCHDOG_TIMEOUT) kpanic(); }
+void watchdogTick(void) { 
+    currentTick++; 
+}
 
-static uint8_t cursor_x = 0;
-static uint8_t cursor_y = 0;
+void petWatchdog(void) { 
+    currentTick = 0; 
+}
+
+void watchdogCheck(void) { 
+    if(currentTick > WATCHDOG_TIMEOUT) kpanic(); 
+}
+
+void kclear(void);
+void print(char* msg, unsigned char colour);
+void cmd_meminfo(const char *args);
+void cmd_console_colour(const char* args);
+
+static void cmd_shutdown(const char *args) { 
+    (void)args; 
+    kshutdown(); 
+}
+
+static void cmd_minifs(const char *args) { 
+    (void)args; 
+    print("\nNo drives attached\n",0x0F); 
+}
+
+static void cmd_induce(const char *args) { 
+    (void)args; 
+    kpanic(); 
+}
+
+static void cmd_clear(const char *args) { 
+    (void)args; 
+    kclear(); 
+}
+
+static void cmd_echo(const char *args) {
+    if(!args) return;
+    while(*args == ' ') args++;
+    print("\n",0x0F);
+    print((char*)args,0x0F);
+    print("\n",0x0F);
+}
+
+static void cmd_help(const char *args) {
+    (void)args;
+    print("\nAvailable commands:\n", 0x0F);
+    print("  help        - Show this help message\n", 0x0F);
+    print("  clear       - Clear the screen\n", 0x0F);
+    print("  echo <text> - Display text\n", 0x0F);
+    print("  meminfo     - Show memory information\n", 0x0F);
+    print("  colour <c>  - Change console color\n", 0x0F);
+    print("  desktop     - Launch desktop environment\n", 0x0F);
+    print("  minifs      - Show filesystem status\n", 0x0F);
+    print("  shutdown    - Shutdown the system\n", 0x0F);
+    print("  induce(kernel.panic()) - Trigger kernel panic\n", 0x0F);
+    print("\n", 0x0F);
+}
+
+static struct cmd_entry commands[] = {
+    {"help", cmd_help},
+    {"clear", cmd_clear},
+    {"echo", cmd_echo},
+    {"meminfo", cmd_meminfo},
+    {"colour", cmd_console_colour},
+    {"desktop", cmd_desktop},
+    {"minifs", cmd_minifs},
+    {"shutdown", cmd_shutdown},
+    {"induce(kernel.panic())", cmd_induce},
+    {0, 0}
+};
 
 static void update_cursor(void);
 static void scroll_if_needed(void);
@@ -136,9 +249,9 @@ void kpanic(void) {
     }
 }
 
-static uint32_t total_memory_mb = 0;
 
 void cmd_meminfo(const char *args) {
+    (void)args; //suppress unused parameter warning
     char buf[64];
     ksnprintf(buf, sizeof(buf), "Total memory: %u MB\n", total_memory_mb);
     print(buf, 0x0F);
@@ -202,35 +315,6 @@ static void scroll_if_needed(void){
     }
 }
 
-#define RSDP_SIG "RSD PTR "
-#define ACPI_SIG_FADT "FACP"
-#define ACPI_SIG_RSDT "RSDT"
-#define ACPI_SIG_XSDT "XSDT"
-#define SLP_EN (1 << 13)
-
-typedef struct __attribute__((packed)) {
-    char signature[8];
-    uint8_t checksum;
-    char oemid[6];
-    uint8_t revision;
-    uint32_t rsdt_address;
-    uint32_t length;
-    uint64_t xsdt_address;
-    uint8_t extended_checksum;
-    uint8_t reserved[3];
-} rsdp_descriptor_t;
-
-typedef struct __attribute__((packed)) {
-    char signature[4];
-    uint32_t length;
-    uint8_t revision;
-    uint8_t checksum;
-    char oemid[6];
-    char oemtableid[8];
-    uint32_t oemrevision;
-    uint32_t creatorid;
-    uint32_t creatorrev;
-} acpi_table_header_t;
 
 static int acpi_checksum(void *ptr, unsigned long len) {
     uint8_t sum = 0;
@@ -242,7 +326,11 @@ static int acpi_checksum(void *ptr, unsigned long len) {
 static rsdp_descriptor_t* find_rsdp(void){
     uint16_t *ebda_ptr = (uint16_t*)0x40E;
     uint32_t ebda_kb = 0;
+    //suppress array bounds warning for low memory access
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Warray-bounds"
     if (ebda_ptr) ebda_kb = *ebda_ptr;
+    #pragma GCC diagnostic pop
     if (ebda_kb) {
         uint32_t ebda = ((uint32_t)ebda_kb) << 4;
         for (uint32_t p = ebda; p < ebda + 1024; p += 16) {
@@ -395,22 +483,6 @@ void kshutdown(void){
     kpanic();
 }
 
-#define KEYBOARD_DATA_PORT 0x60
-#define KEYBOARD_STATUS_PORT 0x64
-
-static const char scancode_map[128] = {
- 0,27,'1','2','3','4','5','6','7','8','9','0','-','=', '\b',
- '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
- 'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\','z','x',
- 'c','v','b','n','m',',','.','/',0,'*',0,' '
-};
-
-static const char scancode_map_shift[128] = {
- 0,27,'!','@','#','$','%','^','&','*','(',')','_','+','\b',
- '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
- 'A','S','D','F','G','H','J','K','L',':','"','~',0,'|','Z','X',
- 'C','V','B','N','M','<','>','?',0,'*',0,' '
-};
 
 static inline void write_char_at(uint16_t row, uint16_t col, char c, uint8_t attr){
     if (row >= SCREEN_HEIGHT) return;
@@ -438,7 +510,6 @@ void move_cursor(uint16_t row, uint16_t col){
     outb(0x3D5,(uint8_t)((pos >> 8) & 0xFF));
 }
 
-static int shift_pressed = 0;
 
 static char sc_to_ascii(uint8_t sc){
     if(sc == 0x2A || sc == 0x36){ shift_pressed = 1; return 0; }
@@ -552,43 +623,18 @@ static int strncasecmp_custom(const char *a, const char *b, size_t n){
     return (int)(unsigned char)tolower_char(a[i]) - (int)(unsigned char)tolower_char(b[i]);
 }
 
-static void cmd_shutdown(const char *args){ (void)args; kshutdown(); }
-static void cmd_minifs(const char *args){ (void)args; print("\nNo drives attached\n",0x0F); }
-static void cmd_induce(const char *args){ (void)args; kpanic(); }
-static void cmd_clear(const char *args){ (void)args; kclear(); }
-static void cmd_echo(const char *args){
-    if(!args) return;
-    while(*args == ' ') args++;
-    print("\n",0x0F);
-    print((char*)args,0x0F);
-    print("\n",0x0F);
-}
 
-typedef void (*cmd_fn)(const char *args);
-
-struct cmd_entry { const char *name; cmd_fn fn; };
 
 void cmd_console_colour(const char* args){
     kclear();
     unsigned int j = 0;
     while(j < 80 * 25){
         VID_MEM[j * 2] = ' ';
-        VID_MEM[j * 2 + 1] = (unsigned char)args;
+        VID_MEM[j * 2 + 1] = (unsigned char)(uintptr_t)args; // Proper cast to avoid size warning
         j++;
     }
 }
 
-static struct cmd_entry commands[] = {
-    {"shutdown", cmd_shutdown},
-    {"minifs", cmd_minifs},
-    {"induce(kernel.panic())", cmd_induce},
-    {"clear", cmd_clear},
-    {"echo", cmd_echo},
-    {"meminfo", cmd_meminfo},
-    {"desktop", cmd_desktop},
-    {"colour", cmd_console_colour},
-    {0, 0}
-};
 
 
 
@@ -602,6 +648,13 @@ void commandLoop(void){
         size_t start = i;
         while(buffer[i] && buffer[i] != ' ') i++;
         size_t cmdlen = i - start;
+        
+        //handle empty command (just pressed enter)
+        if(cmdlen == 0) {
+            print("\n", 0x0F);
+            continue;
+        }
+        
         for(struct cmd_entry *ce = commands; ce->name; ++ce){
             size_t n = 0;
             while(ce->name[n]) n++;
@@ -612,16 +665,11 @@ void commandLoop(void){
                 goto cont;
             }
         }
-        print("\nError: Invalid Command\n", 0x4F);
+        print("\nError: Invalid command. Type 'help' for available commands.\n", 0x4F);
         cont: ;
     }
 }
 
-size_t kstrlen(const char *str) {
-    size_t len = 0;
-    while (str[len]) len++;
-    return len;
-}
 
 void put_char_at(char c, uint8_t attr, int x, int y) {
     int offset = (y * SCREEN_WIDTH + x) * 2;
