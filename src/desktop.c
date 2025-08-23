@@ -3,6 +3,7 @@
 #include "string.h"
 #include "io.h"
 #include "font.h"
+#include "keyboard.h"
 
 #define VGA_WIDTH   320
 #define VGA_HEIGHT  200
@@ -16,8 +17,10 @@
 // Forward declaration for kernel shutdown function
 extern void kshutdown(void);
 
+char current_notepad_text[128] = "";
+
 //structs and typedefs
-typedef enum { WC_LABEL, WC_RECT } win_content_type;
+typedef enum { WC_LABEL, WC_RECT, WC_TEXTAREA } win_content_type;
 typedef struct {
     win_content_type type;
     int x, y, w, h;
@@ -41,7 +44,8 @@ typedef enum {
     PROC_WELCOME,
     PROC_CALCULATOR,
     PROC_NOTEPAD,
-    PROC_ABOUT
+    PROC_ABOUT,
+    PROC_TEXTMODERET
 } process_type_t;
 
 typedef struct {
@@ -63,7 +67,7 @@ static int next_pid = 1;
 static int process_count = 0;
 static int start_menu_open = 0;
 static int start_button_width = 50;
-static int start_menu_item_count = 4;
+static int start_menu_item_count = 5;
 static uint8_t cursor_bg[CURSOR_H][CURSOR_W];
 static uint8_t mcycle = 0;
 static int8_t  mbytes[3];
@@ -103,12 +107,14 @@ static void action_calculator(void);
 static void action_notepad(void);
 static void action_about(void);
 static void action_shutdown(void);
+static void action_textmode(void);
 static void draw_close_button(window_t *win);
 
 static start_menu_item_t start_menu_items[] = {
     {"Calculator", action_calculator},
     {"Notepad", action_notepad},
     {"About", action_about},
+    {"Frosty CLI", action_textmode},
     {"Shutdown", action_shutdown}
 };
 
@@ -268,7 +274,7 @@ static int create_process(process_type_t type, int x, int y) {
             strncpy(proc->window.title, "Notepad", sizeof(proc->window.title)-1);
             window_add_label(&proc->window, 10, 10, "Text Editor", 15);
             window_add_rect(&proc->window, 10, 25, 170, 100, 7);
-            window_add_label(&proc->window, 15, 30, "Type your text here...", 0);
+            window_add_label(&proc->window, 15, 30, current_notepad_text, 0);
             break;
             
         case PROC_ABOUT:
@@ -351,6 +357,10 @@ static void action_about(void) {
 
 static void action_shutdown(void) {
     kshutdown();
+}
+
+static void action_textmode(void) {
+    create_process(PROC_TEXTMODERET, 120, 80);
 }
 
 static void draw_taskbar(void) {
@@ -490,6 +500,19 @@ static void vga_set_mode_13h(void) {
     outb(0x3C0, 0x20);
 }
 
+static void vga_set_mode_12h(void) {
+        __asm__ volatile (
+        "mov $0x03, %%ax\n"
+        "int $0x10"
+        :
+        :
+        : "ax"
+    );
+
+    //just restart
+}
+
+
 static void mouse_wait(uint8_t type) {
     uint32_t timeout = 100000;
     if (type == 0) {
@@ -580,6 +603,8 @@ static void bring_to_front(int pid) {
     }
     processes[process_count - 1] = temp;
 }
+
+
 
 void cmd_desktop(const char *args) {
     (void)args;
@@ -672,10 +697,28 @@ void cmd_desktop(const char *args) {
             for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
                 VGA[i] = screen_buffer[i];
 
+            
+
             draw_taskbar();
             draw_start_menu();
             draw_all_windows();
             draw_cursor(cx, cy);
+        }
+        for(int i = 0; i < process_count; i++){
+            if(processes[i].type == PROC_TEXTMODERET){
+                vga_set_mode_12h();
+                return;
+            }
+            if(processes[i].type == PROC_NOTEPAD && processes[i].active){
+                char key = kb_poll();
+                if (key) {
+                    size_t len = strlen(current_notepad_text);
+                    if(len < sizeof(current_notepad_text)-1){
+                        current_notepad_text[len] = key;
+                        current_notepad_text[len+1] = '\0';
+                    }
+                }
+            }
         }
     }
 }

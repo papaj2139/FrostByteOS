@@ -28,7 +28,10 @@ io.o: src/io.c
 font.o: src/font.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o
+keyboard.o: src/keyboard.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)
