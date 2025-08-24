@@ -37,7 +37,10 @@ serial.o: src/drivers/serial.c
 pc_speaker.o: src/drivers/pc_speaker.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o serial.o pc_speaker.o
+vga.o: src/gui/vga.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o serial.o pc_speaker.o vga.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)

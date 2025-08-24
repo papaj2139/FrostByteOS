@@ -68,6 +68,7 @@ static uint32_t total_memory_mb = 0;
 //function declarations
 void kpanic(void);
 void kshutdown(void);
+void kreboot(void);
 
 void watchdogTick(void) { 
     currentTick++; 
@@ -94,6 +95,11 @@ void enable_cursor(uint8_t start, uint8_t end);
 static void cmd_shutdown(const char *args) { 
     (void)args; 
     kshutdown(); 
+}
+
+static void cmd_reboot(const char *args) {
+    (void)args;
+    kreboot();
 }
 
 static void cmd_minifs(const char *args) { 
@@ -130,6 +136,7 @@ static void cmd_help(const char *args) {
     print("  desktop     - Launch desktop environment\n", 0x0F);
     print("  minifs      - Show filesystem status\n", 0x0F);
     print("  shutdown    - Shutdown the system\n", 0x0F);
+    print("  reboot      - Reboot the system\n", 0x0F);
     print("  induce(kernel.panic()) - Trigger kernel panic\n", 0x0F);
     print("  iceedit     - Opens the ICE (Interprated Compiled Executable) Editor", 0x0F);
     print("\n", 0x0F);
@@ -156,11 +163,12 @@ void cmd_iceedit(const char *args){
     print("ICE Editor\n", 0x0F);
     print("F5 - Execute\n", 0x0F);
     print("Use arrow keys to move the cursor.\n", 0x0F);
+    print("Esc - Exit to shell\n", 0x0F);
     print("\n", 0x0F);
 
     //place cursor below header
     cursor_x = 0;
-    cursor_y = 3;
+    cursor_y = 4;
     update_cursor();
 
     int e0 = 0;
@@ -186,7 +194,9 @@ void cmd_iceedit(const char *args){
         }
 
         //ignore key releases
-        if(sc & 0x80){ e0 = 0; continue; }
+        if(sc & 0x80){ 
+            e0 = 0; continue; 
+        }
 
         if(e0){
             e0 = 0;
@@ -198,7 +208,7 @@ void cmd_iceedit(const char *args){
                 if(cursor_x < SCREEN_WIDTH - 1) cursor_x++;
                 desired_col = cursor_x;
             } else if(sc == 0x48){ 
-                if(cursor_y > 3){
+                if(cursor_y > 4){
                     uint16_t target = cursor_y - 1;
                     uint16_t ll = get_line_length(target);
                     uint16_t nx = desired_col;
@@ -222,6 +232,12 @@ void cmd_iceedit(const char *args){
             continue;
         }
 
+        if (sc == 0x01) {
+            //esc goes back to shell
+            print("\n", 0x0F);
+            kclear();
+            return;
+        }
         char ch = 0;
         //local ascii mapper mirroring input() behavior
         if(sc > 0 && sc < 128){
@@ -234,7 +250,7 @@ void cmd_iceedit(const char *args){
             desired_col = cursor_x;
         } else if(ch == '\b'){
             //prevent deleting header text
-            if(!(cursor_y == 3 && cursor_x == 0)){
+            if(!(cursor_y == 4 && cursor_x == 0)){
                 putchar_term('\b', 0x0F);
                 desired_col = cursor_x;
             }
@@ -254,6 +270,7 @@ static struct cmd_entry commands[] = {
     {"desktop", cmd_desktop},
     {"minifs", cmd_minifs},
     {"shutdown", cmd_shutdown},
+    {"reboot", cmd_reboot},
     {"induce(kernel.panic())", cmd_induce},
     {"iceedit", cmd_iceedit},
     {0, 0}
@@ -587,6 +604,14 @@ void kshutdown(void){
     kpanic();
 }
 
+//works in qemu idk how about real hardware 
+void kreboot(void){
+    __asm__ volatile("cli");
+    //port 0xCF9 (reset control register)
+    outb(0xCF9, 0x02); //set reset bit
+    for (volatile unsigned int i = 0; i < 100000; ++i) { }
+    outb(0xCF9, 0x06); //full reset
+}
 
 static inline void write_char_at(uint16_t row, uint16_t col, char c, uint8_t attr){
     if (row >= SCREEN_HEIGHT) return;
