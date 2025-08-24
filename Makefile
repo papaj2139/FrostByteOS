@@ -32,9 +32,12 @@ keyboard.o: src/drivers/keyboard.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 serial.o: src/drivers/serial.c
+	$(CC) $(CFLAGS) -c $< -o $@\
+
+pc_speaker.o: src/drivers/pc_speaker.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o serial.o
+$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o serial.o pc_speaker.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)
@@ -48,6 +51,9 @@ run: iso
 
 run-serial: iso
 	qemu-system-i386 -cdrom $(ISO_NAME) -serial stdio
+
+run-sound: iso
+	qemu-system-i386 -cdrom $(ISO_NAME) -audiodev alsa,id=snd0 -machine pcspk-audiodev=snd0
 
 clean:
 	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir
