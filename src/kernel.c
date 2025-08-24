@@ -3,6 +3,8 @@
 #include "desktop.h"
 #include "io.h"
 #include "drivers/serial.h"
+#include "drivers/keyboard.h"
+#include "drivers/pc_speaker.h"
 
 /* TODO LIST: 
     * = done
@@ -61,22 +63,7 @@ volatile int currentTick = 0;
 static uint8_t cursor_x = 0;
 static uint8_t cursor_y = 0;
 static uint32_t total_memory_mb = 0;
-static int shift_pressed = 0;
 
-//arrays
-static const char scancode_map[128] = {
- 0,27,'1','2','3','4','5','6','7','8','9','0','-','=', '\b',
- '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
- 'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\','z','x',
- 'c','v','b','n','m',',','.','/',0,'*',0,' '
-};
-
-static const char scancode_map_shift[128] = {
- 0,27,'!','@','#','$','%','^','&','*','(',')','_','+','\b',
- '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
- 'A','S','D','F','G','H','J','K','L',':','"','~',0,'|','Z','X',
- 'C','V','B','N','M','<','>','?',0,'*',0,' '
-};
 
 //function declarations
 void kpanic(void);
@@ -98,6 +85,11 @@ void kclear(void);
 void print(char* msg, unsigned char colour);
 void cmd_meminfo(const char *args);
 void cmd_console_colour(const char* args);
+static void update_cursor(void);
+static void scroll_if_needed(void);
+static int putchar_term(char c, unsigned char colour);
+void enable_cursor(uint8_t start, uint8_t end);
+
 
 static void cmd_shutdown(const char *args) { 
     (void)args; 
@@ -143,8 +135,19 @@ static void cmd_help(const char *args) {
     print("\n", 0x0F);
 }
 
+static uint16_t get_line_length(uint16_t row){
+    if(row >= SCREEN_HEIGHT) return 0;
+    uint16_t len = SCREEN_WIDTH;
+    while(len > 0){
+        char c = VID_MEM[(row * SCREEN_WIDTH + (len - 1)) * 2];
+        if(c != ' ') break;
+        len--;
+    }
+    return len;
+}
+
 void cmd_iceedit(const char *args){
-    (void*)args;
+    (void)args;
 
     DEBUG_PRINT("ICE Editor Started");
 
@@ -152,17 +155,93 @@ void cmd_iceedit(const char *args){
 
     print("ICE Editor\n", 0x0F);
     print("F5 - Execute\n", 0x0F);
-    print("\n\n", 0x0F);
-    char buffer[128];
+    print("Use arrow keys to move the cursor.\n", 0x0F);
+    print("\n", 0x0F);
+
+    //place cursor below header
+    cursor_x = 0;
+    cursor_y = 3;
+    update_cursor();
+
+    int e0 = 0;
+    enable_cursor(14, 15);
+    uint16_t desired_col = cursor_x;
 
     for(;;){
-        input(buffer, sizeof(buffer));
-        size_t i = 0;
-        while(buffer[i] && buffer[i] == ' ') i++;
-        size_t start = i;
-        while(buffer[i] && buffer[i] != ' ') i++;
-        size_t cmdlen = i - start;
-        DEBUG_PRINTF("ice: ",buffer);
+        //wait for key
+        while((inb(KEYBOARD_STATUS_PORT) & 1) == 0);
+        uint8_t sc = inb(KEYBOARD_DATA_PORT);
+
+        if(sc == 0xE0){ 
+            e0 = 1; continue; 
+        }
+
+        if(sc == 0x2A || sc == 0x36){ 
+            shift_pressed = 1; 
+            continue; 
+        }
+        if(sc == 0xAA || sc == 0xB6){
+            shift_pressed = 0;
+             continue; 
+        }
+
+        //ignore key releases
+        if(sc & 0x80){ e0 = 0; continue; }
+
+        if(e0){
+            e0 = 0;
+            //arrow keys
+            if(sc == 0x4B){ 
+                if(cursor_x > 0) cursor_x--;
+                desired_col = cursor_x;
+            } else if(sc == 0x4D){ 
+                if(cursor_x < SCREEN_WIDTH - 1) cursor_x++;
+                desired_col = cursor_x;
+            } else if(sc == 0x48){ 
+                if(cursor_y > 3){
+                    uint16_t target = cursor_y - 1;
+                    uint16_t ll = get_line_length(target);
+                    uint16_t nx = desired_col;
+                    if(nx > ll) nx = ll;
+                    if(nx >= SCREEN_WIDTH) nx = SCREEN_WIDTH - 1;
+                    cursor_y = target;
+                    cursor_x = nx;
+                }
+            } else if(sc == 0x50){ 
+                if(cursor_y < SCREEN_HEIGHT - 1){
+                    uint16_t target = cursor_y + 1;
+                    uint16_t ll = get_line_length(target);
+                    uint16_t nx = desired_col;
+                    if(nx > ll) nx = ll;
+                    if(nx >= SCREEN_WIDTH) nx = SCREEN_WIDTH - 1;
+                    cursor_y = target;
+                    cursor_x = nx;
+                }
+            }
+            update_cursor();
+            continue;
+        }
+
+        char ch = 0;
+        //local ascii mapper mirroring input() behavior
+        if(sc > 0 && sc < 128){
+            ch = shift_pressed ? scancode_map_shift[sc] : scancode_map[sc];
+        }
+        if(!ch) continue;
+
+        if(ch == '\n'){
+            putchar_term('\n', 0x0F);
+            desired_col = cursor_x;
+        } else if(ch == '\b'){
+            //prevent deleting header text
+            if(!(cursor_y == 3 && cursor_x == 0)){
+                putchar_term('\b', 0x0F);
+                desired_col = cursor_x;
+            }
+        } else {
+            putchar_term(ch, 0x0F);
+            desired_col = cursor_x;
+        }
     }
 }
 
@@ -248,9 +327,8 @@ void kpanic(void) {
         VID_MEM[j * 2] = ' ';
         VID_MEM[j * 2 + 1] = 0x1F; // White on blue
     }
-
+    ERROR_SOUND();
     print_at(" FrostByte ", 0x71, 35, 4); // Gray background, black text
-
 
     print_at("A fatal exception 0E has occurred at 0028:C0044526 in VXD VFAT(01) + 00002D6A.", 0x1F, 2, 6);
     print_at("The current application will be terminated.", 0x1F, 2, 7);
@@ -651,12 +729,48 @@ static int strncasecmp_custom(const char *a, const char *b, size_t n){
 
 
 
+// Parse decimal or 0xHH into a u8. Returns 1 on success, 0 on failure.
+static int parse_u8(const char* s, unsigned char* out){
+    if(!s) return 0;
+    while(*s == ' ') s++;
+    if(!*s) return 0;
+    unsigned int val = 0;
+    if(s[0] == '0' && (s[1] == 'x' || s[1] == 'X')){
+        s += 2;
+        if(!*s) return 0;
+        while(*s){
+            char c = *s;
+            unsigned int d;
+            if(c >= '0' && c <= '9') d = (unsigned int)(c - '0');
+            else if(c >= 'a' && c <= 'f') d = 10u + (unsigned int)(c - 'a');
+            else if(c >= 'A' && c <= 'F') d = 10u + (unsigned int)(c - 'A');
+            else break;
+            val = (val << 4) | d;
+            if(val > 255u) { val = 255u; break; }
+            s++;
+        }
+    } else {
+        while(*s >= '0' && *s <= '9'){
+            val = val * 10u + (unsigned int)(*s - '0');
+            if(val > 255u) { val = 255u; break; }
+            s++;
+        }
+    }
+    *out = (unsigned char)val;
+    return 1;
+}
+
 void cmd_console_colour(const char* args){
+    unsigned char attr = 0x0F;
+    if(!parse_u8(args, &attr)){
+        print("\nUsage: colour <attr>  e.g., colour 15 or colour 0x1F\n", 0x0F);
+        return;
+    }
     kclear();
     unsigned int j = 0;
-    while(j < 80 * 25){
+    while(j < SCREEN_WIDTH * SCREEN_HEIGHT){
         VID_MEM[j * 2] = ' ';
-        VID_MEM[j * 2 + 1] = (unsigned char)(uintptr_t)args; //proper cast to avoid size warning
+        VID_MEM[j * 2 + 1] = attr;
         j++;
     }
 }
@@ -713,6 +827,7 @@ void kmain(uint32_t magic, uint32_t addr) {
     kclear();
     print("Loading into FrostByte...", 0x0F);
     serial_init();
+    speaker_init();
     DEBUG_PRINT("FrostByteOS kernel started");
 
     const char spinner_chars[] = { '|', '/', '-', '\\' };
