@@ -4,15 +4,17 @@
 #include "../io.h"
 
 uint8_t* const VGA = (uint8_t*)VGA_ADDRESS;
+static uint8_t* g_draw_surface = (uint8_t*)VGA_ADDRESS; //defaults to vram
+static int g_vsync_enabled = 1; // runtime toggle
 
 void putpx(int x, int y, uint8_t color) {
     if ((unsigned)x < VGA_WIDTH && (unsigned)y < VGA_HEIGHT)
-        VGA[y * VGA_WIDTH + x] = color;
+        g_draw_surface[y * VGA_WIDTH + x] = color;
 }
 
 uint8_t getpx(int x, int y) {
     if ((unsigned)x < VGA_WIDTH && (unsigned)y < VGA_HEIGHT)
-        return VGA[y * VGA_WIDTH + x];
+        return g_draw_surface[y * VGA_WIDTH + x];
     return 0;
 }
 
@@ -127,4 +129,67 @@ void vga_set_mode_12h(void) {
         : "ax"
     );
     //just restart 
+}
+
+void vga_set_draw_surface(uint8_t* surface){
+    g_draw_surface = surface ? surface : (uint8_t*)VGA_ADDRESS;
+}
+
+void vga_set_vsync_enabled(int enabled){
+    g_vsync_enabled = enabled ? 1 : 0;
+}
+
+int vga_get_vsync_enabled(void){
+    return g_vsync_enabled;
+}
+
+void vga_wait_vsync(void){
+    //wait for end of vertical retrace
+    while (inb(0x3DA) & 0x08) { }
+    //wait for start of vertical retrace
+    while (!(inb(0x3DA) & 0x08)) { }
+}
+
+void vga_present(const uint8_t* surface){
+    if (!surface) surface = g_draw_surface;
+    if (surface == VGA) return;
+    if (g_vsync_enabled) vga_wait_vsync();
+    const uint8_t* src8 = surface;
+    uint8_t* dst8 = VGA;
+    unsigned count = VGA_WIDTH * VGA_HEIGHT; //64000 bytes
+
+    //align destination to 4 bytes for dword copy
+    while (((uintptr_t)dst8 & 3) && count) {
+        *dst8++ = *src8++;
+        --count;
+    }
+
+    unsigned dwords = count >> 2;
+    unsigned tail = count & 3;
+
+    if (dwords) {
+        const void* s = src8;
+        void* d = dst8;
+        unsigned n = dwords;
+        __asm__ volatile (
+            "cld\n\trep movsd"
+            : "+S"(s), "+D"(d), "+c"(n)
+            :
+            : "memory"
+        );
+        src8 = (const uint8_t*)s;
+        dst8 = (uint8_t*)d;
+    }
+
+    if (tail) {
+        const void* s = src8;
+        void* d = dst8;
+        unsigned n = tail;
+        __asm__ volatile (
+            "cld\n\trep movsb"
+            : "+S"(s), "+D"(d), "+c"(n)
+            :
+            : "memory"
+        );
+    }
 }

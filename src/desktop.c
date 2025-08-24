@@ -480,75 +480,80 @@ void cmd_desktop(const char *args) {
     (void)args;
 
     vga_set_mode_13h();
+    vga_set_vsync_enabled(0);
 
-    static uint8_t screen_buffer[VGA_WIDTH * VGA_HEIGHT];
-    
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
-        VGA[i] = 3;
+    //back buffer and double buffering setup
+    static uint8_t backbuffer[VGA_WIDTH * VGA_HEIGHT];
+    vga_set_draw_surface(backbuffer);
 
-    draw_taskbar();
-
-    for (int y = 0; y < VGA_HEIGHT; y++)
-        for (int x = 0; x < VGA_WIDTH; x++)
-            screen_buffer[y * VGA_WIDTH + x] = getpx(x, y);
-
+    //initial state
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) backbuffer[i] = 3;
     create_process(PROC_WELCOME, 50, 50);
 
     int cx = VGA_WIDTH / 2 - CURSOR_W / 2;
     int cy = VGA_HEIGHT / 2 - CURSOR_H / 2;
 
     mouse_init();
-
+    int was_clicking = 0;
+    int needs_redraw = 1;
     for (;;) {
+        // Handle mouse input and update state
         if (poll_mouse_packet()) {
             cx += mbytes[1];
             cy -= mbytes[2];
 
             if (cx < 0) cx = 0;
             if (cy < 0) cy = 0;
+            if (cx >= VGA_WIDTH) cx = VGA_WIDTH - 1;
+            if (cy >= VGA_HEIGHT) cy = VGA_HEIGHT - 1;
+            needs_redraw = 1;
 
             int left_click = (mbytes[0] & 0x01) != 0;
-            static int was_clicking = 0;
             int just_clicked = left_click && !was_clicking;
-            was_clicking = left_click;
 
             if (just_clicked) {
                 if (clicked_start_button(cx, cy)) {
                     start_menu_open = !start_menu_open;
-                }
-                else if (start_menu_open) {
+                    needs_redraw = 1;
+                } else if (start_menu_open) {
                     int item = clicked_start_menu_item(cx, cy);
                     if (item >= 0) {
                         start_menu_items[item].action();
                         start_menu_open = 0;
+                        needs_redraw = 1;
                     } else {
                         start_menu_open = 0;
+                        needs_redraw = 1;
                     }
-                }
-                else {
+                } else {
                     int clicked_pid = clicked_taskbar_process(cx, cy);
                     if (clicked_pid > 0) {
                         bring_to_front(clicked_pid);
-                    }
-                    else {
+                        needs_redraw = 1;
+                    } else {
                         process_t *clicked_proc = find_window_at_position(cx, cy);
                         if (clicked_proc) {
                             if (clicked_close(&clicked_proc->window, cx, cy)) {
                                 close_process(clicked_proc->pid);
-                            }
-                            else if (mouse_over(cx, cy, clicked_proc->window.x + 1, clicked_proc->window.y + 1, 
-                                              clicked_proc->window.w - 2, 8)) {
+                                needs_redraw = 1;
+                            } else if (mouse_over(cx, cy, clicked_proc->window.x + 1, clicked_proc->window.y + 1,
+                                                  clicked_proc->window.w - 2, 8)) {
                                 win_dragging = clicked_proc->pid;
                                 drag_offset_x = cx - clicked_proc->window.x;
                                 drag_offset_y = cy - clicked_proc->window.y;
                                 bring_to_front(clicked_proc->pid);
+                                needs_redraw = 1;
                             }
                         }
                     }
                 }
-            } else if (!left_click) {
+
+            }
+
+            if (!left_click) {
                 win_dragging = -1;
             }
+            was_clicking = left_click;
 
             if (win_dragging != -1) {
                 process_t *drag_proc = get_process(win_dragging);
@@ -557,38 +562,43 @@ void cmd_desktop(const char *args) {
                     drag_proc->window.y = cy - drag_offset_y;
                     if (drag_proc->window.x < 0) drag_proc->window.x = 0;
                     if (drag_proc->window.y < 0) drag_proc->window.y = 0;
-                    if (drag_proc->window.x + drag_proc->window.w > VGA_WIDTH) 
+                    if (drag_proc->window.x + drag_proc->window.w > VGA_WIDTH)
                         drag_proc->window.x = VGA_WIDTH - drag_proc->window.w;
-                    if (drag_proc->window.y + drag_proc->window.h > VGA_HEIGHT - TASKBAR_HEIGHT) 
+                    if (drag_proc->window.y + drag_proc->window.h > VGA_HEIGHT - TASKBAR_HEIGHT)
                         drag_proc->window.y = VGA_HEIGHT - TASKBAR_HEIGHT - drag_proc->window.h;
+                    needs_redraw = 1;
                 }
             }
+        }
 
-            for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
-                VGA[i] = screen_buffer[i];
+        // Keyboard processing
+        for (int i = 0; i < process_count; i++) {
+            if (processes[i].type == PROC_TEXTMODERET) {
+                vga_set_mode_12h();
+                return;
+            }
+            if (processes[i].type == PROC_NOTEPAD && processes[i].active) {
+                char key = kb_poll();
+                if (key) {
+                    size_t len = strlen(current_notepad_text);
+                    if (len < sizeof(current_notepad_text) - 1) {
+                        current_notepad_text[len] = key;
+                        current_notepad_text[len + 1] = '\0';
+                        needs_redraw = 1;
+                    }
+                }
+            }
+        }
 
-            
-
+        //compose and present only when needed
+        if (needs_redraw) {
+            for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) backbuffer[i] = 3; //clear background
             draw_taskbar();
             draw_start_menu();
             draw_all_windows();
             draw_cursor(cx, cy);
-        }
-        for(int i = 0; i < process_count; i++){
-            if(processes[i].type == PROC_TEXTMODERET){
-                vga_set_mode_12h();
-                return;
-            }
-            if(processes[i].type == PROC_NOTEPAD && processes[i].active){
-                char key = kb_poll();
-                if (key) {
-                    size_t len = strlen(current_notepad_text);
-                    if(len < sizeof(current_notepad_text)-1){
-                        current_notepad_text[len] = key;
-                        current_notepad_text[len+1] = '\0';
-                    }
-                }
-            }
+            vga_present(backbuffer);
+            needs_redraw = 0;
         }
     }
 }
