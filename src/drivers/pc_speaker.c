@@ -66,8 +66,21 @@ void speaker_stop(void) {
 }
 
 void speaker_beep(uint32_t frequency, uint32_t duration_ms) {
+    if (frequency == 0 || duration_ms == 0) { speaker_stop(); return; }
     speaker_play_freq(frequency);
-    sleep_ms(duration_ms);
+
+    if (!interrupts_enabled()) {
+        //when IRQs are disabled use PIT channel 2 OUT (bit 5 of port 0x61) to count toggles and apprxoimate duration OUT toggles at 2*f
+        uint32_t toggles_needed = (duration_ms * frequency + 499) / 500; //round
+        uint8_t last = inb(SPEAKER_PORT) & 0x20;
+        while (toggles_needed > 0) {
+            uint8_t cur = inb(SPEAKER_PORT) & 0x20;
+            if (cur != last) { last = cur; toggles_needed--; }
+        }
+    } else {
+        sleep_ms(duration_ms);
+    }
+
     speaker_stop();
 }
 
