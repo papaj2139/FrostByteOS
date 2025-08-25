@@ -26,4 +26,18 @@ void draw_rect(int x, int y, int w, int h, uint8_t color);
 void vga_set_mode_13h(void);
 void vga_set_mode_12h(void);
 
+//double buffering utilities
+//set the active draw surface pass NULL or VGA to draw directly to vram
+void vga_set_draw_surface(uint8_t* surface);
+
+//block until vertical retrace and then copy the provided surface to vram
+void vga_present(const uint8_t* surface);
+
+//wait for vertical retrace period
+void vga_wait_vsync(void);
+
+//vsync control (runtime A/B testing)
+void vga_set_vsync_enabled(int enabled);
+int  vga_get_vsync_enabled(void);
+
 #endif
