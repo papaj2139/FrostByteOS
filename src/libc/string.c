@@ -114,3 +114,16 @@ int strncasecmp_custom(const char *a, const char *b, size_t n) {
     if (i == n) return 0;
     return (int)(unsigned char)tolower_char(a[i]) - (int)(unsigned char)tolower_char(b[i]);
 }
+
+char *strstr(const char *haystack, const char *needle) {
+    if (!*needle) return (char*)haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n && (*h == *n)) {
+            h++; n++;
+        }
+        if (!*n) return (char*)haystack;
+    }
+    return 0;
+}

@@ -10,6 +10,7 @@ void *memset(void *s, int c, size_t n);
 int strcmp(const char *a, const char *b);
 unsigned int strlen(const char *str);
 void strncpy(char* dest, const char* src, unsigned int n);
+char *strstr(const char *haystack, const char *needle);
 void itoa_unsigned(unsigned int value, char *buf, int base);
 int ksnprintf(char *out, size_t size, const char *fmt, ...);
 char tolower_char(char c);
