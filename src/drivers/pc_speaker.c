@@ -1,11 +1,35 @@
 #include "pc_speaker.h"
 #include "../io.h"
+#include "timer.h"
 
-//delay function (busy wait)
-static void delay_ms(uint32_t ms) {
-    //rough approximation timing
-    for (uint32_t i = 0; i < ms * 1000; i++) {
-        __asm__ volatile("nop");
+//detect if maskable interrupts are enabled (IF flag)
+static inline int interrupts_enabled(void) {
+    uint32_t eflags;
+    __asm__ volatile ("pushf; pop %0" : "=r"(eflags));
+    return (eflags & (1u << 9)) != 0;
+}
+
+//sleep using PIT timer ticks CPU halts until next IRQ to save power
+static void sleep_ms(uint32_t ms) {
+    //fallback when interrupts are disabled (e.g., panic path)
+    if (!interrupts_enabled()) {
+        volatile uint32_t nops = ms * 1000u; //rough approximation
+        for (volatile uint32_t i = 0; i < nops; ++i) {
+            __asm__ volatile ("nop");
+        }
+        return;
+    }
+
+    uint32_t hz = timer_get_frequency();
+    if (hz == 0) hz = 100; //fallback
+    uint64_t start = timer_get_ticks();
+    //compute ceil(ms*hz/1000)
+    uint32_t whole = ms / 1000;
+    uint32_t rem = ms % 1000;
+    uint32_t ticks_needed32 = whole * hz + (uint32_t)(((uint32_t)rem * hz + 999) / 1000);
+    uint64_t target = start + (uint64_t)ticks_needed32;
+    while (timer_get_ticks() < target) {
+        __asm__ volatile ("hlt");
     }
 }
 
@@ -43,7 +67,7 @@ void speaker_stop(void) {
 
 void speaker_beep(uint32_t frequency, uint32_t duration_ms) {
     speaker_play_freq(frequency);
-    delay_ms(duration_ms);
+    sleep_ms(duration_ms);
     speaker_stop();
 }
 
