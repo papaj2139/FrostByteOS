@@ -3,6 +3,7 @@
 #include "string.h"
 #include "io.h"
 #include "drivers/keyboard.h"
+#include "drivers/mouse.h"
 #include "gui/vga.h"
 
 #define TASKBAR_HEIGHT 16
@@ -65,8 +66,6 @@ static int start_menu_open = 0;
 static int start_button_width = 50;
 static int start_menu_item_count = 5;
 static uint8_t cursor_bg[CURSOR_H][CURSOR_W];
-static uint8_t mcycle = 0;
-static int8_t  mbytes[3];
 static int win_dragging = -1;
 static int drag_offset_x = 0, drag_offset_y = 0;
 
@@ -383,45 +382,6 @@ static int clicked_taskbar_process(int mx, int my) {
 }
 
 
-static void mouse_wait(uint8_t type) {
-    uint32_t timeout = 100000;
-    if (type == 0) {
-        while (timeout--) { if (inb(0x64) & 1) return; }
-    } else {
-        while (timeout--) { if ((inb(0x64) & 2) == 0) return; }
-    }
-}
-static void mouse_write(uint8_t val) {
-    mouse_wait(1); outb(0x64, 0xD4);
-    mouse_wait(1); outb(0x60, val);
-}
-static uint8_t mouse_read(void) {
-    mouse_wait(0);
-    return inb(0x60);
-}
-static void mouse_init(void) {
-    mouse_wait(1); outb(0x64, 0xA8);
-    mouse_wait(1); outb(0x64, 0x20);
-    mouse_wait(0); uint8_t status = inb(0x60) | 2;
-    mouse_wait(1); outb(0x64, 0x60);
-    mouse_wait(1); outb(0x60, status);
-
-    mouse_write(0xF6); (void)mouse_read();
-    mouse_write(0xF4); (void)mouse_read();
-}
-
-static int poll_mouse_packet(void) {
-    if (!(inb(0x64) & 1)) return 0;
-    uint8_t status = inb(0x64);
-    if (!(status & 0x20)) { (void)inb(0x60); return 0; }
-    uint8_t data = inb(0x60);
-
-    if (mcycle == 0 && !(data & 0x08)) return 0;
-    mbytes[mcycle++] = (int8_t)data;
-    if (mcycle == 3) { mcycle = 0; return 1; }
-    return 0;
-}
-
 static int mouse_over(int mx, int my, int x, int y, int w, int h) {
     return mx >= x && my >= y && mx < x + w && my < y + h;
 }
@@ -496,11 +456,12 @@ void cmd_desktop(const char *args) {
     mouse_init();
     int was_clicking = 0;
     int needs_redraw = 1;
+    int8_t pkt[3];
     for (;;) {
         // Handle mouse input and update state
-        if (poll_mouse_packet()) {
-            cx += mbytes[1];
-            cy -= mbytes[2];
+        if (mouse_poll_packet(pkt)) {
+            cx += pkt[1];
+            cy -= pkt[2];
 
             if (cx < 0) cx = 0;
             if (cy < 0) cy = 0;
@@ -508,7 +469,7 @@ void cmd_desktop(const char *args) {
             if (cy >= VGA_HEIGHT) cy = VGA_HEIGHT - 1;
             needs_redraw = 1;
 
-            int left_click = (mbytes[0] & 0x01) != 0;
+            int left_click = (pkt[0] & 0x01) != 0;
             int just_clicked = left_click && !was_clicking;
 
             if (just_clicked) {

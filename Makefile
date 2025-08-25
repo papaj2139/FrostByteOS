@@ -31,8 +31,11 @@ font.o: src/font.c
 keyboard.o: src/drivers/keyboard.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+mouse.o: src/drivers/mouse.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 serial.o: src/drivers/serial.c
-	$(CC) $(CFLAGS) -c $< -o $@\
+	$(CC) $(CFLAGS) -c $< -o $@
 
 pc_speaker.o: src/drivers/pc_speaker.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -40,7 +43,22 @@ pc_speaker.o: src/drivers/pc_speaker.c
 vga.o: src/gui/vga.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o serial.o pc_speaker.o vga.o
+idt.o: src/interrupts/idt.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+irq.o: src/interrupts/irq.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+pic.o: src/interrupts/pic.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+isr.o: src/interrupts/isr.asm
+	$(ASM) $(ASMFLAGS) $< -o $@
+
+timer.o: src/drivers/timer.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o mouse.o serial.o pc_speaker.o vga.o idt.o irq.o pic.o isr.o timer.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)

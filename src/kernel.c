@@ -5,6 +5,9 @@
 #include "drivers/serial.h"
 #include "drivers/keyboard.h"
 #include "drivers/pc_speaker.h"
+#include "interrupts/idt.h"
+#include "interrupts/pic.h"
+#include "drivers/timer.h"
 
 /* TODO LIST: 
     * = done
@@ -171,59 +174,49 @@ void cmd_iceedit(const char *args){
     cursor_y = 4;
     update_cursor();
 
-    int e0 = 0;
+    //clear any pending keyboard input from the shell before starting editor
+    kbd_flush();
+
     enable_cursor(14, 15);
     uint16_t desired_col = cursor_x;
 
     for(;;){
-        //wait for key
-        while((inb(KEYBOARD_STATUS_PORT) & 1) == 0);
-        uint8_t sc = inb(KEYBOARD_DATA_PORT);
+        unsigned short ev = kbd_getevent();
+        if(!ev) continue;
 
-        if(sc == 0xE0){ 
-            e0 = 1; continue; 
+        //esc keyreturns to shell        
+        if (ev == 27) {
+            print("\n", 0x0F);
+            kbd_flush();
+            kclear();
+            return;
         }
 
-        if(sc == 0x2A || sc == 0x36){ 
-            shift_pressed = 1; 
-            continue; 
-        }
-        if(sc == 0xAA || sc == 0xB6){
-            shift_pressed = 0;
-             continue; 
-        }
-
-        //ignore key releases
-        if(sc & 0x80){ 
-            e0 = 0; continue; 
-        }
-
-        if(e0){
-            e0 = 0;
-            //arrow keys
-            if(sc == 0x4B){ 
-                if(cursor_x > 0) cursor_x--;
+        //arrow keys
+        if (ev >= 0xE000) {
+            if (ev == K_ARROW_LEFT) {
+                if (cursor_x > 0) cursor_x--;
                 desired_col = cursor_x;
-            } else if(sc == 0x4D){ 
-                if(cursor_x < SCREEN_WIDTH - 1) cursor_x++;
+            } else if (ev == K_ARROW_RIGHT) {
+                if (cursor_x < SCREEN_WIDTH - 1) cursor_x++;
                 desired_col = cursor_x;
-            } else if(sc == 0x48){ 
-                if(cursor_y > 4){
+            } else if (ev == K_ARROW_UP) {
+                if (cursor_y > 4) {
                     uint16_t target = cursor_y - 1;
                     uint16_t ll = get_line_length(target);
                     uint16_t nx = desired_col;
-                    if(nx > ll) nx = ll;
-                    if(nx >= SCREEN_WIDTH) nx = SCREEN_WIDTH - 1;
+                    if (nx > ll) nx = ll;
+                    if (nx >= SCREEN_WIDTH) nx = SCREEN_WIDTH - 1;
                     cursor_y = target;
                     cursor_x = nx;
                 }
-            } else if(sc == 0x50){ 
-                if(cursor_y < SCREEN_HEIGHT - 1){
+            } else if (ev == K_ARROW_DOWN) {
+                if (cursor_y < SCREEN_HEIGHT - 1) {
                     uint16_t target = cursor_y + 1;
                     uint16_t ll = get_line_length(target);
                     uint16_t nx = desired_col;
-                    if(nx > ll) nx = ll;
-                    if(nx >= SCREEN_WIDTH) nx = SCREEN_WIDTH - 1;
+                    if (nx > ll) nx = ll;
+                    if (nx >= SCREEN_WIDTH) nx = SCREEN_WIDTH - 1;
                     cursor_y = target;
                     cursor_x = nx;
                 }
@@ -232,25 +225,15 @@ void cmd_iceedit(const char *args){
             continue;
         }
 
-        if (sc == 0x01) {
-            //esc goes back to shell
-            print("\n", 0x0F);
-            kclear();
-            return;
-        }
-        char ch = 0;
-        //local ascii mapper mirroring input() behavior
-        if(sc > 0 && sc < 128){
-            ch = shift_pressed ? scancode_map_shift[sc] : scancode_map[sc];
-        }
+        //ASCII input
+        char ch = (char)(ev & 0xFF);
         if(!ch) continue;
-
-        if(ch == '\n'){
+        if (ch == '\n') {
             putchar_term('\n', 0x0F);
             desired_col = cursor_x;
-        } else if(ch == '\b'){
+        } else if (ch == '\b') {
             //prevent deleting header text
-            if(!(cursor_y == 4 && cursor_x == 0)){
+            if (!(cursor_y == 4 && cursor_x == 0)) {
                 putchar_term('\b', 0x0F);
                 desired_col = cursor_x;
             }
@@ -646,91 +629,31 @@ static char sc_to_ascii(uint8_t sc){
     if(sc > 0 && sc < 128) return shift_pressed ? scancode_map_shift[sc] : scancode_map[sc];
     return 0;
 }
-
+//now it use sthe proper IRQ keyboard driver 
 void input(char *buffer, size_t size){
     size_t len = 0;
-    for(size_t i=0;i<size;i++) buffer[i]=0;
-    uint16_t start_x = cursor_x;
-    uint16_t start_y = cursor_y;
-    size_t cursor_index = 0;
-    int e0 = 0;
-    enable_cursor(14,15);
-    move_cursor(start_y,start_x);
-    while(1){
-        while((inb(KEYBOARD_STATUS_PORT) & 1) == 0);
-        uint8_t sc = inb(KEYBOARD_DATA_PORT);
-        if(sc == 0xE0){ e0 = 1; continue; }
-        if(sc == 0x2A || sc == 0x36){ shift_pressed = 1; continue; }
-        if(sc == 0xAA || sc == 0xB6){ shift_pressed = 0; continue; }
-        if(sc & 0x80) { if(e0){ e0 = 0; } continue; }
-        if(e0){
-            e0 = 0;
-            if(sc == 0x4B){
-                if(cursor_index > 0) cursor_index--;
-                uint16_t cx = start_x + cursor_index;
-                uint16_t cy = start_y + cx / SCREEN_WIDTH;
-                cx = cx % SCREEN_WIDTH;
-                cursor_x = cx; cursor_y = cy;
-                update_cursor();
-                continue;
-            } else if(sc == 0x4D){
-                if(cursor_index < len) cursor_index++;
-                uint16_t cx = start_x + cursor_index;
-                uint16_t cy = start_y + cx / SCREEN_WIDTH;
-                cx = cx % SCREEN_WIDTH;
-                cursor_x = cx; cursor_y = cy;
-                update_cursor();
-                continue;
-            } else continue;
-        }
-        char ch = sc_to_ascii(sc);
+    for(size_t i = 0; i < size; ++i) buffer[i] = 0;
+    enable_cursor(14, 15);
+    for(;;){
+        char ch = getkey(); //blocks until a key is available
         if(!ch) continue;
         if(ch == '\n'){
             buffer[len] = 0;
-            putchar_term('\n',0x0F);
+            putchar_term('\n', 0x0F);
             return;
         } else if(ch == '\b'){
-            if(cursor_index > 0){
-                size_t del_at = cursor_index - 1;
-                for(size_t i = del_at; i < len; ++i) buffer[i] = buffer[i+1];
-                if(len) len--;
-                cursor_index--;
-                for(size_t i = 0; i < len; ++i){
-                    uint16_t px = start_x + i;
-                    uint16_t py = start_y + px / SCREEN_WIDTH;
-                    px = px % SCREEN_WIDTH;
-                    write_char_at(py, px, buffer[i], 0x0F);
-                }
-                uint16_t cx = start_x + len;
-                uint16_t cy = start_y + cx / SCREEN_WIDTH;
-                cx = cx % SCREEN_WIDTH;
-                write_char_at(cy, cx, ' ', 0x0F);
-                uint16_t curx = start_x + cursor_index;
-                uint16_t cury = start_y + curx / SCREEN_WIDTH;
-                curx = curx % SCREEN_WIDTH;
-                cursor_x = curx; cursor_y = cury;
-                update_cursor();
+            if(len > 0){
+                len--;
+                buffer[len] = 0;
+                putchar_term('\b', 0x0F);
             }
             continue;
-        } else {
+        } else if((unsigned char)ch >= 32 && (unsigned char)ch < 127){
             if(len < size - 1){
-                for(size_t i = len; i > cursor_index; --i) buffer[i] = buffer[i-1];
-                buffer[cursor_index] = ch;
-                len++;
-                cursor_index++;
-                for(size_t i = 0; i < len; ++i){
-                    uint16_t px = start_x + i;
-                    uint16_t py = start_y + px / SCREEN_WIDTH;
-                    px = px % SCREEN_WIDTH;
-                    write_char_at(py, px, buffer[i], 0x0F);
-                }
-                uint16_t curx = start_x + cursor_index;
-                uint16_t cury = start_y + curx / SCREEN_WIDTH;
-                curx = curx % SCREEN_WIDTH;
-                cursor_x = curx; cursor_y = cury;
-                update_cursor();
+                buffer[len++] = ch;
+                buffer[len] = 0;
+                putchar_term(ch, 0x0F);
             }
-            continue;
         }
     }
 }
@@ -855,17 +778,35 @@ void kmain(uint32_t magic, uint32_t addr) {
     speaker_init();
     DEBUG_PRINT("FrostByteOS kernel started");
 
+    //initialize interrupts
+    pic_remap(0x20, 0x28);
+    DEBUG_PRINT("PIC remapped");
+    idt_install();
+    DEBUG_PRINT("IDT installed");
+    timer_init(100); //100 hz
+    keyboard_init(); //enable IRQ1 and setup keyboard handler
+    DEBUG_PRINT("Timer initialized");
+    __asm__ volatile ("sti");
+    DEBUG_PRINT("Interrupts enabled");
+
     const char spinner_chars[] = { '|', '/', '-', '\\' };
     int spin_index = 0;
 
     int spinner_x = 25;
     int spinner_y = 0;
-
-    for(int i = 0; i < 10; i++) {
-        put_char_at(spinner_chars[spin_index], 0x0F, spinner_x, spinner_y);
-        spin_index = (spin_index + 1) % 4;
-
-        for (volatile unsigned long long i = 0; i < 10000000ULL; ++i);
+    DEBUG_PRINT("About to spin");
+    //spin using actual interrupt-driven timer
+    uint64_t start_tick = timer_get_ticks();
+    uint64_t last_tick = start_tick;
+    while (timer_get_ticks() - start_tick < 50) {
+        uint64_t t = timer_get_ticks();
+        if (t != last_tick) {
+            last_tick = t;
+            if ((t % 5) == 0) {
+                put_char_at(spinner_chars[spin_index], 0x0F, spinner_x, spinner_y);
+                spin_index = (spin_index + 1) % 4;
+            }
+        }
     }
     kclear();
     commandLoop();
