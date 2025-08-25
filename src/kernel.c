@@ -33,6 +33,8 @@
 #define KEYBOARD_DATA_PORT 0x60
 #define KEYBOARD_STATUS_PORT 0x64
 
+char *bsodVer = "classic";
+
 //structs and typedefs
 typedef struct __attribute__((packed)) {
     char signature[8];
@@ -141,7 +143,8 @@ static void cmd_help(const char *args) {
     print("  shutdown    - Shutdown the system\n", 0x0F);
     print("  reboot      - Reboot the system\n", 0x0F);
     print("  induce(kernel.panic()) - Trigger kernel panic\n", 0x0F);
-    print("  iceedit     - Opens the ICE (Interprated Compiled Executable) Editor", 0x0F);
+    print("  iceedit     - Opens the ICE (Interprated Compiled Executable) Editor\n", 0x0F);
+    print("  bsodVer <classic, modern>  - Sets the kernel panic screen to windows-inspired screens (modern = emoticon screen, classic = A fatal exeption...)", 0x0F);
     print("\n", 0x0F);
 }
 
@@ -244,6 +247,19 @@ void cmd_iceedit(const char *args){
     }
 }
 
+void cmd_kpset(const char *args){
+    if(!args) return;
+
+    if(strcmp(args, "classic") != 0 && strcmp(args, "modern") != 0){
+        print("Invalid theme\n", 0x4F);
+        return;
+    }
+
+    strncpy(bsodVer, args, strlen(args));
+    bsodVer[strlen(args)] = '\0';
+}
+
+
 static struct cmd_entry commands[] = {
     {"help", cmd_help},
     {"clear", cmd_clear},
@@ -256,6 +272,7 @@ static struct cmd_entry commands[] = {
     {"reboot", cmd_reboot},
     {"induce(kernel.panic())", cmd_induce},
     {"iceedit", cmd_iceedit},
+    {"bsodVer", cmd_kpset},
     {0, 0}
 };
 
@@ -327,27 +344,37 @@ void kpanic(void) {
         VID_MEM[j * 2] = ' ';
         VID_MEM[j * 2 + 1] = 0x1F; // White on blue
     }
-    ERROR_SOUND();
-    print_at(" FrostByte ", 0x71, 35, 4); // Gray background, black text
+    
+    if(strcmp(bsodVer, "modern") == 0){
+        print_at(":(", 0x1F, 0, 0);
+        print_at("Your pc ran into a problem and needs to restart.", 0x1F, 0, 1);
+        print_at("Please wait while we gather information about this (0%)", 0x1F, 0, 2);
+        print_at("Error code: ERR_CODE_GOES_HERE_LOLOLOLOL", 0x1F, 0, 3);
+    } else{
+        print_at(" FrostByte ", 0x71, 35, 4); // Gray background, black text
 
-    print_at("A fatal exception 0E has occurred at 0028:C0044526 in VXD VFAT(01) + 00002D6A.", 0x1F, 2, 6);
-    print_at("The current application will be terminated.", 0x1F, 2, 7);
-    print_at("* Press any key to terminate the current application.", 0x1F, 2, 8);
-    print_at("* Press CTRL+ALT+DEL to restart your computer. You will", 0x1F, 2, 9);
-    print_at("  lose any unsaved information in all applications.", 0x1F, 2, 10);
+        print_at("A fatal exception 0E has occurred at 0028:C0044526 in VXD VFAT(01) + 00002D6A.", 0x1F, 2, 6);
+        print_at("The current application will be terminated.", 0x1F, 2, 7);
+        print_at("* Press any key to terminate the current application.", 0x1F, 2, 8);
+        print_at("* Press CTRL+ALT+DEL to restart your computer. You will", 0x1F, 2, 9);
+        print_at("  lose any unsaved information in all applications.", 0x1F, 2, 10);
 
-    print_at(" Press enter to shutdown. ", 0x1F, 25, 15);
+        print_at("  Press enter to reboot. ", 0x1F, 25, 15);
+        move_cursor(26, 15);
+    }
 
     while (inb(0x64) & 1) {
         (void)inb(0x60);
     }
+
+    ERROR_SOUND();
 
     // Wait for Enter key manually (polling, no echo)
     for (;;) {
         if (inb(0x64) & 1) { // If output buffer full
             uint8_t scancode = inb(0x60);
             if (scancode == 0x1C) { // Enter key make code
-                kshutdown();
+                kreboot();
             }
         }
     }
@@ -809,6 +836,7 @@ void kmain(uint32_t magic, uint32_t addr) {
         }
     }
     kclear();
+    SUCCESS_SOUND();
     commandLoop();
     kpanic(); //if we return here
 }
