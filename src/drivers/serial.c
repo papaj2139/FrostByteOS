@@ -1,6 +1,6 @@
 #include "serial.h"
 #include "../io.h"
-#include "../string.h"
+#include <string.h>
 #include <stdarg.h>
 
 static uint16_t serial_port = SERIAL_COM1_BASE;

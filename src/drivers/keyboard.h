@@ -32,6 +32,8 @@ char kb_poll();
 //read next key event  returns ASCII in low byte for printable keys
 //or one of the K_* special codes for extended keys
 unsigned short kbd_getevent(void);
+//non-blocking event poll returns 0 if no event available ASCII in low byte or 0xE0xx for extended
+unsigned short kbd_poll_event(void);
 void keyboard_init(void);
 //clear any pending keyboard events and reset repeat state
 void kbd_flush(void);

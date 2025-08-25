@@ -97,3 +97,20 @@ int ksnprintf(char *out, size_t size, const char *fmt, ...) {
     va_end(args);
     return pos;
 }
+
+char tolower_char(char c) {
+    if (c >= 'A' && c <= 'Z') return (char)(c + 32);
+    return c;
+}
+
+int strncasecmp_custom(const char *a, const char *b, size_t n) {
+    size_t i = 0;
+    while (i < n && a[i] && b[i]) {
+        char ca = tolower_char(a[i]);
+        char cb = tolower_char(b[i]);
+        if (ca != cb) return (int)(unsigned char)ca - (int)(unsigned char)cb;
+        i++;
+    }
+    if (i == n) return 0;
+    return (int)(unsigned char)tolower_char(a[i]) - (int)(unsigned char)tolower_char(b[i]);
+}

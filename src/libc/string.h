@@ -12,5 +12,7 @@ unsigned int strlen(const char *str);
 void strncpy(char* dest, const char* src, unsigned int n);
 void itoa_unsigned(unsigned int value, char *buf, int base);
 int ksnprintf(char *out, size_t size, const char *fmt, ...);
+char tolower_char(char c);
+int strncasecmp_custom(const char *a, const char *b, size_t n);
 
 #endif

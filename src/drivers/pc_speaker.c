@@ -80,7 +80,6 @@ void speaker_beep(uint32_t frequency, uint32_t duration_ms) {
     } else {
         sleep_ms(duration_ms);
     }
-
     speaker_stop();
 }
 

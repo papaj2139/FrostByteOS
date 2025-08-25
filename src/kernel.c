@@ -1,4 +1,4 @@
-#include "string.h"
+#include <string.h>
 #include <stdint.h>
 #include "desktop.h"
 #include "io.h"
@@ -650,12 +650,6 @@ void move_cursor(uint16_t row, uint16_t col){
 }
 
 
-static char sc_to_ascii(uint8_t sc){
-    if(sc == 0x2A || sc == 0x36){ shift_pressed = 1; return 0; }
-    if(sc == 0xAA || sc == 0xB6){ shift_pressed = 0; return 0; }
-    if(sc > 0 && sc < 128) return shift_pressed ? scancode_map_shift[sc] : scancode_map[sc];
-    return 0;
-}
 //now it use sthe proper IRQ keyboard driver 
 void input(char *buffer, size_t size){
     size_t len = 0;
@@ -684,24 +678,6 @@ void input(char *buffer, size_t size){
         }
     }
 }
-
-static char tolower_char(char c){
-    if(c >= 'A' && c <= 'Z') return c + 32;
-    return c;
-}
-
-static int strncasecmp_custom(const char *a, const char *b, size_t n){
-    size_t i = 0;
-    while(i < n && a[i] && b[i]){
-        char ca = tolower_char(a[i]);
-        char cb = tolower_char(b[i]);
-        if(ca != cb) return (int)(unsigned char)ca - (int)(unsigned char)cb;
-        i++;
-    }
-    if(i == n) return 0;
-    return (int)(unsigned char)tolower_char(a[i]) - (int)(unsigned char)tolower_char(b[i]);
-}
-
 
 
 // Parse decimal or 0xHH into a u8. Returns 1 on success, 0 on failure.
@@ -822,6 +798,7 @@ void kmain(uint32_t magic, uint32_t addr) {
     int spinner_x = 25;
     int spinner_y = 0;
     DEBUG_PRINT("About to spin");
+    SUCCESS_SOUND();
     //spin using actual interrupt-driven timer
     uint64_t start_tick = timer_get_ticks();
     uint64_t last_tick = start_tick;

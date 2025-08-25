@@ -1,6 +1,6 @@
-#include <stdint.h>
+#include <string.h>
+#include <stddef.h>
 #include "desktop.h"
-#include "string.h"
 #include "io.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
@@ -68,6 +68,9 @@ static int start_menu_item_count = 5;
 static uint8_t cursor_bg[CURSOR_H][CURSOR_W];
 static int win_dragging = -1;
 static int drag_offset_x = 0, drag_offset_y = 0;
+
+static int calc_total = 0;
+static int calc_current = 0;
 
 //arrays
 static const uint8_t cursor_bitmap[CURSOR_H][CURSOR_W] = {
@@ -454,11 +457,13 @@ void cmd_desktop(const char *args) {
     int cy = VGA_HEIGHT / 2 - CURSOR_H / 2;
 
     mouse_init();
+    //ensure no stale keyboard events when entering GUI
+    kbd_flush();
     int was_clicking = 0;
     int needs_redraw = 1;
     int8_t pkt[3];
     for (;;) {
-        // Handle mouse input and update state
+        //handle mouse input and update state with the interrupt-mouse
         if (mouse_poll_packet(pkt)) {
             cx += pkt[1];
             cy -= pkt[2];
@@ -504,6 +509,40 @@ void cmd_desktop(const char *args) {
                                 drag_offset_y = cy - clicked_proc->window.y;
                                 bring_to_front(clicked_proc->pid);
                                 needs_redraw = 1;
+                            } else {
+                                //app-specific click handling
+                                if (clicked_proc->type == PROC_CALCULATOR) {
+                                    window_t *w = &clicked_proc->window;
+                                    int base_x = w->x;
+                                    int base_y = w->y + 10; //content Y offset
+
+                                    int btn_y = base_y + 40; //buttons row Y
+                                    //7
+                                    if (mouse_over(cx, cy, base_x + 10, btn_y, 20, 15)) {
+                                        calc_current = calc_current * 10 + 7;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                        needs_redraw = 1;
+                                    }
+                                    //8
+                                    else if (mouse_over(cx, cy, base_x + 35, btn_y, 20, 15)) {
+                                        calc_current = calc_current * 10 + 8;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                        needs_redraw = 1;
+                                    }
+                                    //9
+                                    else if (mouse_over(cx, cy, base_x + 60, btn_y, 20, 15)) {
+                                        calc_current = calc_current * 10 + 9;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                        needs_redraw = 1;
+                                    }
+                                    //+
+                                    else if (mouse_over(cx, cy, base_x + 85, btn_y, 20, 15)) {
+                                        calc_total += calc_current;
+                                        calc_current = 0;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_total);
+                                        needs_redraw = 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -539,13 +578,31 @@ void cmd_desktop(const char *args) {
                 return;
             }
             if (processes[i].type == PROC_NOTEPAD && processes[i].active) {
-                char key = kb_poll();
-                if (key) {
-                    size_t len = strlen(current_notepad_text);
-                    if (len < sizeof(current_notepad_text) - 1) {
-                        current_notepad_text[len] = key;
-                        current_notepad_text[len + 1] = '\0';
-                        needs_redraw = 1;
+                unsigned short ev = kbd_poll_event();
+                if (ev) {
+                    if ((ev & 0xFF00u) == 0xE000u) {
+                        //ignore extended keys for notepad atleast fornow 
+                    } else {
+                        char key = (char)(ev & 0xFFu);
+                        size_t len = strlen(current_notepad_text);
+                        if (key == '\b') {
+                            if (len > 0) {
+                                current_notepad_text[len - 1] = '\0';
+                                needs_redraw = 1;
+                            }
+                        } else if ((unsigned char)key >= 32 && (unsigned char)key < 127) {
+                            if (len < sizeof(current_notepad_text) - 1) {
+                                current_notepad_text[len] = key;
+                                current_notepad_text[len + 1] = '\0';
+                                needs_redraw = 1;
+                            }
+                        }
+
+                        //update notepad text label 
+                        if (processes[i].window.content_count >= 3) {
+                            strncpy(processes[i].window.content[2].text, current_notepad_text, sizeof(processes[i].window.content[2].text) - 1);
+                            processes[i].window.content[2].text[sizeof(processes[i].window.content[2].text) - 1] = '\0';
+                        }
                     }
                 }
             }
