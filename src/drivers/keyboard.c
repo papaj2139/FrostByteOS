@@ -26,13 +26,17 @@ static volatile uint8_t  repeat_is_ext = 0;
 static volatile uint8_t  repeat_scancode = 0; //base scancode (without 0xE0/0x80)
 static volatile uint32_t repeat_next_tick = 0;
 
-static inline int keybuf_empty(void) { return key_head == key_tail; }
+static inline int keybuf_empty(void) { 
+    return key_head == key_tail; 
+}
 static inline void keybuf_push(char c) {
     uint8_t next = (uint8_t)((key_head + 1) & 63);
     if (next != key_tail) { keybuf[key_head] = c; key_head = next; }
 }
 
-static inline int evbuf_empty(void) { return ev_head == ev_tail; }
+static inline int evbuf_empty(void) { 
+    return ev_head == ev_tail; 
+}
 static inline void evbuf_push(unsigned short e) {
     uint8_t next = (uint8_t)((ev_head + 1) & 63);
     if (next != ev_tail) { evbuf[ev_head] = e; ev_head = next; }
@@ -53,15 +57,24 @@ static inline unsigned short evbuf_pop(void) {
 }
 
 static char sc_to_ascii(uint8_t sc){
-    if(sc == 0x2A || sc == 0x36){ shift_pressed = 1; return 0; }
-    if(sc == 0xAA || sc == 0xB6){ shift_pressed = 0; return 0; }
+    if(sc == 0x2A || sc == 0x36){ 
+        shift_pressed = 1; 
+        return 0; 
+    }
+    if(sc == 0xAA || sc == 0xB6){ 
+        shift_pressed = 0; 
+        return 0; 
+    }
     if(sc > 0 && sc < 128) return shift_pressed ? scancode_map_shift[sc] : scancode_map[sc];
     return 0;
 }
 
 static void keyboard_irq_handler(void) {
     uint8_t scancode = inb(kbd_data_port);
-    if (scancode == 0xE0) { e0_pending = 1; return; }
+    if (scancode == 0xE0) { 
+        e0_pending = 1; 
+        return; 
+    }
     if (scancode & 0x80) {
         //key release
         uint8_t code = (uint8_t)(scancode & 0x7F);
@@ -123,10 +136,18 @@ char kb_poll(void) {
     //prefer IRQ-buffered input
     char c = keybuf_pop();
     if (c) return c;
-    //fallback to hardware poll (e.x if interrupts are disabled for some reaosn)
-    if (inb(kbd_status_port) & 1) {
+    //fallback to hardware poll (e.x if interrupts are disabled for some reason)
+    uint8_t status = inb(kbd_status_port);
+    if (status & 1) { //output buffer full
+        if (status & 0x20) {
+            //AUX bit set equals mouse data present do not consume here let mouse driver handle it
+            return 0;
+        }
         uint8_t scancode = inb(kbd_data_port);
-        if (scancode == 0xE0) { e0_pending = 1; return 0; }
+        if (scancode == 0xE0) { 
+            e0_pending = 1; 
+            return 0; 
+        }
         if (scancode & 0x80) {
             uint8_t code = (uint8_t)(scancode & 0x7F);
             if (e0_pending) { ext_key_state[code] = 0; e0_pending = 0; }
@@ -180,7 +201,7 @@ char getkey(void){
     }
 }
 
-unsigned short kbd_getevent(void){
+uint16_t kbd_getevent(void){
     for(;;){
         //buffered events first
         unsigned short e = evbuf_pop();
@@ -206,6 +227,35 @@ unsigned short kbd_getevent(void){
         }
         __asm__ volatile ("hlt");
     }
+}
+
+//non-blocking event poll for GUI loop (does not steal mouse bytes)
+uint16_t kbd_poll_event(void) {
+    //try buffered first
+    unsigned short e = evbuf_pop();
+    if (e) return e;
+
+    //allow fallback conversion without blocking
+    (void)kb_poll();
+
+    e = evbuf_pop();
+    if (e) return e;
+
+    //software repeat without blocking
+    if (repeat_active) {
+        uint32_t now = timer_get_ticks();
+        if ((int32_t)(now - repeat_next_tick) >= 0) {
+            repeat_next_tick = now + KBD_REPEAT_RATE_TICKS;
+            if (repeat_is_ext) {
+                return (unsigned short)(0xE000u | repeat_scancode);
+            } else {
+                char rc = sc_to_ascii(repeat_scancode);
+                if (rc) return (unsigned short)(unsigned char)rc;
+                repeat_active = 0;
+            }
+        }
+    }
+    return 0;
 }
 
 void keyboard_init(void) {
