@@ -8,6 +8,7 @@
 #include "interrupts/idt.h"
 #include "interrupts/pic.h"
 #include "drivers/timer.h"
+#include "drivers/rtc.h"
 
 /* TODO LIST: 
     * = done
@@ -33,7 +34,6 @@
 #define KEYBOARD_DATA_PORT 0x60
 #define KEYBOARD_STATUS_PORT 0x64
 
-char *bsodVer = "classic";
 
 //structs and typedefs
 typedef struct __attribute__((packed)) {
@@ -68,15 +68,33 @@ volatile int currentTick = 0;
 static uint8_t cursor_x = 0;
 static uint8_t cursor_y = 0;
 static uint32_t total_memory_mb = 0;
+static const char* g_panic_reason = 0; //optional reason to display on panic
+char *bsodVer = "classic";
+
 
 
 //function declarations
 void kpanic(void);
 void kshutdown(void);
 void kreboot(void);
+void move_cursor(uint16_t row, uint16_t col);
+void kclear(void);
+void print(char* msg, unsigned char colour);
+void cmd_meminfo(const char *args);
+void cmd_console_colour(const char* args);
+static void update_cursor(void);
+static void scroll_if_needed(void);
+static int putchar_term(char c, unsigned char colour);
+void enable_cursor(uint8_t start, uint8_t end);
 
 void watchdogTick(void) { 
     currentTick++; 
+}
+
+//panic with a custom message stores reason and invokes kpanic screen
+void kpanic_msg(const char* reason){
+    g_panic_reason = reason;
+    kpanic();
 }
 
 void petWatchdog(void) { 
@@ -87,14 +105,6 @@ void watchdogCheck(void) {
     if(currentTick > WATCHDOG_TIMEOUT) kpanic(); 
 }
 
-void kclear(void);
-void print(char* msg, unsigned char colour);
-void cmd_meminfo(const char *args);
-void cmd_console_colour(const char* args);
-static void update_cursor(void);
-static void scroll_if_needed(void);
-static int putchar_term(char c, unsigned char colour);
-void enable_cursor(uint8_t start, uint8_t end);
 
 
 static void cmd_shutdown(const char *args) { 
@@ -130,6 +140,30 @@ static void cmd_echo(const char *args) {
     print("\n",0x0F);
 }
 
+static void cmd_time(const char *args) {
+    (void)args;
+    rtc_time_t t;
+    if (!rtc_read(&t)) {
+        print("\nRTC read failed\n", 0x4F);
+        return;
+    }
+    char buf[64];
+    size_t p = 0;
+    p += ksnprintf(buf + p, sizeof(buf) - p, "\n%u-", t.year);
+    if (t.month < 10 && p + 1 < sizeof(buf)) buf[p++] = '0';
+    p += ksnprintf(buf + p, sizeof(buf) - p, "%u-", t.month);
+    if (t.day < 10 && p + 1 < sizeof(buf)) buf[p++] = '0';
+    p += ksnprintf(buf + p, sizeof(buf) - p, "%u ", t.day);
+    if (t.hour < 10 && p + 1 < sizeof(buf)) buf[p++] = '0';
+    p += ksnprintf(buf + p, sizeof(buf) - p, "%u:", t.hour);
+    if (t.minute < 10 && p + 1 < sizeof(buf)) buf[p++] = '0';
+    p += ksnprintf(buf + p, sizeof(buf) - p, "%u:", t.minute);
+    if (t.second < 10 && p + 1 < sizeof(buf)) buf[p++] = '0';
+    p += ksnprintf(buf + p, sizeof(buf) - p, "%u\n", t.second);
+    buf[(p < sizeof(buf)) ? p : (sizeof(buf) - 1)] = '\0';
+    print(buf, 0x0F);
+}
+
 static void cmd_help(const char *args) {
     (void)args;
     print("\nAvailable commands:\n", 0x0F);
@@ -137,6 +171,7 @@ static void cmd_help(const char *args) {
     print("  clear       - Clear the screen\n", 0x0F);
     print("  echo <text> - Display text\n", 0x0F);
     print("  meminfo     - Show memory information\n", 0x0F);
+    print("  time        - Show current RTC time\n", 0x0F);
     print("  colour <c>  - Change console color\n", 0x0F);
     print("  desktop     - Launch desktop environment\n", 0x0F);
     print("  minifs      - Show filesystem status\n", 0x0F);
@@ -265,6 +300,7 @@ static struct cmd_entry commands[] = {
     {"clear", cmd_clear},
     {"echo", cmd_echo},
     {"meminfo", cmd_meminfo},
+    {"time", cmd_time},
     {"colour", cmd_console_colour},
     {"desktop", cmd_desktop},
     {"minifs", cmd_minifs},
@@ -276,8 +312,7 @@ static struct cmd_entry commands[] = {
     {0, 0}
 };
 
-static void update_cursor(void);
-static void scroll_if_needed(void);
+
 
 void kclear(void){
     unsigned int j = 0;
@@ -349,12 +384,22 @@ void kpanic(void) {
         print_at(":(", 0x1F, 0, 0);
         print_at("Your pc ran into a problem and needs to restart.", 0x1F, 0, 1);
         print_at("Please wait while we gather information about this (0%)", 0x1F, 0, 2);
-        print_at("Error code: ERR_CODE_GOES_HERE_LOLOLOLOL", 0x1F, 0, 3);
+        if (g_panic_reason && g_panic_reason[0]) {
+            print_at("Reason:", 0x1F, 0, 3);
+            print_at((char*)g_panic_reason, 0x1F, 8, 3);
+        } else {
+            print_at("Reason: (unspecified)", 0x1F, 0, 3);
+        }
     } else{
         print_at(" FrostByte ", 0x71, 35, 4); // Gray background, black text
 
-        print_at("A fatal exception 0E has occurred at 0028:C0044526 in VXD VFAT(01) + 00002D6A.", 0x1F, 2, 6);
-        print_at("The current application will be terminated.", 0x1F, 2, 7);
+        if (g_panic_reason && g_panic_reason[0]) {
+            print_at("A fatal error has occurred:", 0x1F, 2, 6);
+            print_at((char*)g_panic_reason, 0x1F, 2, 7);
+        } else {
+            print_at("A fatal exception has occurred.", 0x1F, 2, 6);
+            print_at("The current application will be terminated.", 0x1F, 2, 7);
+        }
         print_at("* Press any key to terminate the current application.", 0x1F, 2, 8);
         print_at("* Press CTRL+ALT+DEL to restart your computer. You will", 0x1F, 2, 9);
         print_at("  lose any unsaved information in all applications.", 0x1F, 2, 10);

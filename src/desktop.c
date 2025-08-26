@@ -477,16 +477,23 @@ static void bring_to_front(int pid) {
 
 
 void cmd_desktop(const char *args) {
-    //parse optional mode flag
+    //parse optional mode flag + vsync flag
     vga_mode_t mode = VGA_MODE_13H;
+    int vsync_enable = 0; //default off
     if (args && *args) {
         if (strstr(args, "12h=yes") || strstr(args, "mode=12h") || strstr(args, "12h")) {
             mode = VGA_MODE_12H;
         }
+        //vsync runtime control vsync=on/yes/1/true or vsync=off/no/0/false
+        if (strstr(args, "vsync=on") || strstr(args, "vsync=1") || strstr(args, "vsync=yes") || strstr(args, "vsync=true")) {
+            vsync_enable = 1;
+        } else if (strstr(args, "vsync=off") || strstr(args, "vsync=0") || strstr(args, "vsync=no") || strstr(args, "vsync=false")) {
+            vsync_enable = 0;
+        }
     }
 
     vga_set_mode(mode);
-    vga_set_vsync_enabled(0);
+    vga_set_vsync_enabled(vsync_enable);
 
     //back buffer and double buffering setup
     static uint8_t backbuffer[640 * 480]; //support largest mode

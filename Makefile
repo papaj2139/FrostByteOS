@@ -55,10 +55,17 @@ pic.o: src/interrupts/pic.c
 isr.o: src/interrupts/isr.asm
 	$(ASM) $(ASMFLAGS) $< -o $@
 
+isr_c.o: src/interrupts/isr.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 timer.o: src/drivers/timer.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o mouse.o serial.o pc_speaker.o vga.o idt.o irq.o pic.o isr.o timer.o
+rtc.o: src/drivers/rtc.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+
+$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o mouse.o serial.o pc_speaker.o vga.o idt.o irq.o pic.o isr.o isr_c.o timer.o rtc.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)

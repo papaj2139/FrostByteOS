@@ -2,6 +2,67 @@
 section .text
 
 extern irq_dispatch
+extern isr_exception_dispatch
+
+;exception stubs (ISRs 0-31)
+%macro ISR_NOERR 1
+global isr%1
+isr%1:
+    pushad
+    push dword 0           ;no error code
+    push dword %1          ;vector number
+    call isr_exception_dispatch
+    add esp, 8             ;pop our args
+    popad
+    iretd
+%endmacro
+
+%macro ISR_ERR 1
+global isr%1
+isr%1:
+    pushad
+    push dword [esp + 32]  ;original CPU-pushed error code
+    push dword %1          ;vector number
+    call isr_exception_dispatch
+    add esp, 8             ;pop our args
+    popad
+    add esp, 4             ;discard original error code
+    iretd
+%endmacro
+
+; Define all 32 exception vectors
+ISR_NOERR 0   ;division by zero error
+ISR_NOERR 1   ;debug
+ISR_NOERR 2   ;non-maskable interrupt
+ISR_NOERR 3   ;breakpoint
+ISR_NOERR 4   ;overflow
+ISR_NOERR 5   ;bound range exceeded
+ISR_NOERR 6   ;invalidopcode
+ISR_NOERR 7   ;device not available
+ISR_ERR 8     ;double Fault (pushes error code)
+ISR_NOERR 9   ;coprocessor segment overrun (reserved)
+ISR_ERR 10    ;invalid TSS
+ISR_ERR 11    ;segment not present
+ISR_ERR 12    ;stack-segment fault
+ISR_ERR 13    ;general protection fault
+ISR_ERR 14    ;page fault
+ISR_NOERR 15  ;reserved
+ISR_NOERR 16  ;x87 floating-point exception
+ISR_ERR 17    ;alignment check
+ISR_NOERR 18  ;machine check
+ISR_NOERR 19  ;SIMD floating-point exception
+ISR_NOERR 20  ;virtualization exception
+ISR_NOERR 21  ;control protection exception
+ISR_NOERR 22  ;reserved
+ISR_NOERR 23  ;reserved
+ISR_NOERR 24  ;reserved
+ISR_NOERR 25  ;reserved
+ISR_NOERR 26  ;reserved
+ISR_NOERR 27  ;reserved
+ISR_NOERR 28  ;hypervisor injection exception
+ISR_NOERR 29  ;VMM communication exception
+ISR_NOERR 30  ;security exception
+ISR_NOERR 31  ;reserved
 
 global irq0
 irq0:
