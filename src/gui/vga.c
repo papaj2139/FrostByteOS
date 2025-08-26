@@ -229,6 +229,12 @@ void vga_set_mode_12h(void) {
         outb(0x3D4, i);
         outb(0x3D5, crtc[i]);
     }
+    // ensure start address = 0 for text buffer
+    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);
+    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);
+    // ensure start address = 0
+    outb(0x3D4, 0x0C); outb(0x3D5, 0x00);
+    outb(0x3D4, 0x0D); outb(0x3D5, 0x00);
     
     //graphics controller registers
     outb(0x3CE, 0x00); outb(0x3CF, 0x00);
@@ -270,8 +276,9 @@ void vga_set_text_mode(void) {
     outb(0x3C2, 0x67);
     
     //sequencer registers
-    outb(0x3C4, 0x00); 
-    outb(0x3C5, 0x03);
+    //assert async reset while programming
+    outb(0x3C4, 0x00);
+    outb(0x3C5, 0x01);
     outb(0x3C4, 0x01); 
     outb(0x3C5, 0x00);
     outb(0x3C4, 0x02); 
@@ -279,7 +286,10 @@ void vga_set_text_mode(void) {
     outb(0x3C4, 0x03); 
     outb(0x3C5, 0x00);
     outb(0x3C4, 0x04); 
-    outb(0x3C5, 0x02);
+    outb(0x3C5, 0x02); // odd/even addressing ON, chain-4 OFF
+    // release reset
+    outb(0x3C4, 0x00);
+    outb(0x3C5, 0x03);
     
     //CRTC for 80x25 text mode
     static const uint8_t crtc[] = {
@@ -313,7 +323,7 @@ void vga_set_text_mode(void) {
     outb(0x3CE, 0x05); 
     outb(0x3CF, 0x10);
     outb(0x3CE, 0x06); 
-    outb(0x3CF, 0x0E);
+    outb(0x3CF, 0x0F); // map CPU window to 0xB8000 (color text)
     outb(0x3CE, 0x07); 
     outb(0x3CF, 0x00);
     outb(0x3CE, 0x08); 
@@ -326,7 +336,7 @@ void vga_set_text_mode(void) {
         outb(0x3C0, i);    //standard palette mapping
     }
     
-    (void)inb(0x3DA); outb(0x3C0, 0x10); outb(0x3C0, 0x0C); //mode control
+    (void)inb(0x3DA); outb(0x3C0, 0x10); outb(0x3C0, 0x08); //mode control text mode, blink off
     (void)inb(0x3DA); outb(0x3C0, 0x11); outb(0x3C0, 0x00); //overscan color
     (void)inb(0x3DA); outb(0x3C0, 0x12); outb(0x3C0, 0x0F); //color plane enable
     (void)inb(0x3DA); outb(0x3C0, 0x13); outb(0x3C0, 0x00); //horizontal pixel panning (no panning)
@@ -355,6 +365,10 @@ void vga_set_text_mode(void) {
     g_mode = VGA_MODE_TEXT;
     g_w = 640;  //approximate pixel width for 80x25 text (8x16 cell)
     g_h = 400;  //approximate pixel height
+
+    //clear text VRAM to spaces with white on black attribute to remove artifacts
+    volatile uint16_t* tm = (volatile uint16_t*)0xB8000;
+    for (int i = 0; i < 80 * 25; ++i) tm[i] = ((uint16_t)0x0F << 8) | ' ';
 }
 
 void vga_set_draw_surface(uint8_t* surface){
