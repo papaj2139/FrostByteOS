@@ -5,6 +5,7 @@
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
 #include "gui/vga.h"
+#include "drivers/serial.h"
 
 #define TASKBAR_HEIGHT 16
 #define MAX_CONTENT 32
@@ -18,12 +19,13 @@ extern void kshutdown(void);
 char current_notepad_text[128] = "";
 
 //structs and typedefs
-typedef enum { WC_LABEL, WC_RECT, WC_TEXTAREA } win_content_type;
+typedef enum { WC_LABEL, WC_RECT, WC_TEXTAREA, WC_BUTTON } win_content_type;
 typedef struct {
     win_content_type type;
     int x, y, w, h;
     uint8_t color;
     char text[64];
+    void (*callback)(void);
 } win_content_t;
 
 typedef struct {
@@ -113,6 +115,19 @@ static start_menu_item_t start_menu_items[] = {
     {"Shutdown", action_shutdown}
 };
 
+static void window_add_button(window_t *win, int x, int y, const char *label, uint8_t colour, void (*callback)(void)) {
+    if (win->content_count >= MAX_CONTENT) return;
+    win_content_t *c = &win->content[win->content_count++];
+    c->type = WC_BUTTON;
+    c->x = x;
+    c->y = y;
+    c->w = 40;       // standard button width
+    c->h = 16;       // standard button height
+    c->color = colour;
+    strncpy(c->text, label, sizeof(c->text)-1);
+    c->text[sizeof(c->text)-1] = '\0';
+    c->callback = callback;
+}
 
 static void window_add_label(window_t *win, int x, int y, const char *text, uint8_t color) {
     if (win->content_count >= MAX_CONTENT) return;
@@ -151,11 +166,17 @@ static void draw_window(window_t *win) {
         switch (c->type) {
             case WC_LABEL: draw_string_small(cx, cy, c->text, c->color); break;
             case WC_RECT:  draw_rect(cx, cy, c->w, c->h, c->color); break;
+            case WC_BUTTON: draw_rect(cx, cy, c->w, c->h, c->color); draw_string_small(cx + 2, cy + 2, c->text, 0); break;
+
         }
     }
 }
 
 // Process Manager
+
+void test_btn(void){
+    DEBUG_PRINT("Clicked button :D");
+}
 
 static int create_process(process_type_t type, int x, int y) {
     if (process_count >= MAX_PROCESSES) return -1;
@@ -190,7 +211,7 @@ static int create_process(process_type_t type, int x, int y) {
             window_add_label(&proc->window, 10, 10, "Calculator App", 15);
             window_add_label(&proc->window, 10, 25, "Display: 0", 14);
             // Add calculator buttons
-            window_add_rect(&proc->window, 10, 40, 20, 15, 12);
+            window_add_button(&proc->window, 10, 40, "Test", test_btn, 12);
             window_add_label(&proc->window, 17, 43, "7", 0);
             window_add_rect(&proc->window, 35, 40, 20, 15, 12);
             window_add_label(&proc->window, 42, 43, "8", 0);
@@ -401,6 +422,22 @@ static int clicked_close(window_t *win, int mx, int my) {
     return mouse_over(mx, my, bx, by, size, size);
 }
 
+static int clicked_button(window_t *win, int mx, int my) {
+    for (int i = 0; i < win->content_count; i++) {
+        win_content_t *c = &win->content[i];
+        if (c->type != WC_BUTTON) continue;
+
+        int bx = win->x + c->x;
+        int by = win->y + 10 + c->y; // offset for titlebar
+        if (mx >= bx && mx < bx + c->w && my >= by && my < by + c->h) {
+            if (c->callback) c->callback();
+            return i;
+        }
+    }
+    return -1; // no button clicked
+}
+
+
 static process_t* find_window_at_position(int mx, int my) {
     for (int i = process_count - 1; i >= 0; i--) {
         if (processes[i].active) {
@@ -503,6 +540,8 @@ void cmd_desktop(const char *args) {
                                 drag_offset_x = cx - clicked_proc->window.x;
                                 drag_offset_y = cy - clicked_proc->window.y;
                                 bring_to_front(clicked_proc->pid);
+                                needs_redraw = 1;
+                            } else if(clicked_button(clicked_proc, cx, cy)){
                                 needs_redraw = 1;
                             }
                         }
