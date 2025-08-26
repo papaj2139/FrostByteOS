@@ -6,12 +6,13 @@ If you encunter any issues please open an issue ticket or email **frostbyte.oper
 
 # Building
 ## Dependencies
+- GNU make (BSD make won't work)
 - i686-elf-gcc or i386-elf-gcc
 - nasm
 - qemu-system-i386 (optional, but if you want `make run` to work)
 
 
-**recommended to build on Linux (I personally use Mint so i'm not too sure about other distros**
+**recommended to build on Linux (I personally use Mint so i'm not too sure about other distros) but any other unix-like, e.x freeBSD, mac osx will work**
 ## Command
 ```bash
 git clone https://github.com/FrostByte-OS/FrostByteOS.git

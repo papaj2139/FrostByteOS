@@ -1,6 +1,6 @@
-#include <stdint.h>
+#include <string.h>
+#include <stddef.h>
 #include "desktop.h"
-#include "string.h"
 #include "io.h"
 #include "drivers/keyboard.h"
 #include "drivers/mouse.h"
@@ -70,6 +70,9 @@ static int start_menu_item_count = 5;
 static uint8_t cursor_bg[CURSOR_H][CURSOR_W];
 static int win_dragging = -1;
 static int drag_offset_x = 0, drag_offset_y = 0;
+
+static int calc_total = 0;
+static int calc_current = 0;
 
 //arrays
 static const uint8_t cursor_bitmap[CURSOR_H][CURSOR_W] = {
@@ -317,21 +320,21 @@ static void action_textmode(void) {
 }
 
 static void draw_taskbar(void) {
-    draw_rect(0, VGA_HEIGHT - TASKBAR_HEIGHT, VGA_WIDTH, TASKBAR_HEIGHT, 12);
+    draw_rect(0, vga_height() - TASKBAR_HEIGHT, vga_width(), TASKBAR_HEIGHT, 12);
     
     // Draw start button
     int button_color = start_menu_open ? 8 : 14; // Darker when pressed
-    draw_rect(2, VGA_HEIGHT - TASKBAR_HEIGHT + 2, start_button_width, TASKBAR_HEIGHT - 4, button_color);
-    draw_string_small(6, VGA_HEIGHT - TASKBAR_HEIGHT + 4, "Start", 0);
+    draw_rect(2, vga_height() - TASKBAR_HEIGHT + 2, start_button_width, TASKBAR_HEIGHT - 4, button_color);
+    draw_string_small(6, vga_height() - TASKBAR_HEIGHT + 4, "Start", 0);
     
     // Draw process indicators in taskbar
     int taskbar_x = start_button_width + 10;
     for (int i = 0; i < process_count; i++) {
         if (processes[i].active) {
-            draw_rect(taskbar_x, VGA_HEIGHT - TASKBAR_HEIGHT + 2, 60, TASKBAR_HEIGHT - 4, 9);
-            draw_string_small(taskbar_x + 2, VGA_HEIGHT - TASKBAR_HEIGHT + 4, processes[i].window.title, 15);
+            draw_rect(taskbar_x, vga_height() - TASKBAR_HEIGHT + 2, 60, TASKBAR_HEIGHT - 4, 9);
+            draw_string_small(taskbar_x + 2, vga_height() - TASKBAR_HEIGHT + 4, processes[i].window.title, 15);
             taskbar_x += 65;
-            if (taskbar_x > VGA_WIDTH - 60) break; // Don't overflow taskbar
+            if (taskbar_x > vga_width() - 60) break; // Don't overflow taskbar
         }
     }
 }
@@ -342,7 +345,7 @@ static void draw_start_menu(void) {
     int menu_width = 80;
     int menu_height = start_menu_item_count * 12 + 4;
     int menu_x = 2;
-    int menu_y = VGA_HEIGHT - TASKBAR_HEIGHT - menu_height;
+    int menu_y = vga_height() - TASKBAR_HEIGHT - menu_height;
     
     // Menu background
     draw_rect(menu_x, menu_y, menu_width, menu_height, 7);
@@ -364,8 +367,8 @@ static void draw_start_menu(void) {
 }
 
 static int clicked_start_button(int mx, int my) {
-    return mx >= 2 && my >= VGA_HEIGHT - TASKBAR_HEIGHT + 2 && 
-           mx < 2 + start_button_width && my < VGA_HEIGHT - 2;
+    return mx >= 2 && my >= vga_height() - TASKBAR_HEIGHT + 2 && 
+           mx < 2 + start_button_width && my < vga_height() - 2;
 }
 
 static int clicked_start_menu_item(int mx, int my) {
@@ -374,7 +377,7 @@ static int clicked_start_menu_item(int mx, int my) {
     int menu_width = 80;
     int menu_height = start_menu_item_count * 12 + 4;
     int menu_x = 2;
-    int menu_y = VGA_HEIGHT - TASKBAR_HEIGHT - menu_height;
+    int menu_y = vga_height() - TASKBAR_HEIGHT - menu_height;
     
     if (mx < menu_x || my < menu_y || mx >= menu_x + menu_width || my >= menu_y + menu_height) 
         return -1;
@@ -387,7 +390,7 @@ static int clicked_start_menu_item(int mx, int my) {
 }
 
 static int clicked_taskbar_process(int mx, int my) {
-    if (my < VGA_HEIGHT - TASKBAR_HEIGHT + 2 || my >= VGA_HEIGHT - 2) return -1;
+    if (my < vga_height() - TASKBAR_HEIGHT + 2 || my >= vga_height() - 2) return -1;
     
     int taskbar_x = start_button_width + 10;
     for (int i = 0; i < process_count; i++) {
@@ -396,7 +399,7 @@ static int clicked_taskbar_process(int mx, int my) {
                 return processes[i].pid;
             }
             taskbar_x += 65;
-            if (taskbar_x > VGA_WIDTH - 60) break;
+            if (taskbar_x > vga_width() - 60) break;
         }
     }
     return -1;
@@ -474,37 +477,52 @@ static void bring_to_front(int pid) {
 
 
 void cmd_desktop(const char *args) {
-    (void)args;
+    //parse optional mode flag
+    vga_mode_t mode = VGA_MODE_13H;
+    if (args && *args) {
+        if (strstr(args, "12h=yes") || strstr(args, "mode=12h") || strstr(args, "12h")) {
+            mode = VGA_MODE_12H;
+        }
+    }
 
-    vga_set_mode_13h();
+    vga_set_mode(mode);
     vga_set_vsync_enabled(0);
 
     //back buffer and double buffering setup
-    static uint8_t backbuffer[VGA_WIDTH * VGA_HEIGHT];
+    static uint8_t backbuffer[640 * 480]; //support largest mode
     vga_set_draw_surface(backbuffer);
 
     //initial state
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) backbuffer[i] = 3;
+    for (int i = 0; i < vga_width() * vga_height(); i++) backbuffer[i] = 3;
     create_process(PROC_WELCOME, 50, 50);
 
-    int cx = VGA_WIDTH / 2 - CURSOR_W / 2;
-    int cy = VGA_HEIGHT / 2 - CURSOR_H / 2;
+    int cx = vga_width() / 2 - CURSOR_W / 2;
+    int cy = vga_height() / 2 - CURSOR_H / 2;
+    int last_cx = cx;
+    int last_cy = cy;
 
     mouse_init();
+    //ensure no stale keyboard events when entering GUI
+    kbd_flush();
     int was_clicking = 0;
     int needs_redraw = 1;
+    int cursor_moved = 0;
+    int has_dirty = 0;
+    int dirty_x = 0, dirty_y = 0, dirty_w = 0, dirty_h = 0;
     int8_t pkt[3];
     for (;;) {
-        // Handle mouse input and update state
+        //handle mouse input and update state with the interrupt-mouse
         if (mouse_poll_packet(pkt)) {
+            int prev_cx = cx;
+            int prev_cy = cy;
             cx += pkt[1];
             cy -= pkt[2];
 
             if (cx < 0) cx = 0;
             if (cy < 0) cy = 0;
-            if (cx >= VGA_WIDTH) cx = VGA_WIDTH - 1;
-            if (cy >= VGA_HEIGHT) cy = VGA_HEIGHT - 1;
-            needs_redraw = 1;
+            if (cx >= vga_width()) cx = vga_width() - 1;
+            if (cy >= vga_height()) cy = vga_height() - 1;
+            if (cx != prev_cx || cy != prev_cy) cursor_moved = 1;
 
             int left_click = (pkt[0] & 0x01) != 0;
             int just_clicked = left_click && !was_clicking;
@@ -541,8 +559,46 @@ void cmd_desktop(const char *args) {
                                 drag_offset_y = cy - clicked_proc->window.y;
                                 bring_to_front(clicked_proc->pid);
                                 needs_redraw = 1;
+<<<<<<< HEAD
                             } else if(clicked_button(clicked_proc, cx, cy)){
                                 needs_redraw = 1;
+=======
+                            } else {
+                                //app-specific click handling
+                                if (clicked_proc->type == PROC_CALCULATOR) {
+                                    window_t *w = &clicked_proc->window;
+                                    int base_x = w->x;
+                                    int base_y = w->y + 10; //content Y offset
+
+                                    int btn_y = base_y + 40; //buttons row Y
+                                    //calculator
+                                    //7
+                                    if (mouse_over(cx, cy, base_x + 10, btn_y, 20, 15)) {
+                                        calc_current = calc_current * 10 + 7;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                        needs_redraw = 1;
+                                    }
+                                    //8
+                                    else if (mouse_over(cx, cy, base_x + 35, btn_y, 20, 15)) {
+                                        calc_current = calc_current * 10 + 8;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                        needs_redraw = 1;
+                                    }
+                                    //9
+                                    else if (mouse_over(cx, cy, base_x + 60, btn_y, 20, 15)) {
+                                        calc_current = calc_current * 10 + 9;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                        needs_redraw = 1;
+                                    }
+                                    //+
+                                    else if (mouse_over(cx, cy, base_x + 85, btn_y, 20, 15)) {
+                                        calc_total += calc_current;
+                                        calc_current = 0;
+                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_total);
+                                        needs_redraw = 1;
+                                    }
+                                }
+>>>>>>> c29448b044ff9b2fec3d1a91165db7b0e3767f94
                             }
                         }
                     }
@@ -558,15 +614,40 @@ void cmd_desktop(const char *args) {
             if (win_dragging != -1) {
                 process_t *drag_proc = get_process(win_dragging);
                 if (drag_proc) {
+                    //previous window rect
+                    int prev_x = drag_proc->window.x;
+                    int prev_y = drag_proc->window.y;
+                    int w = drag_proc->window.w;
+                    int h = drag_proc->window.h;
+
+                    //update to new position
                     drag_proc->window.x = cx - drag_offset_x;
                     drag_proc->window.y = cy - drag_offset_y;
                     if (drag_proc->window.x < 0) drag_proc->window.x = 0;
                     if (drag_proc->window.y < 0) drag_proc->window.y = 0;
-                    if (drag_proc->window.x + drag_proc->window.w > VGA_WIDTH)
-                        drag_proc->window.x = VGA_WIDTH - drag_proc->window.w;
-                    if (drag_proc->window.y + drag_proc->window.h > VGA_HEIGHT - TASKBAR_HEIGHT)
-                        drag_proc->window.y = VGA_HEIGHT - TASKBAR_HEIGHT - drag_proc->window.h;
-                    needs_redraw = 1;
+                    if (drag_proc->window.x + drag_proc->window.w > vga_width())
+                        drag_proc->window.x = vga_width() - drag_proc->window.w;
+                    if (drag_proc->window.y + drag_proc->window.h > vga_height() - TASKBAR_HEIGHT)
+                        drag_proc->window.y = vga_height() - TASKBAR_HEIGHT - drag_proc->window.h;
+
+                    //compute union of old and new rects as dirty area
+                    int new_x = drag_proc->window.x;
+                    int new_y = drag_proc->window.y;
+                    int minx = prev_x < new_x ? prev_x : new_x;
+                    int miny = prev_y < new_y ? prev_y : new_y;
+                    int maxx = (prev_x + w) > (new_x + w) ? (prev_x + w) : (new_x + w);
+                    int maxy = (prev_y + h) > (new_y + h) ? (prev_y + h) : (new_y + h);
+                    //small padding for borders
+                    minx -= 1; miny -= 1; maxx += 1; maxy += 1;
+                    if (minx < 0) minx = 0;
+                    if (miny < 0) miny = 0;
+                    if (maxx > vga_width()) maxx = vga_width();
+                    if (maxy > vga_height()) maxy = vga_height();
+                    dirty_x = minx;
+                    dirty_y = miny;
+                    dirty_w = maxx - minx;
+                    dirty_h = maxy - miny;
+                    has_dirty = (dirty_w > 0 && dirty_h > 0);
                 }
             }
         }
@@ -574,17 +655,35 @@ void cmd_desktop(const char *args) {
         // Keyboard processing
         for (int i = 0; i < process_count; i++) {
             if (processes[i].type == PROC_TEXTMODERET) {
-                vga_set_mode_12h();
+                vga_set_text_mode();
                 return;
             }
             if (processes[i].type == PROC_NOTEPAD && processes[i].active) {
-                char key = kb_poll();
-                if (key) {
-                    size_t len = strlen(current_notepad_text);
-                    if (len < sizeof(current_notepad_text) - 1) {
-                        current_notepad_text[len] = key;
-                        current_notepad_text[len + 1] = '\0';
-                        needs_redraw = 1;
+                unsigned short ev = kbd_poll_event();
+                if (ev) {
+                    if ((ev & 0xFF00u) == 0xE000u) {
+                        //ignore extended keys for notepad atleast fornow 
+                    } else {
+                        char key = (char)(ev & 0xFFu);
+                        size_t len = strlen(current_notepad_text);
+                        if (key == '\b') {
+                            if (len > 0) {
+                                current_notepad_text[len - 1] = '\0';
+                                needs_redraw = 1;
+                            }
+                        } else if ((unsigned char)key >= 32 && (unsigned char)key < 127) {
+                            if (len < sizeof(current_notepad_text) - 1) {
+                                current_notepad_text[len] = key;
+                                current_notepad_text[len + 1] = '\0';
+                                needs_redraw = 1;
+                            }
+                        }
+
+                        //update notepad text label 
+                        if (processes[i].window.content_count >= 3) {
+                            strncpy(processes[i].window.content[2].text, current_notepad_text, sizeof(processes[i].window.content[2].text) - 1);
+                            processes[i].window.content[2].text[sizeof(processes[i].window.content[2].text) - 1] = '\0';
+                        }
                     }
                 }
             }
@@ -592,13 +691,72 @@ void cmd_desktop(const char *args) {
 
         //compose and present only when needed
         if (needs_redraw) {
-            for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) backbuffer[i] = 3; //clear background
+            memset(backbuffer, 3, (size_t)(vga_width() * vga_height())); //clear background
             draw_taskbar();
             draw_start_menu();
             draw_all_windows();
+            //save background under cursor before drawing it
+            save_cursor_bg(cx, cy);
             draw_cursor(cx, cy);
             vga_present(backbuffer);
+            last_cx = cx;
+            last_cy = cy;
             needs_redraw = 0;
+            cursor_moved = 0;
+            has_dirty = 0;
+        }
+        else if (has_dirty) {
+            //recompose whole scene but present only the dirty rectangle + cursor area
+            memset(backbuffer, 3, (size_t)(vga_width() * vga_height()));
+            draw_taskbar();
+            draw_start_menu();
+            draw_all_windows();
+            save_cursor_bg(cx, cy);
+            draw_cursor(cx, cy);
+
+            //include cursor rect to ensure correct cursor over changed background
+            int minx = dirty_x < cx ? dirty_x : cx;
+            int miny = dirty_y < cy ? dirty_y : cy;
+            int maxx = (dirty_x + dirty_w) > (cx + CURSOR_W) ? (dirty_x + dirty_w) : (cx + CURSOR_W);
+            int maxy = (dirty_y + dirty_h) > (cy + CURSOR_H) ? (dirty_y + dirty_h) : (cy + CURSOR_H);
+            if (minx < 0) minx = 0;
+            if (miny < 0) miny = 0;
+            if (maxx > vga_width()) maxx = vga_width();
+            if (maxy > vga_height()) maxy = vga_height();
+            int rw = maxx - minx;
+            int rh = maxy - miny;
+            if (rw > 0 && rh > 0) {
+                vga_present_rect(minx, miny, rw, rh, backbuffer);
+            }
+            last_cx = cx;
+            last_cy = cy;
+            has_dirty = 0;
+            cursor_moved = 0;
+        }
+        else if (cursor_moved) {
+            //fast path only cursor moved, update minimal region
+            //restore old cursor background in backbuffer
+            restore_cursor_bg(last_cx, last_cy);
+            //save new background and draw cursor at new pos
+            save_cursor_bg(cx, cy);
+            draw_cursor(cx, cy);
+
+            int minx = last_cx < cx ? last_cx : cx;
+            int miny = last_cy < cy ? last_cy : cy;
+            int maxx = (last_cx > cx ? last_cx : cx) + CURSOR_W;
+            int maxy = (last_cy > cy ? last_cy : cy) + CURSOR_H;
+            if (minx < 0) minx = 0;
+            if (miny < 0) miny = 0;
+            if (maxx > vga_width()) maxx = vga_width();
+            if (maxy > vga_height()) maxy = vga_height();
+            int rw = maxx - minx;
+            int rh = maxy - miny;
+            if (rw > 0 && rh > 0) {
+                vga_present_rect(minx, miny, rw, rh, backbuffer);
+            }
+            last_cx = cx;
+            last_cy = cy;
+            cursor_moved = 0;
         }
     }
 }
