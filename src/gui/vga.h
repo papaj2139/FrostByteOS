@@ -9,13 +9,14 @@
 
 extern uint8_t* const VGA;
 
-// current VGA mode state
+//current VGA mode state
 typedef enum {
-    VGA_MODE_13H = 0, // 320x200x256 (chunky 8bpp)
-    VGA_MODE_12H = 1  // 640x480x16  (planar 4bpp)
+    VGA_MODE_13H = 0, //320x200x256 (chunky 8bpp)
+    VGA_MODE_12H = 1, //640x480x16  (planar 4bpp)
+    VGA_MODE_TEXT = 2 //80x25 text mode (character/attribute)
 } vga_mode_t;
 
-// mode management
+//mode management
 void vga_set_mode(vga_mode_t mode);
 vga_mode_t vga_get_mode(void);
 int vga_width(void);

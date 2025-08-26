@@ -21,6 +21,9 @@ void vga_set_mode(vga_mode_t mode) {
         case VGA_MODE_12H:
             vga_set_mode_12h();
             break;
+        case VGA_MODE_TEXT:
+            vga_set_text_mode();
+            break;
     }
     g_programmed = 1;
 }
@@ -28,6 +31,7 @@ void vga_set_mode(vga_mode_t mode) {
 void vga_present_rect(int x, int y, int w, int h, const uint8_t* surface){
     if (!surface) surface = g_draw_surface;
     if (surface == VGA) return;
+    if (g_mode == VGA_MODE_TEXT) return; //no graphics upload in text mode
 
     //clip to bounds
     if (x < 0) { w += x; x = 0; }
@@ -325,12 +329,32 @@ void vga_set_text_mode(void) {
     (void)inb(0x3DA); outb(0x3C0, 0x10); outb(0x3C0, 0x0C); //mode control
     (void)inb(0x3DA); outb(0x3C0, 0x11); outb(0x3C0, 0x00); //overscan color
     (void)inb(0x3DA); outb(0x3C0, 0x12); outb(0x3C0, 0x0F); //color plane enable
-    (void)inb(0x3DA); outb(0x3C0, 0x13); outb(0x3C0, 0x08); //horizontal pixel panning
+    (void)inb(0x3DA); outb(0x3C0, 0x13); outb(0x3C0, 0x00); //horizontal pixel panning (no panning)
     (void)inb(0x3DA); outb(0x3C0, 0x14); outb(0x3C0, 0x00); //color select
-    
+
+    //program DAC with standard 16-color palette (6-bit per channel)
+    outb(0x3C6, 0xFF); //PEL mask
+    outb(0x3C8, 0x00); //start at color 0
+    static const uint8_t dac16[16][3] = {
+        {  0,  0,  0}, {  0,  0, 42}, {  0, 42,  0}, {  0, 42, 42},
+        { 42,  0,  0}, { 42,  0, 42}, { 42, 21,  0}, { 42, 42, 42},
+        { 21, 21, 21}, { 21, 21, 63}, { 21, 63, 21}, { 21, 63, 63},
+        { 63, 21, 21}, { 63, 21, 63}, { 63, 63, 21}, { 63, 63, 63}
+    };
+    for (int i = 0; i < 16; ++i) {
+        outb(0x3C9, dac16[i][0]);
+        outb(0x3C9, dac16[i][1]);
+        outb(0x3C9, dac16[i][2]);
+    }
+
     //enable video
     (void)inb(0x3DA);
     outb(0x3C0, 0x20);
+
+    //update internal mode state
+    g_mode = VGA_MODE_TEXT;
+    g_w = 640;  //approximate pixel width for 80x25 text (8x16 cell)
+    g_h = 400;  //approximate pixel height
 }
 
 void vga_set_draw_surface(uint8_t* surface){
@@ -355,6 +379,7 @@ void vga_wait_vsync(void){
 void vga_present(const uint8_t* surface){
     if (!surface) surface = g_draw_surface;
     if (surface == VGA) return;
+    if (g_mode == VGA_MODE_TEXT) return; // no graphics upload in text mode
     if (g_vsync_enabled) vga_wait_vsync();
     const uint8_t* src8 = surface;
     uint8_t* dst8 = VGA;
