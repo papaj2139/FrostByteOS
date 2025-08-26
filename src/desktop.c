@@ -566,14 +566,10 @@ void cmd_desktop(const char *args) {
                                 drag_offset_y = cy - clicked_proc->window.y;
                                 bring_to_front(clicked_proc->pid);
                                 needs_redraw = 1;
-<<<<<<< HEAD
-                            } else if(clicked_button(clicked_proc, cx, cy)){
-                                needs_redraw = 1;
-=======
                             } else {
                                 //app-specific click handling
                                 if (clicked_proc->type == PROC_CALCULATOR) {
-                                    window_t *w = &clicked_proc->window;
+                                     window_t *w = &clicked_proc->window;
                                     int base_x = w->x;
                                     int base_y = w->y + 10; //content Y offset
 
@@ -605,7 +601,6 @@ void cmd_desktop(const char *args) {
                                         needs_redraw = 1;
                                     }
                                 }
->>>>>>> c29448b044ff9b2fec3d1a91165db7b0e3767f94
                             }
                         }
                     }
