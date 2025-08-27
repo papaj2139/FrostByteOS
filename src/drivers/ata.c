@@ -40,6 +40,9 @@ static const device_ops_t ata_ops = {
     .cleanup = ata_device_cleanup
 };
 
+static device_t ata_devices[4];
+static ata_device_data_t ata_device_data[4];
+static int ata_drive_count = 0;
 
 void ata_init(void) {
     //idk might ad something here laer
@@ -258,10 +261,6 @@ void ata_device_cleanup(device_t* device) {
         //nothing yet theres no memory managment
     }
 }
-
-static device_t ata_devices[4];
-static ata_device_data_t ata_device_data[4];
-static int ata_drive_count = 0;
 
 void ata_probe_and_register(void) {
     uint16_t ports[] = {ATA_PRIMARY_DATA, ATA_SECONDARY_DATA};
