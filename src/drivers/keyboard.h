@@ -1,6 +1,8 @@
 #ifndef KEYBOARD_H
 #define KEYBOARD_H
 
+#include "../device_manager.h"
+
 #define kbd_data_port 0x60
 #define kbd_status_port 0x64
 
@@ -37,5 +39,14 @@ unsigned short kbd_poll_event(void);
 void keyboard_init(void);
 //clear any pending keyboard events and reset repeat state
 void kbd_flush(void);
+
+//device manager integration
+device_t* keyboard_create_device(void);
+int keyboard_device_init(device_t* device);
+int keyboard_register_device(void);
+int keyboard_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size);
+int keyboard_device_write(device_t* device, uint32_t offset, const void* buffer, uint32_t size);
+int keyboard_device_ioctl(device_t* device, uint32_t cmd, void* arg);
+void keyboard_device_cleanup(device_t* device);
 
 #endif

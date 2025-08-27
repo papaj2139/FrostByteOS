@@ -64,8 +64,31 @@ timer.o: src/drivers/timer.c
 rtc.o: src/drivers/rtc.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+ata.o: src/drivers/ata.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o mouse.o serial.o pc_speaker.o vga.o idt.o irq.o pic.o isr.o isr_c.o timer.o rtc.o
+syscall.o: src/syscall.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+syscall_asm.o: src/syscall_asm.asm
+	$(ASM) $(ASMFLAGS) $< -o $@
+
+gdt.o: src/interrupts/gdt.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+gdt_asm.o: src/interrupts/gdt_asm.asm
+	$(ASM) $(ASMFLAGS) $< -o $@
+
+tss.o: src/interrupts/tss.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+device_manager.o: src/device_manager.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+stdlib.o: src/libc/stdlib.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o mouse.o serial.o pc_speaker.o vga.o idt.o irq.o pic.o isr.o isr_c.o timer.o rtc.o syscall.o syscall_asm.o gdt.o gdt_asm.o tss.o device_manager.o ata.o stdlib.o 
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)
@@ -74,14 +97,17 @@ iso: $(KERNEL)
 	cp boot/grub/grub.cfg isodir/boot/grub/
 	grub-mkrescue -o $(ISO_NAME) isodir
 
-run: iso
-	qemu-system-i386 -cdrom $(ISO_NAME)
+run: iso disk.img
+	qemu-system-i386 -cdrom $(ISO_NAME) -hda disk.img
 
-run-serial: iso
-	qemu-system-i386 -cdrom $(ISO_NAME) -serial stdio
+run-serial: iso disk.img
+	qemu-system-i386 -cdrom $(ISO_NAME) -hda disk.img -serial stdio
 
-run-sound: iso
-	qemu-system-i386 -cdrom $(ISO_NAME) -audiodev alsa,id=snd0 -machine pcspk-audiodev=snd0
+run-sound: iso disk.img
+	qemu-system-i386 -cdrom $(ISO_NAME) -hda disk.img -audiodev alsa,id=snd0 -machine pcspk-audiodev=snd0
+
+disk.img:
+	dd if=/dev/zero of=disk.img bs=1M count=1
 
 clean:
 	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir

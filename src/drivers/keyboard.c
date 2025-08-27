@@ -3,7 +3,9 @@
 #include "../interrupts/irq.h"
 #include "../interrupts/pic.h"
 #include "timer.h"
+#include "../device_manager.h"
 #include <stdint.h>
+#include <string.h>
 
 int shift_pressed = 0;
 
@@ -274,4 +276,109 @@ void kbd_flush(void) {
     repeat_scancode = 0;
     repeat_next_tick = 0;
     __asm__ volatile ("sti");
+}
+
+
+//device operations for keyboard
+static const device_ops_t keyboard_ops = {
+    .init = keyboard_device_init,
+    .read = keyboard_device_read,
+    .write = keyboard_device_write,
+    .ioctl = keyboard_device_ioctl,
+    .cleanup = keyboard_device_cleanup
+};
+
+//keyboard device instance
+static device_t keyboard_device;
+
+device_t* keyboard_create_device(void) {
+    //initialize device structure
+    strcpy(keyboard_device.name, "ps2kbd0");
+    keyboard_device.type = DEVICE_TYPE_INPUT;
+    keyboard_device.status = DEVICE_STATUS_UNINITIALIZED;
+    keyboard_device.device_id = 0; //will be assigned by device manager
+    keyboard_device.private_data = NULL;
+    keyboard_device.ops = &keyboard_ops;
+    keyboard_device.next = NULL;
+    
+    return &keyboard_device;
+}
+
+int keyboard_device_init(device_t* device) {
+    (void)device; //unused for now
+    
+    //keyboard is already initialized by keyboard_init()
+    //just verify it's working
+    return 0; //success
+}
+
+int keyboard_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size) {
+    (void)device; //unused
+    (void)offset; //unused for keyboard
+    
+    if (!buffer || size == 0) {
+        return -1;
+    }
+    
+    char* char_buffer = (char*)buffer;
+    uint32_t bytes_read = 0;
+    
+    //read available characters
+    while (bytes_read < size) {
+        char c = kb_poll(); //non-blocking poll
+        if (c == 0) {
+            break; //no more characters available
+        }
+        char_buffer[bytes_read] = c;
+        bytes_read++;
+    }
+    
+    return bytes_read;
+}
+
+int keyboard_device_write(device_t* device, uint32_t offset, const void* buffer, uint32_t size) {
+    (void)device;
+    (void)offset;
+    (void)buffer;
+    (void)size;
+    
+    //keyboard is input-only device
+    return -1;
+}
+
+int keyboard_device_ioctl(device_t* device, uint32_t cmd, void* arg) {
+    (void)device;
+    (void)cmd;
+    (void)arg;
+    
+    //no ioctl commands implemented yet
+    return -1;
+}
+
+void keyboard_device_cleanup(device_t* device) {
+    (void)device;
+    //nothing to cleanup for keyboard
+}
+
+int keyboard_register_device(void) {
+    //create keyboard device
+    device_t* kbd_device = keyboard_create_device();
+    if (!kbd_device) {
+        return -1;
+    }
+    
+    //register with device manager first
+    if (device_register(kbd_device) != 0) {
+        keyboard_device_cleanup(kbd_device);
+        return -1;
+    }
+    
+    //then initialize through device manager
+    if (device_init(kbd_device) != 0) {
+        //cleanup on failure
+        device_unregister(kbd_device->device_id);
+        return -1;
+    }
+    
+    return 0;
 }

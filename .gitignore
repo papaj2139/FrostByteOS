@@ -3,3 +3,5 @@
 *.elf
 isodir/
 .vscode/
+*.bin
+*.img
