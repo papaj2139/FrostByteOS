@@ -13,6 +13,19 @@ typedef enum {
     DEVICE_TYPE_UNKNOWN
 } device_type_t;
 
+//device subtypes
+typedef enum {
+    DEVICE_SUBTYPE_GENERIC,      //default subtype
+    DEVICE_SUBTYPE_AUDIO,        //audio devices
+    DEVICE_SUBTYPE_DISPLAY,      //display/output devices
+    DEVICE_SUBTYPE_KEYBOARD,     //keyboard input
+    DEVICE_SUBTYPE_MOUSE,        //mouse input
+    DEVICE_SUBTYPE_STORAGE_ATA,  //ATA storage
+    DEVICE_SUBTYPE_STORAGE_USB,  //USB storage
+    DEVICE_SUBTYPE_NETWORK_ETH,  //Ethernet network
+    DEVICE_SUBTYPE_NETWORK_WIFI, //WiFi network
+} device_subtype_t;
+
 //device status
 typedef enum {
     DEVICE_STATUS_UNINITIALIZED,
@@ -38,6 +51,7 @@ typedef struct {
 typedef struct device {
     char name[32];
     device_type_t type;
+    device_subtype_t subtype;
     device_status_t status;
     uint32_t device_id;
     void* private_data;
@@ -52,6 +66,8 @@ int device_unregister(uint32_t device_id);
 device_t* device_find_by_id(uint32_t device_id);
 device_t* device_find_by_name(const char* name);
 device_t* device_find_by_type(device_type_t type);
+device_t* device_find_by_subtype(device_subtype_t subtype);
+device_t* device_find_by_type_and_subtype(device_type_t type, device_subtype_t subtype);
 void device_list_all(void);
 int device_init(device_t* device);
 int device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size);

@@ -93,7 +93,6 @@ device_t* device_find_by_type(device_type_t type) {
 void device_list_all(void) {
     device_t* current = device_list_head;
     
-    
     if (!current) {
         print("  No devices registered\n", 0x0C);
         return;
@@ -129,6 +128,40 @@ void device_list_all(void) {
                 break;
         }
         
+        print(" Subtype: ", 0x0F);
+        switch (current->subtype) {
+            case DEVICE_SUBTYPE_GENERIC:
+                print("Generic", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_AUDIO:
+                print("Audio", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_DISPLAY:
+                print("Display", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_KEYBOARD:
+                print("Keyboard", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_MOUSE:
+                print("Mouse", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_STORAGE_ATA:
+                print("ATA Storage", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_STORAGE_USB:
+                print("USB Storage", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_NETWORK_ETH:
+                print("Ethernet", 0x0F);
+                break;
+            case DEVICE_SUBTYPE_NETWORK_WIFI:
+                print("WiFi", 0x0F);
+                break;
+            default:
+                print("Unknown", 0x0F);
+                break;
+        }
+        
         print(" Status: ", 0x0F);
         switch (current->status) {
             case DEVICE_STATUS_READY:
@@ -152,6 +185,34 @@ void device_list_all(void) {
         current = current->next;
     }
 }
+
+device_t* device_find_by_subtype(device_subtype_t subtype) {
+    device_t* current = device_list_head;
+    
+    while (current) {
+        if (current->subtype == subtype) {
+            return current;
+        }
+        current = current->next;
+    }
+    
+    return NULL;
+}
+
+device_t* device_find_by_type_and_subtype(device_type_t type, device_subtype_t subtype) {
+    device_t* current = device_list_head;
+    
+    while (current) {
+        if (current->type == type && current->subtype == subtype) {
+            return current;
+        }
+        current = current->next;
+    }
+    
+    return NULL;
+}
+
+
 
 int device_init(device_t* device) {
     if (!device || !device->ops || !device->ops->init) {

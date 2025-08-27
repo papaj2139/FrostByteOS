@@ -27,6 +27,17 @@ static volatile uint8_t  repeat_active = 0;
 static volatile uint8_t  repeat_is_ext = 0;
 static volatile uint8_t  repeat_scancode = 0; //base scancode (without 0xE0/0x80)
 static volatile uint32_t repeat_next_tick = 0;
+//keyboard device instance
+static device_t keyboard_device;
+//device operations for keyboard
+static const device_ops_t keyboard_ops = {
+    .init = keyboard_device_init,
+    .read = keyboard_device_read,
+    .write = keyboard_device_write,
+    .ioctl = keyboard_device_ioctl,
+    .cleanup = keyboard_device_cleanup
+};
+
 
 static inline int keybuf_empty(void) { 
     return key_head == key_tail; 
@@ -278,23 +289,11 @@ void kbd_flush(void) {
     __asm__ volatile ("sti");
 }
 
-
-//device operations for keyboard
-static const device_ops_t keyboard_ops = {
-    .init = keyboard_device_init,
-    .read = keyboard_device_read,
-    .write = keyboard_device_write,
-    .ioctl = keyboard_device_ioctl,
-    .cleanup = keyboard_device_cleanup
-};
-
-//keyboard device instance
-static device_t keyboard_device;
-
 device_t* keyboard_create_device(void) {
     //initialize device structure
     strcpy(keyboard_device.name, "ps2kbd0");
     keyboard_device.type = DEVICE_TYPE_INPUT;
+    keyboard_device.subtype = DEVICE_SUBTYPE_KEYBOARD;
     keyboard_device.status = DEVICE_STATUS_UNINITIALIZED;
     keyboard_device.device_id = 0; //will be assigned by device manager
     keyboard_device.private_data = NULL;

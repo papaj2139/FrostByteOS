@@ -291,6 +291,7 @@ void ata_probe_and_register(void) {
                 
                 dev->type = DEVICE_TYPE_STORAGE;
                 dev->status = DEVICE_STATUS_UNINITIALIZED; //will be set to READY by devicd manager
+                dev->subtype = DEVICE_SUBTYPE_STORAGE_ATA;
                 dev->ops = &ata_ops;
                 dev->next = NULL;
 
