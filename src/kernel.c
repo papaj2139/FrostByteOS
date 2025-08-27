@@ -1,14 +1,25 @@
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "desktop.h"
 #include "io.h"
 #include "drivers/serial.h"
 #include "drivers/keyboard.h"
+#include "device_manager.h"
 #include "drivers/pc_speaker.h"
 #include "interrupts/idt.h"
 #include "interrupts/pic.h"
 #include "drivers/timer.h"
 #include "drivers/rtc.h"
+#include "drivers/ata.h"
+#include "syscall.h"
+#include "interrupts/gdt.h"
+#include "interrupts/tss.h"
+#include "drivers/mouse.h"
+
+//forward declaration for direct syscall testing
+extern int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4, uint32_t arg5);
+extern void enter_user_mode(void);
 
 /* TODO LIST: 
     * = done
@@ -86,6 +97,7 @@ static void update_cursor(void);
 static void scroll_if_needed(void);
 static int putchar_term(char c, unsigned char colour);
 void enable_cursor(uint8_t start, uint8_t end);
+static void hex_dump(const uint8_t* data, size_t size, unsigned char colour);
 
 void watchdogTick(void) { 
     currentTick++; 
@@ -166,20 +178,25 @@ static void cmd_time(const char *args) {
 
 static void cmd_help(const char *args) {
     (void)args;
-    print("\nAvailable commands:\n", 0x0F);
-    print("  help        - Show this help message\n", 0x0F);
-    print("  clear       - Clear the screen\n", 0x0F);
-    print("  echo <text> - Display text\n", 0x0F);
+    print("\nAvailable commands (type 'help' to show this message):\n\n", 0x0F);
+    
+    print("System Information:\n", 0x0E);
     print("  meminfo     - Show memory information\n", 0x0F);
     print("  time        - Show current RTC time\n", 0x0F);
-    print("  colour <c>  - Change console color\n", 0x0F);
-    print("  desktop     - Launch desktop environment\n", 0x0F);
-    print("  minifs      - Show filesystem status\n", 0x0F);
-    print("  shutdown    - Shutdown the system\n", 0x0F);
+    print("  devices     - List all registered devices\n", 0x0F);
+    print("  devtest     - Test device functionality\n", 0x0F);
+    print("  minifs      - Minimal filesystem commands\n\n", 0x0F);
+    print("  clear       - Clear the screen\n", 0x0F);
+    print("  colour <c>  - Change console color attribute\n", 0x0F);
+    print("  echo <text> - Display text\n", 0x0F);
+    print("  desktop     - Start the desktop environment\n", 0x0F);
+    print("  iceedit     - ICE (Interpreted Compiled Executable) Editor\n", 0x0F);
+    print("  loadapp     - Load and execute application from disk (sector 50)\n", 0x0F);    
+    print("  readsector <dev> <sector> - Read a sector from a device\n", 0x0F);
     print("  reboot      - Reboot the system\n", 0x0F);
-    print("  induce(kernel.panic()) - Trigger kernel panic\n", 0x0F);
-    print("  iceedit     - Opens the ICE (Interprated Compiled Executable) Editor\n", 0x0F);
-    print("  bsodVer <classic, modern>  - Sets the kernel panic screen to windows-inspired screens (modern = emoticon screen, classic = A fatal exeption...)", 0x0F);
+    print("  shutdown    - Shut down the system\n", 0x0F);
+    print("  bsodVer <classic|modern> - Set BSOD style (modern=emoticon, classic=fatal exception)\n", 0x0F);
+    print("  induce(kernel.panic()) - Trigger kernel panic (debug)\n", 0x0F);
     print("\n", 0x0F);
 }
 
@@ -293,7 +310,168 @@ void cmd_kpset(const char *args){
     strncpy(bsodVer, args, strlen(args));
     bsodVer[strlen(args)] = '\0';
 }
+static void cmd_loadapp(const char *args) {
+    (void)args;
+    print("\nLoading app from disk sector 50...\n", 0x0F);
+    
+    //allocate buffer for one sector
+    static uint8_t buffer[512];
+    
+    print("Loading user application...\n", 0x0F);
+    device_t* ata_dev = device_find_by_name("ata0");
+    if (!ata_dev) {
+        print("ATA device ata0 not found!\n", 0x0F);
+        return;
+    }
 
+    int bytes_read = device_read(ata_dev, 50 * 512, buffer, 512); //read 1 sector from LBA 50
+
+    if (bytes_read == 512) {
+        memcpy((void*)0x1000000, buffer, 512);  //safe address
+        print("User application loaded at 0x1000000\n", 0x0F);
+        print("About to switch to user mode...\n", 0x0F);
+        
+        //check if we actually have valid code
+        uint32_t* code = (uint32_t*)0x1000000;
+        print("First 4 bytes of loaded code: ", 0x0F);
+        char hex[12];
+        for (int i = 0; i < 8; i++) {
+            hex[i] = "0123456789ABCDEF"[((uint8_t*)code)[i/2] >> ((i%2) ? 0 : 4) & 0xF];
+        }
+        hex[8] = '\n';
+        hex[9] = '\0';
+        print(hex, 0x0F);
+        
+        //disable interrupts during user mode switch
+        __asm__ volatile ("cli");
+        
+        print("Switching to user mode now...\n", 0x0F);
+    } else {
+        print("Failed to read from ATA drive\n", 0x0F);
+        return;
+    }
+
+    //switch to user mode and execute the app
+    __asm__ volatile (
+        "cli\n"                  //disable interrupts
+        "mov $0x23, %%ax\n"     //user data segment with RPL 3
+        "mov %%ax, %%ds\n"
+        "mov %%ax, %%es\n"
+        "mov %%ax, %%fs\n"
+        "mov %%ax, %%gs\n"
+        
+        //set up stack frame for iret
+        "pushl $0x23\n"         //SS (user data segment with RPL 3)
+        "pushl $0x2000000\n"    //ESP (user stack pointer)
+        "pushf\n"               //EFLAGS
+        "popl %%eax\n"          //get current flags
+        "andl $~0x200, %%eax\n" //clear IF to disable interrupts in user mode
+        "pushl %%eax\n"         //push modified flags
+        "pushl $0x1B\n"         //CS (user code segment with RPL 3)
+        "pushl $0x1000000\n"    //EIP (entry point)
+        "iret\n"                //switch to user mode
+        :
+        :
+        : "eax", "memory"
+    );
+}
+
+static void cmd_devices(const char *args) {
+    (void)args;
+    print("\nRegistered devices:\n", 0x0F);
+    device_list_all();
+}
+
+static void cmd_devtest(const char *args) {
+    (void)args;
+    print("\nTesting device operations...\n", 0x0F);
+    
+    //find ATA device
+    device_t* ata_dev = device_find_by_type(DEVICE_TYPE_STORAGE);
+    if (!ata_dev) {
+        print("No storage device found!\n", 0x0C);
+        return;
+    }
+    
+    //test reading sector 50 via device manager
+    static uint8_t buffer[512];
+    int result = device_read(ata_dev, 50 * 512, buffer, 512);
+    
+    if (result == 512) {
+        print("Device read successful! First 16 bytes:\n", 0x0A);
+        for (int i = 0; i < 16; i++) {
+            char hex[4];
+            hex[0] = "0123456789ABCDEF"[buffer[i] >> 4];
+            hex[1] = "0123456789ABCDEF"[buffer[i] & 0xF];
+            hex[2] = ' ';
+            hex[3] = '\0';
+            print(hex, 0x0F);
+        }
+        print("\n", 0x0F);
+    } else {
+        print("Device read failed!\n", 0x0C);
+    }
+}
+
+static void cmd_readsector(const char *args) {
+    if (!args || !*args) {
+        print("\nUsage: readsector <device> <sector>  e.g., readsector ata0 50 or readsector ata0 0x32\n", 0x0F);
+        return;
+    }
+
+    //skip leading spaces
+    while (*args == ' ') args++;
+
+    //parse device name
+    const char* dev_start = args;
+    while (*args && *args != ' ') args++;
+    size_t dev_len = args - dev_start;
+    if (dev_len == 0) {
+        print("\nError: Missing device name\n", 0x4F);
+        return;
+    }
+
+    char dev_name[32];
+    if (dev_len >= sizeof(dev_name)) {
+        print("\nError: Device name too long\n", 0x4F);
+        return;
+    }
+    memcpy(dev_name, dev_start, dev_len);
+    dev_name[dev_len] = '\0';
+
+    //skip spaces to sector str
+    while (*args == ' ') args++;
+    const char* sector_str = args;
+    if (!*sector_str) {
+        print("\nError: Missing sector number\n", 0x4F);
+        return;
+    }
+
+    //find device
+    device_t* dev = device_find_by_name(dev_name);
+    if (!dev) {
+        print("\nError: Device not found\n", 0x4F);
+        return;
+    }
+
+    //parse sector
+    uint32_t sector;
+    if (!parse_u32(sector_str, &sector)) {
+        print("\nError: Invalid sector number\n", 0x4F);
+        return;
+    }
+
+    //read sector
+    uint8_t buffer[512] = {0};  //initialize buffer with zeros
+    int bytes_read = device_read(dev, sector * 512UL, buffer, 512);
+    if (bytes_read != 512) {
+        print("\nError: Failed to read sector\n", 0x4F);
+        return;
+    }
+
+    print("\nSector contents (hex dump):\n", 0x0F);
+    hex_dump(buffer, 512, 0x0F);
+}
 
 static struct cmd_entry commands[] = {
     {"help", cmd_help},
@@ -305,17 +483,23 @@ static struct cmd_entry commands[] = {
     {"desktop", cmd_desktop},
     {"minifs", cmd_minifs},
     {"shutdown", cmd_shutdown},
+    {"loadapp", cmd_loadapp},
+    {"devices", cmd_devices},
+    {"devtest", cmd_devtest},
     {"reboot", cmd_reboot},
     {"induce(kernel.panic())", cmd_induce},
     {"iceedit", cmd_iceedit},
     {"bsodVer", cmd_kpset},
-    {0, 0}
+    {"readsector", cmd_readsector},
+    {NULL, NULL}
 };
+
 
 
 
 void kclear(void){
     unsigned int j = 0;
+
     while(j < SCREEN_WIDTH * SCREEN_HEIGHT){
         VID_MEM[j * 2] = ' ';
         VID_MEM[j * 2 + 1] = 0x0F;
@@ -359,7 +543,7 @@ void print(char* msg, unsigned char colour){
 }
 
 
-void print_at(const char* str, unsigned char attr, unsigned int x, unsigned int y) {
+static void print_at(const char* str, unsigned char attr, unsigned int x, unsigned int y) {
     unsigned int i = 0;
     unsigned int pos = (y * SCREEN_WIDTH + x) * 2;
     while (str[i]) {
@@ -695,13 +879,42 @@ void move_cursor(uint16_t row, uint16_t col){
 }
 
 
-//now it use sthe proper IRQ keyboard driver 
+//get keyboard input through device manager
+char getkey_device_manager(void) {
+    //find keyboard device hardcoded to PS/2 for now 
+    device_t* kbd_device = device_find_by_name("ps2kbd0");
+    if (!kbd_device) {
+        return 0; //no keyboard device found
+    }
+    
+    //poll for input through device manager
+    char buffer[1];
+    int bytes_read = device_read(kbd_device, 0, buffer, 1);
+    if (bytes_read > 0) {
+        return buffer[0];
+    }
+    return 0; //no input available
+}
+
+//blocking version that waits for input
+char getkey_blocking_device_manager(void) {
+    for(;;) {
+        char ch = getkey_device_manager();
+        if (ch != 0) {
+            return ch;
+        }
+        //small delay to avoid busy waiting
+        for(volatile int i = 0; i < 1000; i++);
+    }
+}
+
+//now uses device manager for keyboard input
 void input(char *buffer, size_t size){
     size_t len = 0;
     for(size_t i = 0; i < size; ++i) buffer[i] = 0;
     enable_cursor(14, 15);
     for(;;){
-        char ch = getkey(); //blocks until a key is available
+        char ch = getkey_blocking_device_manager(); //blocks until a key is available through device manager
         if(!ch) continue;
         if(ch == '\n'){
             buffer[len] = 0;
@@ -724,36 +937,31 @@ void input(char *buffer, size_t size){
     }
 }
 
-
-// Parse decimal or 0xHH into a u8. Returns 1 on success, 0 on failure.
-static int parse_u8(const char* s, unsigned char* out){
-    if(!s) return 0;
-    while(*s == ' ') s++;
-    if(!*s) return 0;
-    unsigned int val = 0;
-    if(s[0] == '0' && (s[1] == 'x' || s[1] == 'X')){
-        s += 2;
-        if(!*s) return 0;
-        while(*s){
-            char c = *s;
-            unsigned int d;
-            if(c >= '0' && c <= '9') d = (unsigned int)(c - '0');
-            else if(c >= 'a' && c <= 'f') d = 10u + (unsigned int)(c - 'a');
-            else if(c >= 'A' && c <= 'F') d = 10u + (unsigned int)(c - 'A');
-            else break;
-            val = (val << 4) | d;
-            if(val > 255u) { val = 255u; break; }
-            s++;
+static void hex_dump(const uint8_t* data, size_t size, unsigned char colour) {
+    char buf[80];
+    for (size_t i = 0; i < size; i += 16) {
+        size_t len = 0;
+        len += ksnprintf(buf + len, sizeof(buf) - len, "%08x: ", (uint32_t)i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < size) {
+                len += ksnprintf(buf + len, sizeof(buf) - len, "%02x ", data[i + j]);
+            } else {
+                len += ksnprintf(buf + len, sizeof(buf) - len, "   ");
+            }
         }
-    } else {
-        while(*s >= '0' && *s <= '9'){
-            val = val * 10u + (unsigned int)(*s - '0');
-            if(val > 255u) { val = 255u; break; }
-            s++;
+        len += ksnprintf(buf + len, sizeof(buf) - len, " ");
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < size) {
+                char c = data[i + j];
+                len += ksnprintf(buf + len, sizeof(buf) - len, "%c", (c >= 32 && c <= 126) ? c : '.');
+            } else {
+                len += ksnprintf(buf + len, sizeof(buf) - len, " ");
+            }
         }
+        buf[len] = '\0';
+        print(buf, colour);
+        print("\n", colour);
     }
-    *out = (unsigned char)val;
-    return 1;
 }
 
 void cmd_console_colour(const char* args){
@@ -826,11 +1034,45 @@ void kmain(uint32_t magic, uint32_t addr) {
     speaker_init();
     DEBUG_PRINT("FrostByteOS kernel started");
 
+    //initialize GDT and TSS
+    gdt_init();
+    DEBUG_PRINT("GDT initialized");
+    tss_init();
+    DEBUG_PRINT("TSS initialized");
+    
+    //initialize device manager
+    device_manager_init();
+    DEBUG_PRINT("Device manager initialized");
+    
+    //initialize and register ATA driver
+    ata_init();
+    DEBUG_PRINT("ATA driver initialized");
+    
+    ata_probe_and_register();
+    DEBUG_PRINT("ATA device probing complete");
+    
+    //register keyboard device
+    if (keyboard_register_device() == 0) {
+        DEBUG_PRINT("Keyboard device registered with device manager");
+    } else {
+        DEBUG_PRINT("Failed to register keyboard device");
+    }
+    //register mouse device
+    if (mouse_register_device() == 0) {
+        DEBUG_PRINT("Mouse device registered with device manager");
+    } else {
+        DEBUG_PRINT("Failed to register mouse device");
+    }
+
+
+
     //initialize interrupts
     pic_remap(0x20, 0x28);
     DEBUG_PRINT("PIC remapped");
     idt_install();
     DEBUG_PRINT("IDT installed");
+    syscall_init();
+    DEBUG_PRINT("Syscalls initialized");
     timer_init(100); //100 hz
     keyboard_init(); //enable IRQ1 and setup keyboard handler
     DEBUG_PRINT("Timer initialized");

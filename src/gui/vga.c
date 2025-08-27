@@ -11,6 +11,9 @@ static int g_w = VGA_WIDTH;
 static int g_h = VGA_HEIGHT;
 static int g_programmed = 0; //whether hardware has been programmed at least once
 
+//TODO: for some reason swtiching to shell from desktop 12h on real hardware you cant type in the shell
+
+
 void vga_set_mode(vga_mode_t mode) {
     //always program hardware on first call after that skip if already in the same mode
     if (g_programmed && mode == g_mode) return;
