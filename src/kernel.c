@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "desktop.h"
 #include "io.h"
 #include "drivers/serial.h"
@@ -14,7 +15,7 @@
 #include "syscall.h"
 #include "interrupts/gdt.h"
 #include "interrupts/tss.h"
-#include <stdlib.h>
+#include "drivers/mouse.h"
 
 //forward declaration for direct syscall testing
 extern int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4, uint32_t arg5);
@@ -1056,6 +1057,14 @@ void kmain(uint32_t magic, uint32_t addr) {
     } else {
         DEBUG_PRINT("Failed to register keyboard device");
     }
+    //register mouse device
+    if (mouse_register_device() == 0) {
+        DEBUG_PRINT("Mouse device registered with device manager");
+    } else {
+        DEBUG_PRINT("Failed to register mouse device");
+    }
+
+
 
     //initialize interrupts
     pic_remap(0x20, 0x28);

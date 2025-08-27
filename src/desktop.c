@@ -509,6 +509,14 @@ void cmd_desktop(const char *args) {
     int last_cy = cy;
 
     mouse_init();
+    
+    //find mouse device for polling
+    device_t* mouse_dev = device_find_by_subtype(DEVICE_SUBTYPE_MOUSE);
+    if (!mouse_dev) {
+        //fallback to direct polling if device not found
+        DEBUG_PRINT("Mouse device not found, using direct polling");
+    }
+
     //ensure no stale keyboard events when entering GUI
     kbd_flush();
     int was_clicking = 0;
@@ -517,9 +525,18 @@ void cmd_desktop(const char *args) {
     int has_dirty = 0;
     int dirty_x = 0, dirty_y = 0, dirty_w = 0, dirty_h = 0;
     int8_t pkt[3];
+    
     for (;;) {
-        //handle mouse input and update state with the interrupt-mouse
-        if (mouse_poll_packet(pkt)) {
+        //handle mouse input using device manager if available
+        int bytes_read = 0;
+        if (mouse_dev && mouse_dev->status == DEVICE_STATUS_READY) {
+            bytes_read = device_read(mouse_dev, 0, pkt, 3);
+        } else {
+            //fallback to direct polling
+            bytes_read = mouse_poll_packet(pkt) ? 3 : 0;
+        }
+
+        if (bytes_read == 3) {
             int prev_cx = cx;
             int prev_cy = cy;
             cx += pkt[1];
