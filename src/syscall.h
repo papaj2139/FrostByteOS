@@ -11,6 +11,7 @@
 #define SYS_CLOSE   6
 #define SYS_GETPID  20
 #define SYS_SLEEP   162
+#define SYS_CREAT   8
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -33,5 +34,6 @@ int32_t sys_open(const char* pathname, int32_t flags);
 int32_t sys_close(int32_t fd);
 int32_t sys_getpid(void);
 int32_t sys_sleep(uint32_t seconds);
+int32_t sys_creat(const char* pathname, int32_t mode);
 
 #endif

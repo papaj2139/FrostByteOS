@@ -51,6 +51,9 @@ static inline int32_t syscall3(uint32_t syscall_num, uint32_t arg1, uint32_t arg
 #define SYS_EXIT    1
 #define SYS_WRITE   4
 #define SYS_READ    3
+#define SYS_OPEN    5
+#define SYS_CLOSE   6
+#define SYS_CREAT   8
 #define SYS_GETPID  20
 #define SYS_SLEEP   162
 
@@ -64,6 +67,18 @@ static inline int32_t write(int fd, const char* buf, uint32_t count) {
 
 static inline int32_t read(int fd, char* buf, uint32_t count) {
     return syscall3(SYS_READ, (uint32_t)fd, (uint32_t)buf, count);
+}
+
+static inline int32_t open(const char* pathname, int32_t flags) {
+    return syscall2(SYS_OPEN, (uint32_t)pathname, (uint32_t)flags);
+}
+
+static inline int32_t close(int32_t fd) {
+    return syscall1(SYS_CLOSE, (uint32_t)fd);
+}
+
+static inline int32_t creat(const char* pathname, int32_t mode) {
+    return syscall2(SYS_CREAT, (uint32_t)pathname, (uint32_t)mode);
 }
 
 static inline int32_t getpid(void) {

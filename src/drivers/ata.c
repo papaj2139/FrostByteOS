@@ -200,13 +200,20 @@ int ata_read_sectors(device_t* device, uint32_t lba, uint8_t sector_count, uint1
 
 int ata_write_sectors(device_t* device, uint32_t lba, uint8_t sector_count, const uint16_t* buffer) {
     ata_device_data_t* data = (ata_device_data_t*)device->private_data;
+    ata_debug("Starting sector write...");
+    ata_debug_hex("LBA", lba);
+    ata_debug_hex("Sector count", sector_count);
 
-    // Select drive and wait 400ns
-    outb(data->data_port + 6, data->drive_select | ((lba >> 24) & 0x0F));
+    //select drive and wait 400ns
+    uint8_t drive_head = data->drive_select | ((lba >> 24) & 0x0F);
+    outb(data->data_port + 6, drive_head);
     sleep_400ns(data->control_port);
 
-    // Wait for drive to be ready
-    if (ata_wait_bsy(data) != 0) return -1;
+    //wait for drive to be ready
+    if (ata_wait_bsy(data) != 0) {
+        ata_debug("Write failed - BSY timeout before command");
+        return -1;
+    }
 
     outb(data->data_port + 2, sector_count);
     outb(data->data_port + 3, (uint8_t)lba);
@@ -215,13 +222,33 @@ int ata_write_sectors(device_t* device, uint32_t lba, uint8_t sector_count, cons
     outb(data->data_port + 7, ATA_CMD_WRITE_SECTORS);
 
     for (int s = 0; s < sector_count; s++) {
-        if (ata_wait_drq(data) != 0) return -1;
-        if (inb(data->data_port + 7) & ATA_STATUS_ERR) return -1;
+        ata_debug_hex("Writing sector", s);
+        if (ata_wait_bsy(data) != 0) {
+            ata_debug("Write failed - BSY timeout during sector write");
+            return -1;
+        }
+        if (ata_wait_drq(data) != 0) {
+            ata_debug("Write failed - DRQ timeout during sector write");
+            return -1;
+        }
+        if (inb(data->data_port + 7) & ATA_STATUS_ERR) {
+            ata_debug("Write failed - error status");
+            return -1;
+        }
 
+        ata_debug("Writing 512 bytes to data port...");
         for (int i = 0; i < 256; i++) {
             outw(data->data_port, buffer[s * 256 + i]);
         }
+        //after writing the data for a sector, the drive needs a cache flush
+        outb(data->data_port + 7, ATA_CMD_CACHE_FLUSH);
+        if (ata_wait_bsy(data) != 0) {
+            ata_debug("Write failed - BSY timeout after cache flush");
+            return -1;
+        }
+        ata_debug("Sector write complete");
     }
+    ata_debug("All sectors written successfully");
     return 0;
 }
 
