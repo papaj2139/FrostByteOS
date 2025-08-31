@@ -19,6 +19,9 @@ int strncasecmp_custom(const char *a, const char *b, size_t n);
 void itoa(int n, char s[]);
 char* strcat(char* dest, const char* src);
 void reverse(char s[]);
-
+char *strchr(const char *s, int c);
+char *strrchr(const char *s, int c);
+int toupper(int c);
+char *strncat(char *dest, const char *src, size_t n);
 
 #endif

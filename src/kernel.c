@@ -16,14 +16,18 @@
 #include "interrupts/gdt.h"
 #include "interrupts/tss.h"
 #include "drivers/mouse.h"
+#include "fs/fs.h"
+#include "fs/fat16.h"
+#include "fs/vfs.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "mm/heap.h"
+#include <stdbool.h>
 
-//forward declaration for direct syscall testing
-extern int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4, uint32_t arg5);
-extern void enter_user_mode(void);
 
-/* TODO LIST: 
+/* TODO LIST:
     * = done
-    
+
     * Fix memory showing as 0mb
     - Add MiniFS (see minifs.c)
     - Add more commands
@@ -44,6 +48,11 @@ extern void enter_user_mode(void);
 #define SLP_EN (1 << 13)
 #define KEYBOARD_DATA_PORT 0x60
 #define KEYBOARD_STATUS_PORT 0x64
+
+
+// Global filesystem instance for shell commands
+static fat16_fs_t g_fat16_fs;
+static bool g_fs_initialized = false;
 
 
 //structs and typedefs
@@ -99,8 +108,8 @@ static int putchar_term(char c, unsigned char colour);
 void enable_cursor(uint8_t start, uint8_t end);
 static void hex_dump(const uint8_t* data, size_t size, unsigned char colour);
 
-void watchdogTick(void) { 
-    currentTick++; 
+void watchdogTick(void) {
+    currentTick++;
 }
 
 //panic with a custom message stores reason and invokes kpanic screen
@@ -109,19 +118,19 @@ void kpanic_msg(const char* reason){
     kpanic();
 }
 
-void petWatchdog(void) { 
-    currentTick = 0; 
+void petWatchdog(void) {
+    currentTick = 0;
 }
 
-void watchdogCheck(void) { 
-    if(currentTick > WATCHDOG_TIMEOUT) kpanic(); 
+void watchdogCheck(void) {
+    if(currentTick > WATCHDOG_TIMEOUT) kpanic();
 }
 
 
 
-static void cmd_shutdown(const char *args) { 
-    (void)args; 
-    kshutdown(); 
+static void cmd_shutdown(const char *args) {
+    (void)args;
+    kshutdown();
 }
 
 static void cmd_reboot(const char *args) {
@@ -129,19 +138,19 @@ static void cmd_reboot(const char *args) {
     kreboot();
 }
 
-static void cmd_minifs(const char *args) { 
-    (void)args; 
-    print("\nNo drives attached\n",0x0F); 
+static void cmd_minifs(const char *args) {
+    (void)args;
+    print("\nNo drives attached\n",0x0F);
 }
 
-static void cmd_induce(const char *args) { 
-    (void)args; 
-    kpanic(); 
+static void cmd_induce(const char *args) {
+    (void)args;
+    kpanic();
 }
 
-static void cmd_clear(const char *args) { 
-    (void)args; 
-    kclear(); 
+static void cmd_clear(const char *args) {
+    (void)args;
+    kclear();
 }
 
 static void cmd_echo(const char *args) {
@@ -178,20 +187,25 @@ static void cmd_time(const char *args) {
 
 static void cmd_help(const char *args) {
     (void)args;
-    print("\nAvailable commands (type 'help' to show this message):\n\n", 0x0F);
-    
-    print("System Information:\n", 0x0E);
+    print("\nAvailable commands (type 'help' to show this message):\n", 0x0F);
     print("  meminfo     - Show memory information\n", 0x0F);
     print("  time        - Show current RTC time\n", 0x0F);
     print("  devices     - List all registered devices\n", 0x0F);
     print("  devtest     - Test device functionality\n", 0x0F);
-    print("  minifs      - Minimal filesystem commands\n\n", 0x0F);
+    print("  memtest     - Test memory management\n", 0x0F);
+    print("  vmmap <addr> - Show virtual to physical address mapping\n", 0x0F);
+    print("  heapinfo    - Show heap information\n", 0x0F);
+    print("  ls          - List directory contents\n", 0x0F);
+    print("  cat <file>  - Display file contents\n", 0x0F);
+    print("  touch <file> - Create a new file\n", 0x0F);
+    print("  vfs_test    - Test VFS functionality\n", 0x0F);
+    print("  minifs      - Minimal filesystem commands\n", 0x0F);
     print("  clear       - Clear the screen\n", 0x0F);
     print("  colour <c>  - Change console color attribute\n", 0x0F);
     print("  echo <text> - Display text\n", 0x0F);
     print("  desktop     - Start the desktop environment\n", 0x0F);
     print("  iceedit     - ICE (Interpreted Compiled Executable) Editor\n", 0x0F);
-    print("  loadapp     - Load and execute application from disk (sector 50)\n", 0x0F);    
+    print("  loadapp     - Load and execute application from disk (sector 50)\n", 0x0F);
     print("  readsector <dev> <sector> - Read a sector from a device\n", 0x0F);
     print("  reboot      - Reboot the system\n", 0x0F);
     print("  shutdown    - Shut down the system\n", 0x0F);
@@ -239,7 +253,7 @@ void cmd_iceedit(const char *args){
         unsigned short ev = kbd_getevent();
         if(!ev) continue;
 
-        //esc keyreturns to shell        
+        //esc keyreturns to shell
         if (ev == 27) {
             print("\n", 0x0F);
             kbd_flush();
@@ -310,70 +324,77 @@ void cmd_kpset(const char *args){
     strncpy(bsodVer, args, strlen(args));
     bsodVer[strlen(args)] = '\0';
 }
+
 static void cmd_loadapp(const char *args) {
     (void)args;
-    print("\nLoading app from disk sector 50...\n", 0x0F);
-    
+    serial_write_string("\nLoading app from disk sector 50...\n");
+
     //allocate buffer for one sector
     static uint8_t buffer[512];
-    
-    print("Loading user application...\n", 0x0F);
+
+    serial_write_string("Loading user application...\n");
     device_t* ata_dev = device_find_by_name("ata0");
     if (!ata_dev) {
-        print("ATA device ata0 not found!\n", 0x0F);
+        serial_write_string("No ATA device found!\n");
         return;
     }
 
     int bytes_read = device_read(ata_dev, 50 * 512, buffer, 512); //read 1 sector from LBA 50
 
-    if (bytes_read == 512) {
-        memcpy((void*)0x1000000, buffer, 512);  //safe address
-        print("User application loaded at 0x1000000\n", 0x0F);
-        print("About to switch to user mode...\n", 0x0F);
-        
-        //check if we actually have valid code
-        uint32_t* code = (uint32_t*)0x1000000;
-        print("First 4 bytes of loaded code: ", 0x0F);
-        char hex[12];
-        for (int i = 0; i < 8; i++) {
-            hex[i] = "0123456789ABCDEF"[((uint8_t*)code)[i/2] >> ((i%2) ? 0 : 4) & 0xF];
-        }
-        hex[8] = '\n';
-        hex[9] = '\0';
-        print(hex, 0x0F);
-        
-        //disable interrupts during user mode switch
-        __asm__ volatile ("cli");
-        
-        print("Switching to user mode now...\n", 0x0F);
-    } else {
-        print("Failed to read from ATA drive\n", 0x0F);
+    if (bytes_read != 512) {
+        serial_write_string("Failed to read from ATA drive\n");
         return;
     }
 
-    //switch to user mode and execute the app
+    //map 0x1000000 directly in kernel space and copy there
+    if (vmm_map_page(0x1000000, 0x1000000, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+        serial_write_string("Failed to map user application memory!\n");
+        return;
+    }
+
+    //copy the application data
+    memcpy((void*)0x1000000, buffer, 512);
+    serial_write_string("User application loaded at 0x1000000\n");
+
+    //check if it has valid code (simple sanity check)
+    uint32_t* code = (uint32_t*)0x1000000;
+    serial_write_string("First 4 bytes of loaded code: ");
+    char hex[12];
+    for (int i = 0; i < 8; i++) {
+        hex[i] = "0123456789ABCDEF"[((uint8_t*)code)[i/2] >> ((i%2) ? 0 : 4) & 0xF];
+    }
+    hex[8] = '\n';
+    hex[9] = '\0';
+    serial_write_string(hex);
+
+    serial_write_string("Switching to user mode...\n");
+
+    //user mode swtich
     __asm__ volatile (
-        "cli\n"                  //disable interrupts
-        "mov $0x23, %%ax\n"     //user data segment with RPL 3
-        "mov %%ax, %%ds\n"
-        "mov %%ax, %%es\n"
-        "mov %%ax, %%fs\n"
-        "mov %%ax, %%gs\n"
-        
-        //set up stack frame for iret
-        "pushl $0x23\n"         //SS (user data segment with RPL 3)
-        "pushl $0x2000000\n"    //ESP (user stack pointer)
-        "pushf\n"               //EFLAGS
-        "popl %%eax\n"          //get current flags
-        "andl $~0x200, %%eax\n" //clear IF to disable interrupts in user mode
-        "pushl %%eax\n"         //push modified flags
-        "pushl $0x1B\n"         //CS (user code segment with RPL 3)
-        "pushl $0x1000000\n"    //EIP (entry point)
-        "iret\n"                //switch to user mode
+        "cli\n\t"                    //disable interrupts
+        "mov $0x23, %%ax\n\t"       //user data segment (GDT entry 4, RPL=3)
+        "mov %%ax, %%ds\n\t"
+        "mov %%ax, %%es\n\t"
+        "mov %%ax, %%fs\n\t"
+        "mov %%ax, %%gs\n\t"
+
+        //set up stack frame for iret to user mode
+        "pushl $0x23\n\t"           //SS (user data segment)
+        "pushl $0x2000000\n\t"      //ESP (user stack pointer)
+        "pushfl\n\t"                //EFLAGS
+        "popl %%eax\n\t"
+        "orl $0x200, %%eax\n\t"     //set IF to enable interrupts in user mode
+        "pushl %%eax\n\t"           
+        "pushl $0x1B\n\t"           //CS (user code segment, GDT entry 3, RPL=3)
+        "pushl $0x1000000\n\t"      //EIP (entry point)
+        "iret\n\t"                  //jump to user mode
         :
         :
         : "eax", "memory"
     );
+
+    //this shouldn't be reached
+    serial_write_string("User application returned unexpectedly.\n");
 }
 
 static void cmd_devices(const char *args) {
@@ -385,18 +406,18 @@ static void cmd_devices(const char *args) {
 static void cmd_devtest(const char *args) {
     (void)args;
     print("\nTesting device operations...\n", 0x0F);
-    
+
     //find ATA device
     device_t* ata_dev = device_find_by_type(DEVICE_TYPE_STORAGE);
     if (!ata_dev) {
         print("No storage device found!\n", 0x0C);
         return;
     }
-    
+
     //test reading sector 50 via device manager
     static uint8_t buffer[512];
     int result = device_read(ata_dev, 50 * 512, buffer, 512);
-    
+
     if (result == 512) {
         print("Device read successful! First 16 bytes:\n", 0x0A);
         for (int i = 0; i < 16; i++) {
@@ -473,6 +494,268 @@ static void cmd_readsector(const char *args) {
     hex_dump(buffer, 512, 0x0F);
 }
 
+static void cmd_ls(const char *args) {
+    (void)args;
+
+    //open the root directory using VFS
+    vfs_node_t* root_dir = vfs_open("/", VFS_FLAG_READ);
+    if (!root_dir) {
+        print("\nFailed to open root directory\n", 0x0F);
+        return;
+    }
+
+    //check if it's actually a directory
+    if (root_dir->type != VFS_FILE_TYPE_DIRECTORY) {
+        vfs_close(root_dir);
+        print("\nRoot is not a directory\n", 0x0F);
+        return;
+    }
+
+    print("\nDirectory listing:\n", 0x0F);
+
+    //read directory entries
+    vfs_node_t* entry;
+    for (uint32_t i = 0; ; i++) {
+        int result = vfs_readdir(root_dir, i, &entry);
+        if (result != 0) {
+            break; //no more entries
+        }
+
+        //print entry name and type
+        if (entry->type == VFS_FILE_TYPE_DIRECTORY) {
+            char buf[80];
+            ksnprintf(buf, sizeof(buf), "  %s <DIR>\n", entry->name);
+            print(buf, 0x0F);
+        } else {
+            char buf[80];
+            ksnprintf(buf, sizeof(buf), "  %s (%u bytes)\n", entry->name, vfs_get_size(entry));
+            print(buf, 0x0F);
+        }
+
+        //close the entry
+        vfs_close(entry);
+    }
+
+    //close the root directory
+    vfs_close(root_dir);
+}
+
+static void cmd_cat(const char *args) {
+    if (!args || !*args) {
+        print("\nUsage: cat <filename>\n", 0x0F);
+        return;
+    }
+
+    //open the file using VFS
+    vfs_node_t* file = vfs_open(args, VFS_FLAG_READ);
+    if (!file) {
+        print("\nFile not found\n", 0x0F);
+        return;
+    }
+
+    //check if it's actually a file
+    if (file->type != VFS_FILE_TYPE_FILE) {
+        vfs_close(file);
+        print("\nNot a regular file\n", 0x0F);
+        return;
+    }
+
+    uint8_t buffer[512];
+    int bytes_read;
+    uint32_t offset = 0;
+    print("\n", 0x0F);
+
+    while ((bytes_read = vfs_read(file, offset, sizeof(buffer), (char*)buffer)) > 0) {
+        for (int i = 0; i < bytes_read; i++) {
+            uint8_t c = buffer[i];
+
+            //handle common whitespace characters
+            if (c == '\n') {
+                print("\n", 0x0F);
+            } else if (c == '\r') {
+                //skip carriage returns (windows line endings)
+                continue;
+            } else if (c == '\t') {
+                print("    ", 0x0F);  //convert tabs to spaces
+            } else if (c >= 32 && c <= 126) {
+                //only printable ASCII characters
+                char str[2] = {c, '\0'};
+                print(str, 0x0F);
+            }
+            //skip all other characters like control chars and extended ascii
+        }
+        offset += bytes_read;
+    }
+
+    vfs_close(file);
+    print("\n", 0x0F);
+}
+
+static void cmd_memtest(const char *args) {
+    (void)args;
+    print("\nMemory Management Test\n", 0x0F);
+
+    //show physical memory stats
+    char buf[80];
+    ksnprintf(buf, sizeof(buf), "Total pages: %u\n", pmm_get_total_pages());
+    print(buf, 0x0F);
+    ksnprintf(buf, sizeof(buf), "Free pages: %u\n", pmm_get_free_pages());
+    print(buf, 0x0F);
+    ksnprintf(buf, sizeof(buf), "Used pages: %u\n", pmm_get_used_pages());
+    print(buf, 0x0F);
+
+    //test heap allocation
+    print("\nTesting heap allocation:\n", 0x0E);
+
+    void* ptr1 = kmalloc(1024);
+    ksnprintf(buf, sizeof(buf), "Allocated 1KB at: 0x%x\n", (uint32_t)ptr1);
+    print(buf, 0x0F);
+
+    void* ptr2 = kmalloc(2048);
+    ksnprintf(buf, sizeof(buf), "Allocated 2KB at: 0x%x\n", (uint32_t)ptr2);
+    print(buf, 0x0F);
+
+    void* ptr3 = kmalloc(512);
+    ksnprintf(buf, sizeof(buf), "Allocated 512B at: 0x%x\n", (uint32_t)ptr3);
+    print(buf, 0x0F);
+
+    //test writing to allocated memory
+    if (ptr1) {
+        strcpy((char*)ptr1, "Hello from heap memory!");
+        ksnprintf(buf, sizeof(buf), "ptr1 contains: %s\n", (char*)ptr1);
+        print(buf, 0x0A);
+    }
+
+    //free memory
+    print("Freeing memory...\n", 0x0E);
+    kfree(ptr1);
+    kfree(ptr2);
+    kfree(ptr3);
+    print("Memory freed successfully!\n", 0x0A);
+}
+
+static void cmd_vmmap(const char *args) {
+    if (!args || !*args) {
+        print("\nUsage: vmmap <virtual_address>\n", 0x0F);
+        print("Example: vmmap 0xC0000000\n", 0x0F);
+        return;
+    }
+
+    uint32_t vaddr;
+    if (!parse_u32(args, &vaddr)) {
+        print("\nError: Invalid virtual address\n", 0x4F);
+        return;
+    }
+
+    uint32_t paddr = vmm_get_physical_addr(vaddr);
+
+    char buf[80];
+    print("\n", 0x0F);
+    ksnprintf(buf, sizeof(buf), "Virtual:  0x%08x\n", vaddr);
+    print(buf, 0x0F);
+
+    if (paddr) {
+        ksnprintf(buf, sizeof(buf), "Physical: 0x%08x\n", paddr);
+        print(buf, 0x0A);
+        print("Status: MAPPED\n", 0x0A);
+    } else {
+        print("Physical: NOT MAPPED\n", 0x0C);
+        print("Status: NOT MAPPED\n", 0x0C);
+    }
+}
+
+static void cmd_heapinfo(const char *args) {
+    (void)args;
+    print("\nHeap Information\n", 0x0F);
+
+    heap_stats_t stats;
+    heap_get_stats(&stats);
+
+    char buf[80];
+    ksnprintf(buf, sizeof(buf), "Total heap size: %u bytes\n", stats.total_size);
+    print(buf, 0x0F);
+    ksnprintf(buf, sizeof(buf), "Used memory: %u bytes\n", stats.used_size);
+    print(buf, 0x0F);
+    ksnprintf(buf, sizeof(buf), "Free memory: %u bytes\n", stats.free_size);
+    print(buf, 0x0F);
+    ksnprintf(buf, sizeof(buf), "Number of blocks: %u\n", stats.num_blocks);
+    print(buf, 0x0F);
+}
+
+static void cmd_vfs_test(const char *args) {
+    (void)args;
+    print("\n=== VFS Test ===\n", 0x0F);
+
+    //try to resolve the root path
+    vfs_node_t* node = vfs_resolve_path("/");
+    if (node) {
+        print("Root node resolved successfully\n", 0x0A);
+        print("Node name: ", 0x0F);
+        print(node->name, 0x0F);
+        print("\n", 0x0F);
+        vfs_close(node);
+    } else {
+        print("Failed to resolve root path\n", 0x0C);
+        return;
+    }
+
+    //try to open root directory
+    vfs_node_t* root_dir = vfs_open("/", VFS_FLAG_READ);
+    if (root_dir) {
+        print("Root directory opened successfully\n", 0x0A);
+
+        //try to read directory entries
+        vfs_node_t* entry;
+        for (uint32_t i = 0; i < 5; i++) { //read first 5 entries
+            int result = vfs_readdir(root_dir, i, &entry);
+            if (result == 0) {
+                char buf[100];
+                if (entry->type == VFS_FILE_TYPE_DIRECTORY) {
+                    ksnprintf(buf, sizeof(buf), "  Entry %u: %s (DIR)\n", i, entry->name);
+                } else {
+                    ksnprintf(buf, sizeof(buf), "  Entry %u: %s (%u bytes)\n", i, entry->name, vfs_get_size(entry));
+                }
+                print(buf, 0x0F);
+                vfs_close(entry);
+            } else {
+                char buf[50];
+                ksnprintf(buf, sizeof(buf), "  No entry at index %u\n", i);
+                print(buf, 0x0F);
+                break;
+            }
+        }
+
+        vfs_close(root_dir);
+    } else {
+        print("Failed to open root directory\n", 0x0C);
+    }
+}
+
+static void cmd_touch(const char *args) {
+    if (!g_fs_initialized) {
+        print("\nFilesystem not initialized.\n", 0x0C);
+        return;
+    }
+    if (!args || !*args) {
+        print("\nUsage: touch <filename>\n", 0x0F);
+        return;
+    }
+
+    //to avoid issues with leading spaces from the command parser
+    while (*args == ' ') args++;
+
+    print("\nCreating file: ", 0x0F);
+    print((char*)args, 0x0F);
+    print("...\n", 0x0F);
+
+    if (fat16_create_file(&g_fat16_fs, args) == 0) {
+        print("File created successfully.\n", 0x0A);
+    } else {
+        print("Failed to create file. It may already exist or the disk is full.\n", 0x0C);
+    }
+}
+
+
 static struct cmd_entry commands[] = {
     {"help", cmd_help},
     {"clear", cmd_clear},
@@ -491,6 +774,13 @@ static struct cmd_entry commands[] = {
     {"iceedit", cmd_iceedit},
     {"bsodVer", cmd_kpset},
     {"readsector", cmd_readsector},
+    {"ls", cmd_ls},
+    {"cat", cmd_cat},
+    {"touch", cmd_touch},
+    {"memtest", cmd_memtest},
+    {"vmmap", cmd_vmmap},
+    {"heapinfo", cmd_heapinfo},
+    {"vfs_test", cmd_vfs_test},
     {NULL, NULL}
 };
 
@@ -563,7 +853,7 @@ void kpanic(void) {
         VID_MEM[j * 2] = ' ';
         VID_MEM[j * 2 + 1] = 0x1F; // White on blue
     }
-    
+
     if(strcmp(bsodVer, "modern") == 0){
         print_at(":(", 0x1F, 0, 0);
         print_at("Your pc ran into a problem and needs to restart.", 0x1F, 0, 1);
@@ -843,7 +1133,7 @@ void kshutdown(void){
     kpanic();
 }
 
-//works in qemu idk how about real hardware 
+//works in qemu idk how about real hardware
 void kreboot(void){
     __asm__ volatile("cli");
     //port 0xCF9 (reset control register)
@@ -881,12 +1171,12 @@ void move_cursor(uint16_t row, uint16_t col){
 
 //get keyboard input through device manager
 char getkey_device_manager(void) {
-    //find keyboard device hardcoded to PS/2 for now 
+    //find keyboard device hardcoded to PS/2 for now
     device_t* kbd_device = device_find_by_name("ps2kbd0");
     if (!kbd_device) {
         return 0; //no keyboard device found
     }
-    
+
     //poll for input through device manager
     char buffer[1];
     int bytes_read = device_read(kbd_device, 0, buffer, 1);
@@ -992,13 +1282,13 @@ void commandLoop(void){
         size_t start = i;
         while(buffer[i] && buffer[i] != ' ') i++;
         size_t cmdlen = i - start;
-        
+
         //handle empty command (just pressed enter)
         if(cmdlen == 0) {
             print("\n", 0x0F);
             continue;
         }
-        
+
         for(struct cmd_entry *ce = commands; ce->name; ++ce){
             size_t n = 0;
             while(ce->name[n]) n++;
@@ -1039,18 +1329,28 @@ void kmain(uint32_t magic, uint32_t addr) {
     DEBUG_PRINT("GDT initialized");
     tss_init();
     DEBUG_PRINT("TSS initialized");
-    
+
+    DEBUG_PRINT("Initializing memory management...");
+    pmm_init(mem_lower, mem_upper);
+    DEBUG_PRINT("Physical memory manager initialized");
+
+    vmm_init();
+    DEBUG_PRINT("Virtual memory manager initialized - paging enabled!");
+
+    heap_init();
+    DEBUG_PRINT("Heap initialized");
+
     //initialize device manager
     device_manager_init();
     DEBUG_PRINT("Device manager initialized");
-    
+
     //initialize and register ATA driver
     ata_init();
     DEBUG_PRINT("ATA driver initialized");
-    
+
     ata_probe_and_register();
     DEBUG_PRINT("ATA device probing complete");
-    
+
     //register keyboard device
     if (keyboard_register_device() == 0) {
         DEBUG_PRINT("Keyboard device registered with device manager");
@@ -1078,6 +1378,40 @@ void kmain(uint32_t magic, uint32_t addr) {
     DEBUG_PRINT("Timer initialized");
     __asm__ volatile ("sti");
     DEBUG_PRINT("Interrupts enabled");
+    //initialize VFS
+    if (vfs_init() == 0) {
+        DEBUG_PRINT("VFS initialized successfully");
+
+        //fegister filesystems with VFS
+        if (fs_vfs_init() == 0) {
+            DEBUG_PRINT("Filesystems registered with VFS");
+            //rn assume that you want to mount the root filesystem on the first ATA device later parse params from multiboot
+            //find ATA device and mount the root filesystem
+            device_t* ata_dev = device_find_by_type(DEVICE_TYPE_STORAGE);
+            if (ata_dev) {
+                //mount the root filesystem
+                if (vfs_mount("ata0", "/", "fat16") == 0) {
+                    DEBUG_PRINT("Root filesystem mounted successfully");
+                    // Manually initialize our global fs object for the new command
+                    if (fat16_init(&g_fat16_fs, ata_dev) == 0) {
+                        g_fs_initialized = true;
+                        DEBUG_PRINT("Global FAT16 FS object initialized for commands");
+                    } else {
+                        DEBUG_PRINT("Failed to init global FAT16 FS object");
+                    }
+                } else {
+                    DEBUG_PRINT("Failed to mount root filesystem");
+                }
+            } else {
+                DEBUG_PRINT("No storage device found");
+            }
+        } else {
+            DEBUG_PRINT("Failed to register filesystems with VFS");
+        }
+    } else {
+        DEBUG_PRINT("Failed to initialize VFS");
+    }
+
 
     const char spinner_chars[] = { '|', '/', '-', '\\' };
     int spin_index = 0;

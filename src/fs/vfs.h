@@ -1,0 +1,102 @@
+#ifndef VFS_H
+#define VFS_H
+
+#include <stdint.h>
+#include "../device_manager.h"
+
+//file types
+#define VFS_FILE_TYPE_FILE      0x01
+#define VFS_FILE_TYPE_DIRECTORY 0x02
+#define VFS_FILE_TYPE_DEVICE    0x04
+#define VFS_FILE_TYPE_SYMLINK   0x08
+
+//VFS node flags
+#define VFS_FLAG_READ    0x01
+#define VFS_FLAG_WRITE   0x02
+#define VFS_FLAG_EXECUTE 0x04
+
+//maximum path length
+#define VFS_MAX_PATH 256
+
+//forward declarations
+typedef struct vfs_node vfs_node_t;
+typedef struct vfs_operations vfs_operations_t;
+typedef struct vfs_mount vfs_mount_t;
+
+//VFS operations structure
+struct vfs_operations {
+    int (*open)(vfs_node_t* node, uint32_t flags);
+    int (*close)(vfs_node_t* node);
+    int (*read)(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer);
+    int (*write)(vfs_node_t* node, uint32_t offset, uint32_t size, const char* buffer);
+    int (*create)(vfs_node_t* parent, const char* name, uint32_t flags);
+    int (*unlink)(vfs_node_t* node);
+    int (*mkdir)(vfs_node_t* parent, const char* name, uint32_t flags);
+    int (*rmdir)(vfs_node_t* node);
+    int (*readdir)(vfs_node_t* node, uint32_t index, vfs_node_t** out);
+    int (*finddir)(vfs_node_t* node, const char* name, vfs_node_t** out);
+    int (*get_size)(vfs_node_t* node);
+    int (*ioctl)(vfs_node_t* node, uint32_t request, void* arg);
+};
+
+//VFS node structure
+struct vfs_node {
+    char name[64];              //node name
+    uint32_t type;              //file type
+    uint32_t flags;             //node flags
+    uint32_t size;              //file size in bytes
+    uint32_t inode;             //inode number
+    vfs_operations_t* ops;      //operations for this node
+    void* device;               //device-specific data
+    void* private_data;         //filesystem-specific data
+    uint32_t ref_count;         //reference count
+    vfs_mount_t* mount;         //mount point this node belongs to
+    vfs_node_t* parent;         //parent directory
+};
+
+//VFS mount structure
+struct vfs_mount {
+    char mount_point[VFS_MAX_PATH];  //mount point path
+    vfs_node_t* root;                //root node of mounted filesystem
+    vfs_node_t* mount_device;        //device node this filesystem is on
+    void* private_data;              //filesystem-specific mount data
+    vfs_mount_t* next;               //next mount in the list
+};
+
+//file descriptor structure
+typedef struct {
+    vfs_node_t* node;           //VFS node
+    uint32_t offset;            //current position in file
+    uint32_t flags;             //access flags
+    uint32_t ref_count;         //reference count
+} vfs_file_t;
+
+//function declarations
+int vfs_init(void);
+int vfs_mount(const char* device, const char* mount_point, const char* fs_type);
+int vfs_unmount(const char* mount_point);
+vfs_node_t* vfs_open(const char* path, uint32_t flags);
+int vfs_close(vfs_node_t* node);
+int vfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer);
+int vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const char* buffer);
+int vfs_create(const char* path, uint32_t flags);
+int vfs_unlink(const char* path);
+int vfs_mkdir(const char* path, uint32_t flags);
+int vfs_rmdir(const char* path);
+int vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out);
+int vfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out);
+int vfs_get_size(vfs_node_t* node);
+vfs_node_t* vfs_resolve_path(const char* path);
+int vfs_register_fs(const char* name, vfs_operations_t* ops);
+vfs_node_t* vfs_create_node(const char* name, uint32_t type, uint32_t flags);
+void vfs_destroy_node(vfs_node_t* node);
+
+//path manipulation functions
+char* vfs_get_parent_path(const char* path);
+char* vfs_get_basename(const char* path);
+int vfs_path_compare(const char* path1, const char* path2);
+
+//root node
+extern vfs_node_t* vfs_root;
+
+#endif

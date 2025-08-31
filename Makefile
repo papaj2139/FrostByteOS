@@ -22,6 +22,9 @@ desktop.o: src/desktop.c
 string.o: src/libc/string.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+stdlib.o: src/libc/stdlib.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 io.o: src/io.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -38,6 +41,15 @@ serial.o: src/drivers/serial.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 pc_speaker.o: src/drivers/pc_speaker.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+timer.o: src/drivers/timer.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+rtc.o: src/drivers/rtc.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+ata.o: src/drivers/ata.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 vga.o: src/gui/vga.c
@@ -58,21 +70,6 @@ isr.o: src/interrupts/isr.asm
 isr_c.o: src/interrupts/isr.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-timer.o: src/drivers/timer.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-rtc.o: src/drivers/rtc.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-ata.o: src/drivers/ata.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-syscall.o: src/syscall.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-syscall_asm.o: src/syscall_asm.asm
-	$(ASM) $(ASMFLAGS) $< -o $@
-
 gdt.o: src/interrupts/gdt.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -82,13 +79,47 @@ gdt_asm.o: src/interrupts/gdt_asm.asm
 tss.o: src/interrupts/tss.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+syscall.o: src/syscall.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+syscall_asm.o: src/syscall_asm.asm
+	$(ASM) $(ASMFLAGS) $< -o $@
+
 device_manager.o: src/device_manager.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-stdlib.o: src/libc/stdlib.c
+fat16.o: src/fs/fat16.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o io.o font.o keyboard.o mouse.o serial.o pc_speaker.o vga.o idt.o irq.o pic.o isr.o isr_c.o timer.o rtc.o syscall.o syscall_asm.o gdt.o gdt_asm.o tss.o device_manager.o ata.o stdlib.o 
+fs.o: src/fs/fs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+vfs.o: src/fs/vfs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+fat16_vfs.o: src/fs/fat16_vfs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+fd.o: src/fd.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+pmm.o: src/mm/pmm.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+vmm.o: src/mm/vmm.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+heap.o: src/mm/heap.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+paging_asm.o: src/mm/paging_asm.asm
+	$(ASM) $(ASMFLAGS) $< -o $@
+
+$(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
+           keyboard.o mouse.o serial.o pc_speaker.o timer.o rtc.o ata.o \
+           vga.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
+           syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o fd.o \
+           pmm.o vmm.o heap.o paging_asm.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)
@@ -98,13 +129,13 @@ iso: $(KERNEL)
 	grub-mkrescue -o $(ISO_NAME) isodir
 
 run: iso disk.img
-	qemu-system-i386 -cdrom $(ISO_NAME) -hda disk.img
+	qemu-system-i386 -cdrom $(ISO_NAME) disk.img
 
 run-serial: iso disk.img
-	qemu-system-i386 -cdrom $(ISO_NAME) -hda disk.img -serial stdio
+	qemu-system-i386 -cdrom $(ISO_NAME) -serial stdio -boot d
 
 run-sound: iso disk.img
-	qemu-system-i386 -cdrom $(ISO_NAME) -hda disk.img -audiodev alsa,id=snd0 -machine pcspk-audiodev=snd0
+	qemu-system-i386 -cdrom $(ISO_NAME) -audiodev alsa,id=snd0 -machine pcspk-audiodev=snd0
 
 disk.img:
 	dd if=/dev/zero of=disk.img bs=1M count=1

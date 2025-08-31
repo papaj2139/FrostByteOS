@@ -19,4 +19,5 @@ int mouse_device_write(device_t* device, uint32_t offset, const void* buffer, ui
 int mouse_device_ioctl(device_t* device, uint32_t cmd, void* arg);
 void mouse_device_cleanup(device_t* device);
 
+
 #endif

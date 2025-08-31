@@ -75,23 +75,75 @@ int ksnprintf(char *out, size_t size, const char *fmt, ...) {
     while (*fmt && pos + 1 < size) {
         if (*fmt == '%') {
             fmt++;
+
+            //handle padding (like %02x)
+            int pad_width = 0;
+            char pad_char = ' ';
+            if (*fmt == '0') {
+                pad_char = '0';
+                fmt++;
+            }
+            while (*fmt >= '0' && *fmt <= '9') {
+                pad_width = pad_width * 10 + (*fmt - '0');
+                fmt++;
+            }
+
             if (*fmt == 'u') {
                 unsigned int num = va_arg(args, unsigned int);
                 char numbuf[32];
                 itoa_unsigned(num, numbuf, 10);
+
+                //apply padding
+                int num_len = strlen(numbuf);
+                while (pad_width > num_len && pos + 1 < size) {
+                    out[pos++] = pad_char;
+                    pad_width--;
+                }
+
                 for (char *p = numbuf; *p && pos + 1 < size; p++)
                     out[pos++] = *p;
             } else if (*fmt == 'x') {
                 unsigned int num = va_arg(args, unsigned int);
                 char numbuf[32];
                 itoa_unsigned(num, numbuf, 16);
+
+                //apply padding
+                int num_len = strlen(numbuf);
+                while (pad_width > num_len && pos + 1 < size) {
+                    out[pos++] = pad_char;
+                    pad_width--;
+                }
+
                 for (char *p = numbuf; *p && pos + 1 < size; p++)
                     out[pos++] = *p;
             } else if (*fmt == 's') {
                 char *str = va_arg(args, char*);
                 while (*str && pos + 1 < size)
                     out[pos++] = *str++;
-            } else if (*fmt == '%') {
+            } else if (*fmt == 'd') {
+                int num = va_arg(args, int);
+                char numbuf[32];
+
+                //handle negative numbers
+                if (num < 0) {
+                    if (pos + 1 < size) out[pos++] = '-';
+                    num = -num;
+                }
+
+                itoa_unsigned((unsigned int)num, numbuf, 10);
+
+                //apply padding
+                int num_len = strlen(numbuf);
+                while (pad_width > num_len && pos + 1 < size) {
+                    out[pos++] = pad_char;
+                    pad_width--;
+                }
+
+                for (char *p = numbuf; *p && pos + 1 < size; p++)
+                    out[pos++] = *p;
+            }
+
+            else if (*fmt == '%') {
                 out[pos++] = '%';
             }
         } else {
@@ -136,14 +188,29 @@ char *strstr(const char *haystack, const char *needle) {
 
 void itoa(int n, char s[]) {
     int i, sign;
-    if ((sign = n) < 0) n = -n;
+    if ((sign = n) < 0) {
+        n = -n;
+    }
     i = 0;
     do {
-        s[i++] = n % 10 + '0';
+        s[i++] = (char)(n % 10 + '0');
     } while ((n /= 10) > 0);
-    if (sign < 0) s[i++] = '-';
+
+    if (sign < 0) {
+        s[i++] = '-';
+    }
     s[i] = '\0';
-    reverse(s);
+
+    //reverse the string
+    int start = 0;
+    int end = i - 1;
+    while (start < end) {
+        char temp = s[start];
+        s[start] = s[end];
+        s[end] = temp;
+        start++;
+        end--;
+    }
 }
 
 char* strcat(char* dest, const char* src) {
@@ -159,4 +226,52 @@ void reverse(char s[]) {
         s[i] = s[j];
         s[j] = c;
     }
+}
+
+char *strchr(const char *s, int c) {
+    while (*s != '\0') {
+        if (*s == (char)c) {
+            return (char *)s;
+        }
+        s++;
+    }
+    return 0;
+}
+
+char *strrchr(const char *s, int c) {
+    char *last = 0;
+    while (*s != '\0') {
+        if (*s == (char)c) {
+            last = (char *)s;
+        }
+        s++;
+    }
+    return last;
+}
+
+int toupper(int c) {
+    if (c >= 'a' && c <= 'z') {
+        return c - ('a' - 'A');
+    }
+    return c;
+}
+
+char *strncat(char *dest, const char *src, size_t n) {
+    char *original_dest = dest;
+
+    //find the end of dest
+    while (*dest != '\0') {
+        dest++;
+    }
+
+    //copy up to n characters from src
+    while (n > 0 && *src != '\0') {
+        *dest++ = *src++;
+        n--;
+    }
+
+    //null terminate
+    *dest = '\0';
+
+    return original_dest;
 }
