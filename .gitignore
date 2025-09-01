@@ -5,3 +5,4 @@ isodir/
 .vscode/
 *.bin
 *.img
+*.txt
