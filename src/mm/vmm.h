@@ -23,6 +23,7 @@ extern void flush_tlb(void);
 void vmm_init(void);
 int vmm_map_page(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags);
 int vmm_unmap_page(uint32_t virtual_addr);
+int vmm_unmap_page_nofree(uint32_t virtual_addr);
 uint32_t vmm_get_physical_addr(uint32_t virtual_addr);
 void vmm_switch_directory(page_directory_t directory);
 page_directory_t vmm_create_directory(void);

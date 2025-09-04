@@ -75,13 +75,16 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     if (fd == 1 || fd == 2) {
         serial_write_string("[SYSCALL] Writing to stdout\n");
         char temp_buf[256];
-        uint32_t copy_count = (count < 255) ? count : 255;
-        for (uint32_t i = 0; i < copy_count; i++) {
-            if (buf[i] == '\0') break;
-            temp_buf[i] = buf[i];
+        uint32_t remaining = count;
+        uint32_t offset = 0;
+        while (remaining > 0) {
+            uint32_t chunk = (remaining < 255) ? remaining : 255;
+            memcpy(temp_buf, buf + offset, chunk);
+            temp_buf[chunk] = '\0';
+            print(temp_buf, 0x0F);
+            offset += chunk;
+            remaining -= chunk;
         }
-        temp_buf[copy_count] = '\0';
-        print(temp_buf, 0x0F);
         return (int32_t)count;
     }
     

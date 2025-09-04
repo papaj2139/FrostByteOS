@@ -557,20 +557,151 @@ static int fat16_set_cluster_value(fat16_fs_t* fs, uint16_t cluster, uint16_t va
     return 0;
 }
 
+//update the matching directory entry on disk (root directory only) with
+//the provided size and first_cluster from 'entry' returns 0 on success
+static int fat16_update_dir_entry_on_disk(fat16_fs_t* fs, const fat16_dir_entry_t* entry) {
+    if (!fs || !entry) return -1;
+
+    uint32_t root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+    uint8_t buffer[512];
+    uint32_t entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+
+    for (uint32_t sector = 0; sector < root_dir_sectors; sector++) {
+        uint32_t offset = (fs->root_dir_start + sector) * 512;
+        if (device_read(fs->device, offset, buffer, 512) != 512) {
+            fat16_debug("Failed to read root directory sector for update");
+            return -1;
+        }
+
+        fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+        for (uint32_t i = 0; i < entries_per_sector; i++) {
+            if (entries[i].filename[0] == 0x00) {
+                //end of dir
+                return -1;
+            }
+            if (entries[i].filename[0] == 0xE5) continue;
+            if (entries[i].attributes & FAT16_ATTR_VOLUME_ID) continue;
+
+            if (memcmp(entries[i].filename, entry->filename, 8) == 0 &&
+                memcmp(entries[i].extension, entry->extension, 3) == 0) {
+                //update size and first cluster
+                entries[i].file_size = entry->file_size;
+                entries[i].first_cluster = entry->first_cluster;
+                if (device_write(fs->device, offset, buffer, 512) != 512) {
+                    fat16_debug("Failed to write updated directory sector");
+                    return -1;
+                }
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
 int fat16_write_file(fat16_file_t* file, const void* buffer, uint32_t size) {
     if (!file || !file->is_open || !buffer || size == 0) {
         return -1;
     }
 
     fat16_debug("Writing to file");
-    
-    //stub - just update file size and return success
-    //would need cluster allocation and data writing
-    file->file_size = file->current_offset + size;
-    file->current_offset += size;
-    
-    fat16_debug("Write completed (stub)");
-    return size;
+
+    fat16_fs_t* fs = file->fs;
+    uint32_t bytes_per_sector = fs->boot_sector.bytes_per_sector; // expect 512
+    uint32_t sectors_per_cluster = fs->boot_sector.sectors_per_cluster;
+    uint32_t cluster_size = sectors_per_cluster * bytes_per_sector;
+
+    const uint8_t* src = (const uint8_t*)buffer;
+    uint32_t bytes_written = 0;
+
+    //ensure the file has a starting cluster
+    if (file->entry.first_cluster < 2) {
+        uint16_t new_cluster = fat16_find_free_cluster(fs);
+        if (new_cluster == 0) return -1;
+        if (fat16_set_cluster_value(fs, new_cluster, 0xFFFF) != 0) return -1; //mark EOC
+        file->entry.first_cluster = new_cluster;
+        file->current_cluster = new_cluster;
+    }
+
+    //find cluster corresponding to current_offset
+    uint32_t cluster_index = file->current_offset / cluster_size;
+    uint32_t offset_in_cluster = file->current_offset % cluster_size;
+
+    uint16_t cluster = file->entry.first_cluster;
+    for (uint32_t i = 0; i < cluster_index; i++) {
+        uint16_t next = fat16_get_next_cluster(fs, cluster);
+        if (next >= FAT16_END_OF_CHAIN) {
+            // allocate a new cluster and chain it
+            uint16_t new_cluster = fat16_find_free_cluster(fs);
+            if (new_cluster == 0) return -1;
+            if (fat16_set_cluster_value(fs, cluster, new_cluster) != 0) return -1;
+            if (fat16_set_cluster_value(fs, new_cluster, 0xFFFF) != 0) return -1;
+            cluster = new_cluster;
+        } else {
+            cluster = next;
+        }
+    }
+
+    uint32_t sector_in_cluster = offset_in_cluster / bytes_per_sector;
+    uint32_t byte_in_sector = offset_in_cluster % bytes_per_sector;
+
+    uint8_t sector_buffer[512];
+
+    while (bytes_written < size) {
+        uint32_t sector_lba = fs->data_start + (cluster - 2) * sectors_per_cluster + sector_in_cluster;
+
+        //read and modify and write the sector
+        if (device_read(fs->device, sector_lba * bytes_per_sector, sector_buffer, bytes_per_sector) != (int)bytes_per_sector) {
+            fat16_debug("Device read failed during write");
+            return -1;
+        }
+
+        uint32_t space_in_sector = bytes_per_sector - byte_in_sector;
+        uint32_t remain = size - bytes_written;
+        uint32_t to_copy = (remain < space_in_sector) ? remain : space_in_sector;
+        memcpy(sector_buffer + byte_in_sector, src + bytes_written, to_copy);
+
+        if (device_write(fs->device, sector_lba * bytes_per_sector, sector_buffer, bytes_per_sector) != (int)bytes_per_sector) {
+            fat16_debug("Device write failed during write");
+            return -1;
+        }
+
+        bytes_written += to_copy;
+        file->current_offset += to_copy;
+        if (file->current_offset > file->file_size) {
+            file->file_size = file->current_offset;
+        }
+
+        //advance position
+        byte_in_sector += to_copy;
+        if (byte_in_sector >= bytes_per_sector) {
+            byte_in_sector = 0;
+            sector_in_cluster++;
+            if (sector_in_cluster >= sectors_per_cluster) {
+                //move to next cluster allocate if needed
+                uint16_t next = fat16_get_next_cluster(fs, cluster);
+                if (next >= FAT16_END_OF_CHAIN) {
+                    uint16_t new_cluster = fat16_find_free_cluster(fs);
+                    if (new_cluster == 0) return -1;
+                    if (fat16_set_cluster_value(fs, cluster, new_cluster) != 0) return -1;
+                    if (fat16_set_cluster_value(fs, new_cluster, 0xFFFF) != 0) return -1;
+                    cluster = new_cluster;
+                } else {
+                    cluster = next;
+                }
+                sector_in_cluster = 0;
+            }
+        }
+    }
+
+    //update file entry (size may have changed)
+    file->entry.file_size = file->file_size;
+    //persist directory entry update (best-effort)
+    if (fat16_update_dir_entry_on_disk(fs, &file->entry) != 0) {
+        fat16_debug("Warning: failed to update dir entry on disk after write");
+    }
+
+    fat16_debug_hex("Bytes written to file", bytes_written);
+    return (int)bytes_written;
 }
 
 int fat16_create_file(fat16_fs_t* fs, const char* filename) {
