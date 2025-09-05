@@ -129,7 +129,7 @@ iso: $(KERNEL)
 	grub-mkrescue -o $(ISO_NAME) isodir
 
 run: iso disk.img
-	qemu-system-i386 -cdrom $(ISO_NAME) disk.img
+	qemu-system-i386 -cdrom $(ISO_NAME)
 
 run-serial: iso disk.img
 	qemu-system-i386 -cdrom $(ISO_NAME) -serial stdio -boot d

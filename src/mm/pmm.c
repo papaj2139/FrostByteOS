@@ -26,14 +26,14 @@ static inline int test_bit(uint32_t bit) {
 
 void pmm_init(uint32_t mem_low, uint32_t mem_high) {
     DEBUG_PRINTF("PMM: Initializing physical memory manager");
-    DEBUG_PRINTF("PMM: Low memory: %u KB, High memory: %u KB", mem_low, mem_high);
+    DEBUG_PRINTF("PMM: Low memory: %d KB, High memory: %d KB", (int)mem_low, (int)mem_high);
 
     //calculate total memory in bytes
     uint32_t total_memory = (mem_low + mem_high) * 1024;
     total_pages = total_memory / PAGE_SIZE;
 
-    DEBUG_PRINTF("PMM: Total memory: %u MB (%u pages)",
-                 total_memory / (1024 * 1024), total_pages);
+    DEBUG_PRINTF("PMM: Total memory: %d MB (%d pages)",
+                 (int)(total_memory / (1024 * 1024)), (int)total_pages);
 
     //clear bitmap (all pages marked as used initially)
     memset(page_bitmap, 0xFF, sizeof(page_bitmap));
@@ -55,8 +55,8 @@ void pmm_init(uint32_t mem_low, uint32_t mem_high) {
         }
     }
 
-    DEBUG_PRINTF("PMM: Free pages: %u, Used pages: %u",
-                 total_pages - used_pages, used_pages);
+    DEBUG_PRINTF("PMM: Free pages: %d, Used pages: %d",
+                 (int)(total_pages - used_pages), (int)used_pages);
 }
 
 uint32_t pmm_alloc_page(void) {

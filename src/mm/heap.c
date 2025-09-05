@@ -39,8 +39,8 @@ void heap_init(void) {
 
     heap_end = KERNEL_HEAP_START + PAGE_SIZE;
 
-    DEBUG_PRINTF("HEAP: Initialized with %u bytes at 0x%x",
-                 heap_start->size, KERNEL_HEAP_START);
+    DEBUG_PRINTF("HEAP: Initialized with %d bytes at 0x%x",
+                 (int)heap_start->size, KERNEL_HEAP_START);
 }
 
 static int expand_heap(size_t needed_size) {

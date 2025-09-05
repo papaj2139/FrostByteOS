@@ -103,6 +103,40 @@ static int fat16_vfs_open(vfs_node_t* node, uint32_t flags) {
             kfree(node->private_data);
         }
         node->private_data = dir_data;
+    } else if (node->type == VFS_FILE_TYPE_FILE) {
+        //ensure file private data exists
+        fat16_file_private_t* file_data = (fat16_file_private_t*)node->private_data;
+        if (!file_data) {
+            file_data = (fat16_file_private_t*)kmalloc(sizeof(fat16_file_private_t));
+            if (!file_data) {
+                return -1;
+            }
+            memset(file_data, 0, sizeof(fat16_file_private_t));
+            node->private_data = file_data;
+        }
+
+        //resolve filesystem pointer from mount root
+        if (!node->mount || !node->mount->root || !node->mount->root->private_data) {
+            return -1;
+        }
+        fat16_fs_t* fs;
+        void* pdata = node->mount->root->private_data;
+        if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+            fs = ((fat16_dir_private_t*)pdata)->fs;
+        } else {
+            fs = &((filesystem_t*)pdata)->fs_data.fat16;
+        }
+        if (!fs) {
+            return -1;
+        }
+
+        //open the file now so subsequent operations have a valid handle
+        if (!file_data->is_open) {
+            if (fat16_open_file(fs, &file_data->file, node->name) != 0) {
+                return -1;
+            }
+            file_data->is_open = 1;
+        }
     }
 
     return 0;
@@ -199,11 +233,43 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
     serial_write_string(node->name);
     serial_write_string("\n");
 
-    //get file data from node
+    //ensure file private data exists
     fat16_file_private_t* file_data = (fat16_file_private_t*)node->private_data;
     if (!file_data) {
-        serial_write_string("[FAT16-VFS] Invalid file data for write\n");
-        return -1;
+        file_data = (fat16_file_private_t*)kmalloc(sizeof(fat16_file_private_t));
+        if (!file_data) {
+            serial_write_string("[FAT16-VFS] Failed to allocate file private data\n");
+            return -1;
+        }
+        memset(file_data, 0, sizeof(fat16_file_private_t));
+        node->private_data = file_data;
+    }
+
+    //lazy open file if needed (mirror read path logic)
+    if (!file_data->is_open) {
+        if (!node->mount || !node->mount->root || !node->mount->root->private_data) {
+            serial_write_string("[FAT16-VFS] No mount root for write open\n");
+            return -1;
+        }
+
+        fat16_fs_t* fs;
+        void* pdata = node->mount->root->private_data;
+        if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+            fs = ((fat16_dir_private_t*)pdata)->fs;
+        } else {
+            fs = &((filesystem_t*)pdata)->fs_data.fat16;
+        }
+
+        if (!fs) {
+            serial_write_string("[FAT16-VFS] Failed to resolve filesystem for write open\n");
+            return -1;
+        }
+
+        if (fat16_open_file(fs, &file_data->file, node->name) != 0) {
+            serial_write_string("[FAT16-VFS] fat16_open_file failed in write\n");
+            return -1;
+        }
+        file_data->is_open = 1;
     }
 
     //set file position
@@ -213,6 +279,10 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
     int result = fat16_write_file(&file_data->file, buffer, size);
     if (result > 0) {
         serial_write_string("[FAT16-VFS] Write operation completed\n");
+        //update node size to reflect on VFS layer
+        if ((uint32_t)node->size < file_data->file.file_size) {
+            node->size = file_data->file.file_size;
+        }
     } else {
         serial_write_string("[FAT16-VFS] Write operation failed\n");
     }
@@ -232,20 +302,17 @@ static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags
 
     //get the FAT16 filesystem from the parent node
     fat16_fs_t* fs = NULL;
-    if (parent == parent->mount->root) {
-        filesystem_t* fs_wrapper = (filesystem_t*)parent->private_data;
-        fs = &fs_wrapper->fs_data.fat16;
+    if (!parent->mount || !parent->mount->root || !parent->mount->root->private_data) {
+        serial_write_string("[FAT16-VFS] Create failed - no mount root\n");
+        return -1;
+    }
+    //always resolve FS from the mount root which may either hold a filesystem_t (before open) 
+    //or a fat16_dir_private_t (after open)   detect via magic
+    void* pdata = parent->mount->root->private_data;
+    if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+        fs = ((fat16_dir_private_t*)pdata)->fs;
     } else {
-        if (!parent->mount || !parent->mount->root || !parent->mount->root->private_data) {
-            serial_write_string("[FAT16-VFS] Create failed - no mount root\n");
-            return -1;
-        }
-        void* pdata = parent->mount->root->private_data;
-        if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
-            fs = ((fat16_dir_private_t*)pdata)->fs;
-        } else {
-            fs = &((filesystem_t*)pdata)->fs_data.fat16;
-        }
+        fs = &((filesystem_t*)pdata)->fs_data.fat16;
     }
     
     if (!fs) {
@@ -270,31 +337,6 @@ static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags
     hex_buf[8] = '\n';
     hex_buf[9] = '\0';
     serial_write_string(hex_buf);
-    
-    //the VFS filesystem instance has corrupted boot sector data
-    //rn just hardcode the correct values
-    if (fs->boot_sector.root_entries == 0) {
-        serial_write_string("[FAT16-VFS] Fixing corrupted boot sector data\n");
-        fs->boot_sector.root_entries = 0x200;  //512 entries from boot sector analysis
-        fs->boot_sector.bytes_per_sector = 0x200;  //512 bytes per sector
-        fs->boot_sector.reserved_sectors = 0x04;  //4 reserved sectors
-        fs->boot_sector.num_fats = 0x02;  //2 FATs
-        fs->boot_sector.sectors_per_fat = 0x14;  //20 sectors per FAT
-        
-        //recalculate filesystem layout
-        fs->fat_start = fs->boot_sector.reserved_sectors;
-        fs->root_dir_start = fs->fat_start + (fs->boot_sector.num_fats * fs->boot_sector.sectors_per_fat);
-        uint32_t root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
-        fs->data_start = fs->root_dir_start + root_dir_sectors;
-        
-        //fix device pointer get it from parent node
-        if (!fs->device && parent->device) {
-            fs->device = parent->device;
-            serial_write_string("[FAT16-VFS] Fixed device pointer\n");
-        }
-        
-        serial_write_string("[FAT16-VFS] Fixed filesystem layout\n");
-    }
     
     int result = fat16_create_file(fs, name);
     if (result == 0) {
@@ -517,7 +559,7 @@ static int fat16_vfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** ou
             uint32_t type = (entry->attributes & FAT16_ATTR_DIRECTORY) ?
                             VFS_FILE_TYPE_DIRECTORY : VFS_FILE_TYPE_FILE;
 
-            vfs_node_t* entry_node = vfs_create_node(entry_name, type, VFS_FLAG_READ);
+            vfs_node_t* entry_node = vfs_create_node(entry_name, type, VFS_FLAG_READ | VFS_FLAG_WRITE);
             if (!entry_node) {
                 return -1;
             }

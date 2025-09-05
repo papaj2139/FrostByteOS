@@ -41,21 +41,26 @@
 #define SCREEN_WIDTH 80
 #define SCREEN_HEIGHT 25
 #define WATCHDOG_TIMEOUT 500
-#define RSDP_SIG "RSD PTR "
-#define ACPI_SIG_FADT "FACP"
-#define ACPI_SIG_RSDT "RSDT"
-#define ACPI_SIG_XSDT "XSDT"
-#define SLP_EN (1 << 13)
 #define KEYBOARD_DATA_PORT 0x60
 #define KEYBOARD_STATUS_PORT 0x64
 
+//ACPI variables
+#define RSDP_SIG "RSD PTR "
+#define ACPI_SIG_RSDT "RSDT"
+#define ACPI_SIG_XSDT "XSDT"
+#define ACPI_SIG_FADT "FACP"
+#define ACPI_SIG_DSDT "DSDT"
+#define SLP_EN (1 << 13)
+#define SCI_EN (1 << 0)
 
-// Global filesystem instance for shell commands
+
+//global filesystem instance for shell commands
 static fat16_fs_t g_fat16_fs;
 static bool g_fs_initialized = false;
 
 
 //structs and typedefs
+
 typedef struct __attribute__((packed)) {
     char signature[8];
     uint8_t checksum;
@@ -79,6 +84,48 @@ typedef struct __attribute__((packed)) {
     uint32_t creatorid;
     uint32_t creatorrev;
 } acpi_table_header_t;
+
+typedef struct __attribute__((packed)) {
+    acpi_table_header_t header;
+    uint32_t firmware_ctrl;
+    uint32_t dsdt;
+    uint8_t reserved1;
+    uint8_t preferred_pm_profile;
+    uint16_t sci_int;
+    uint32_t smi_cmd;
+    uint8_t acpi_enable;
+    uint8_t acpi_disable;
+    uint8_t s4bios_req;
+    uint8_t pstate_cnt;
+    uint32_t pm1a_evt_blk;
+    uint32_t pm1b_evt_blk;
+    uint32_t pm1a_cnt_blk;
+    uint32_t pm1b_cnt_blk;
+    uint32_t pm2_cnt_blk;
+    uint32_t pm_tmr_blk;
+    uint32_t gpe0_blk;
+    uint32_t gpe1_blk;
+    uint8_t pm1_evt_len;
+    uint8_t pm1_cnt_len;
+    uint8_t pm2_cnt_len;
+    uint8_t pm_tmr_len;
+    uint8_t gpe0_blk_len;
+    uint8_t gpe1_blk_len;
+    uint8_t gpe1_base;
+    uint8_t cst_cnt;
+    uint16_t p_lvl2_lat;
+    uint16_t p_lvl3_lat;
+    uint16_t flush_size;
+    uint16_t flush_stride;
+    uint8_t duty_offset;
+    uint8_t duty_width;
+    uint8_t day_alrm;
+    uint8_t mon_alrm;
+    uint8_t century;
+    uint16_t iapc_boot_arch;
+    uint8_t reserved2;
+    uint32_t flags;
+} fadt_t;
 
 typedef void (*cmd_fn)(const char *args);
 struct cmd_entry { const char *name; cmd_fn fn; };
@@ -108,9 +155,11 @@ static int putchar_term(char c, unsigned char colour);
 void enable_cursor(uint8_t start, uint8_t end);
 static void hex_dump(const uint8_t* data, size_t size, unsigned char colour);
 
+
 void watchdogTick(void) {
     currentTick++;
 }
+
 
 //panic with a custom message stores reason and invokes kpanic screen
 void kpanic_msg(const char* reason){
@@ -125,7 +174,6 @@ void petWatchdog(void) {
 void watchdogCheck(void) {
     if(currentTick > WATCHDOG_TIMEOUT) kpanic();
 }
-
 
 
 static void cmd_shutdown(const char *args) {
@@ -784,9 +832,6 @@ static struct cmd_entry commands[] = {
     {NULL, NULL}
 };
 
-
-
-
 void kclear(void){
     unsigned int j = 0;
 
@@ -965,172 +1010,276 @@ static void scroll_if_needed(void){
     }
 }
 
-
-static int acpi_checksum(void *ptr, unsigned long len) {
+static int acpi_checksum(void *ptr, size_t len) {
     uint8_t sum = 0;
     uint8_t *p = (uint8_t*)ptr;
-    for (unsigned long i = 0; i < len; ++i) sum += p[i];
+    for (size_t i = 0; i < len; i++) {
+        sum += p[i];
+    }
     return sum == 0;
 }
 
-static rsdp_descriptor_t* find_rsdp(void){
-    uint16_t *ebda_ptr = (uint16_t*)0x40E;
-    uint32_t ebda_kb = 0;
-    //suppress array bounds warning for low memory access
+static rsdp_descriptor_t* find_rsdp(void) {
+    //check EBDA first and suppress warning for low memory access
     #pragma GCC diagnostic push
     #pragma GCC diagnostic ignored "-Warray-bounds"
-    if (ebda_ptr) ebda_kb = *ebda_ptr;
+    uint16_t ebda_seg = *(uint16_t*)0x40E;
     #pragma GCC diagnostic pop
-    if (ebda_kb) {
-        uint32_t ebda = ((uint32_t)ebda_kb) << 4;
-        for (uint32_t p = ebda; p < ebda + 1024; p += 16) {
-            if (memcmp((void*)p, RSDP_SIG, 8) == 0) {
-                rsdp_descriptor_t *r = (rsdp_descriptor_t*)p;
-                if (acpi_checksum(r, 20)) return r;
+    
+    uint32_t ebda = ((uint32_t)ebda_seg) << 4;
+    if (ebda >= 0x80000 && ebda < 0xA0000) {
+        for (uint32_t addr = ebda; addr < ebda + 1024; addr += 16) {
+            if (memcmp((void*)addr, RSDP_SIG, 8) == 0) {
+                rsdp_descriptor_t *rsdp = (rsdp_descriptor_t*)addr;
+                if (acpi_checksum(rsdp, 20)) {
+                    return rsdp;
+                }
             }
         }
     }
-    for (uint32_t p = 0xE0000; p < 0x100000; p += 16) {
-        if (memcmp((void*)p, RSDP_SIG, 8) == 0) {
-            rsdp_descriptor_t *r = (rsdp_descriptor_t*)p;
-            if (r->revision >= 2) {
-                if (acpi_checksum(r, r->length)) return r;
-            } else {
-                if (acpi_checksum(r, 20)) return r;
+    
+    //check BIOS area
+    for (uint32_t addr = 0xE0000; addr < 0x100000; addr += 16) {
+        if (memcmp((void*)addr, RSDP_SIG, 8) == 0) {
+            rsdp_descriptor_t *rsdp = (rsdp_descriptor_t*)addr;
+            if (acpi_checksum(rsdp, 20)) {
+                return rsdp;
             }
         }
     }
-    return 0;
+    
+    return NULL;
 }
 
-static acpi_table_header_t* get_rsdt_xsdt(rsdp_descriptor_t *rsdp){
-    if (!rsdp) return 0;
-    if (rsdp->revision >= 2 && rsdp->xsdt_address) {
-        acpi_table_header_t *xsdt = (acpi_table_header_t*)(uintptr_t)rsdp->xsdt_address;
-        if (memcmp(xsdt->signature, ACPI_SIG_XSDT, 4) == 0 && acpi_checksum(xsdt, xsdt->length)) return xsdt;
-    }
-    if (rsdp->rsdt_address) {
-        acpi_table_header_t *rsdt = (acpi_table_header_t*)(uintptr_t)rsdp->rsdt_address;
-        if (memcmp(rsdt->signature, ACPI_SIG_RSDT, 4) == 0 && acpi_checksum(rsdt, rsdt->length)) return rsdt;
-    }
-    return 0;
-}
-
-static acpi_table_header_t* find_table(acpi_table_header_t *rsdt_xsdt, const char *sig){
-    if (!rsdt_xsdt) return 0;
-    unsigned long entry_size = 0;
-    if (memcmp(rsdt_xsdt->signature, ACPI_SIG_XSDT, 4) == 0) entry_size = 8;
-    else entry_size = 4;
-    uint8_t *base = (uint8_t*)rsdt_xsdt;
-    uint32_t len = rsdt_xsdt->length;
-    uint32_t hdr = sizeof(acpi_table_header_t);
-    uint32_t count = (len - hdr) / entry_size;
-    for (uint32_t i = 0; i < count; ++i) {
-        uintptr_t addr;
-        if (entry_size == 8) {
-            uint64_t *entries = (uint64_t*)(base + hdr);
-            addr = (uintptr_t)entries[i];
+static acpi_table_header_t* find_acpi_table(acpi_table_header_t *rsdt, const char *signature) {
+    if (!rsdt) return NULL;
+    
+    bool is_xsdt = (memcmp(rsdt->signature, ACPI_SIG_XSDT, 4) == 0);
+    uint32_t entry_size = is_xsdt ? 8 : 4;
+    uint32_t entries = (rsdt->length - sizeof(acpi_table_header_t)) / entry_size;
+    
+    uint8_t *table_data = (uint8_t*)rsdt + sizeof(acpi_table_header_t);
+    
+    for (uint32_t i = 0; i < entries; i++) {
+        uint32_t table_addr;
+        if (is_xsdt) {
+            uint64_t addr64 = *(uint64_t*)(table_data + i * 8);
+            if (addr64 > 0xFFFFFFFF) continue; //skip 64-bit addresses
+            table_addr = (uint32_t)addr64;
         } else {
-            uint32_t *entries = (uint32_t*)(base + hdr);
-            addr = (uintptr_t)entries[i];
+            table_addr = *(uint32_t*)(table_data + i * 4);
         }
-        acpi_table_header_t *t = (acpi_table_header_t*)addr;
-        if (t && memcmp(t->signature, sig, 4) == 0) {
-            if (acpi_checksum(t, t->length)) return t;
+        
+        //map the table header to check signature
+        uint32_t page_addr = table_addr & ~(PAGE_SIZE - 1);
+        uint32_t offset = table_addr & (PAGE_SIZE - 1);
+        uint32_t temp_virt = 0x400000; //use a temporary virtual address
+        
+        if (vmm_map_page(temp_virt, page_addr, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+            continue; //skip if mapping fails
+        }
+        
+        acpi_table_header_t *table = (acpi_table_header_t*)(temp_virt + offset);
+        bool match = (memcmp(table->signature, signature, 4) == 0);
+        
+        vmm_unmap_page_nofree(temp_virt);
+        
+        if (match) {
+            return (acpi_table_header_t*)table_addr; //return physical address
         }
     }
-    return 0;
+    
+    return NULL;
 }
 
-static uint32_t read_pm1a_cnt_blk(acpi_table_header_t *fadt_hdr){
-    if (!fadt_hdr) return 0;
-    uint8_t *fadt = (uint8_t*)fadt_hdr;
-    if (fadt_hdr->length >= 88) {
-        uint32_t pm1a = *(uint32_t*)(fadt + 64);
-        if (pm1a != 0 && pm1a != 0xFFFFFFFF) return pm1a;
-    }
-    if (fadt_hdr->length >= 68) {
-        uint16_t pm1a16 = *(uint16_t*)(fadt + 64);
-        if (pm1a16 != 0 && pm1a16 != 0xFFFF) return (uint32_t)pm1a16;
-    }
-    return 0;
-}
-
-static int find_s5_sleep_type(acpi_table_header_t *fadt_hdr, uint16_t *out_slp_typa){
-    if (!fadt_hdr || !out_slp_typa) return 0;
-    uint8_t *fadt = (uint8_t*)fadt_hdr;
-    uint32_t dsdt_addr = 0;
-    if (fadt_hdr->length >= 44) {
-        dsdt_addr = *(uint32_t*)(fadt + 40);
-    }
-    if (!dsdt_addr) return 0;
-    acpi_table_header_t *dsdt = (acpi_table_header_t*)(uintptr_t)dsdt_addr;
-    if (!dsdt || !acpi_checksum(dsdt, dsdt->length)) return 0;
+static uint16_t find_s5_sleep_type(acpi_table_header_t *dsdt) {
+    if (!dsdt) return 5; //default fallback
+    
     uint8_t *data = (uint8_t*)dsdt;
-    uint32_t len = dsdt->length;
-    for (uint32_t i = 0; i + 4 < len; ++i) {
-        if (data[i] == '_' && data[i+1] == 'S' && data[i+2] == '5') {
-            uint32_t j = i + 3;
-            if (data[j] == '_') j++;
-            uint32_t limit = (j + 64 < len) ? (j + 64) : len;
-            for (uint32_t k = j; k < limit; ++k) {
-                uint8_t b = data[k];
-                if (b == 0x12) {
-                    uint32_t p = k + 1;
-                    uint8_t pkg_len = data[p++];
-                    if (pkg_len & 0x80) pkg_len = data[p++];
-                    for (uint32_t e = p; e < p + pkg_len && e + 1 < len; ++e) {
-                        if (data[e] == 0x0A) {
-                            uint8_t val = data[e+1];
-                            *out_slp_typa = (uint16_t)val;
-                            return 1;
-                        } else if (data[e] == 0x0C) {
-                            uint16_t val = *(uint16_t*)&data[e+1];
-                            *out_slp_typa = val;
-                            return 1;
-                        } else if ((data[e] & 0xF0) == 0x70) {
-                            *out_slp_typa = (uint16_t)(data[e] & 0x0F);
+    uint32_t length = dsdt->length;
+    
+    //search for "_S5_" followed by a package
+    for (uint32_t i = 0; i < length - 10; i++) {
+        if (data[i] == '_' && data[i+1] == 'S' && data[i+2] == '5' && data[i+3] == '_') {
+            //look for package op (0x12) nearby
+            for (uint32_t j = i + 4; j < i + 20 && j < length - 5; j++) {
+                if (data[j] == 0x12) { //package op
+                    //skip package length encoding
+                    uint32_t k = j + 1;
+                    if (data[k] & 0xC0) k += (data[k] >> 6) & 3; //multi-byte length
+                    k++; //skip element count
+                    
+                    //look for first integer value
+                    if (k < length) {
+                        if (data[k] == 0x0A && k + 1 < length) { //byte const
+                            uint8_t val = data[k + 1];
+                            if (val > 0 && val < 8) return val;
+                        } else if (data[k] == 0x01) { //one
                             return 1;
                         }
                     }
                     break;
                 }
-                if (b == 0x0A && k + 1 < limit) {
-                    *out_slp_typa = data[k+1];
-                    return 1;
-                }
             }
         }
     }
-    return 0;
+    
+    return 5; //default S5 sleep type
 }
 
-void kshutdown(void){
+void kshutdown(void) {
+    DEBUG_PRINT("Initiating shutdown...");
+    
+    //find RSDP
     rsdp_descriptor_t *rsdp = find_rsdp();
-    if (rsdp) {
-        acpi_table_header_t *rsdt_xsdt = get_rsdt_xsdt(rsdp);
-        if (rsdt_xsdt) {
-            acpi_table_header_t *fadt = find_table(rsdt_xsdt, ACPI_SIG_FADT);
-            if (fadt) {
-                uint32_t pm1a = read_pm1a_cnt_blk(fadt);
-                uint16_t slp_typ = 0;
-                int got_s5 = find_s5_sleep_type(fadt, &slp_typ);
-                if (pm1a) {
-                    if (!got_s5) slp_typ = 5;
-                    uint16_t slp = (slp_typ & 0x7) << 10;
-                    if (pm1a <= 0xFFFF) {
-                        outw((uint16_t)pm1a, slp | SLP_EN);
-                        for (volatile unsigned long long i = 0; i < 1000000; i++);
-                    }
-                }
+    if (!rsdp) {
+        DEBUG_PRINT("RSDP not found, using fallback");
+        goto fallback_shutdown;
+    }
+    DEBUG_PRINT("RSDP found");
+    
+    //get RSDT/XSDT
+    uint32_t rsdt_phys = 0;
+    if (rsdp->revision >= 2 && rsdp->xsdt_address && (rsdp->xsdt_address >> 32) == 0) {
+        rsdt_phys = (uint32_t)rsdp->xsdt_address;
+    } else if (rsdp->rsdt_address) {
+        rsdt_phys = rsdp->rsdt_address;
+    }
+    
+    if (!rsdt_phys) {
+        DEBUG_PRINT("RSDT/XSDT not found");
+        goto fallback_shutdown;
+    }
+    DEBUG_PRINT("RSDT/XSDT address found");
+    
+    //map RSDT/XSDT
+    uint32_t rsdt_page = rsdt_phys & ~(PAGE_SIZE - 1);
+    uint32_t rsdt_offset = rsdt_phys & (PAGE_SIZE - 1);
+    uint32_t rsdt_virt = 0x500000;
+    
+    if (vmm_map_page(rsdt_virt, rsdt_page, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+        DEBUG_PRINT("Failed to map RSDT/XSDT");
+        goto fallback_shutdown;
+    }
+    DEBUG_PRINT("RSDT/XSDT mapped");
+    
+    acpi_table_header_t *rsdt = (acpi_table_header_t*)(rsdt_virt + rsdt_offset);
+    
+    //find FADT
+    uint32_t fadt_phys = (uint32_t)find_acpi_table(rsdt, ACPI_SIG_FADT);
+    if (!fadt_phys) {
+        DEBUG_PRINT("FADT not found");
+        vmm_unmap_page_nofree(rsdt_virt);
+        goto fallback_shutdown;
+    }
+    DEBUG_PRINT("FADT found");
+    
+    //map FADT
+    uint32_t fadt_page = fadt_phys & ~(PAGE_SIZE - 1);
+    uint32_t fadt_offset = fadt_phys & (PAGE_SIZE - 1);
+    uint32_t fadt_virt = 0x600000;
+    
+    if (vmm_map_page(fadt_virt, fadt_page, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+        DEBUG_PRINT("Failed to map FADT");
+        vmm_unmap_page_nofree(rsdt_virt);
+        goto fallback_shutdown;
+    }
+    
+    fadt_t *fadt = (fadt_t*)(fadt_virt + fadt_offset);
+    
+    //get PM1a control register
+    uint32_t pm1a_cnt = fadt->pm1a_cnt_blk;
+    if (!pm1a_cnt) {
+        DEBUG_PRINT("PM1a control register not found");
+        vmm_unmap_page_nofree(fadt_virt);
+        vmm_unmap_page_nofree(rsdt_virt);
+        goto fallback_shutdown;
+    }
+    serial_printf("PM1a control register: 0x%x\n", pm1a_cnt);
+    
+    //map and parse DSDT for S5 sleep type
+    uint32_t dsdt_phys = fadt->dsdt;
+    uint16_t slp_typ = 5; //default
+    
+    if (dsdt_phys) {
+        uint32_t dsdt_page = dsdt_phys & ~(PAGE_SIZE - 1);
+        uint32_t dsdt_offset = dsdt_phys & (PAGE_SIZE - 1);
+        uint32_t dsdt_virt = 0x700000;
+        
+        if (vmm_map_page(dsdt_virt, dsdt_page, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+            acpi_table_header_t *dsdt = (acpi_table_header_t*)(dsdt_virt + dsdt_offset);
+            slp_typ = find_s5_sleep_type(dsdt);
+            vmm_unmap_page_nofree(dsdt_virt);
+        }
+    }
+    serial_printf("S5 sleep type: %d\n", slp_typ);
+    
+    //enable ACPI if needed
+    if (fadt->smi_cmd && fadt->acpi_enable) {
+        serial_printf("Enabling ACPI via SMI_CMD=0x%x\n", fadt->smi_cmd);
+        uint16_t pm1a_sts = inw(pm1a_cnt);
+        if (!(pm1a_sts & SCI_EN)) {
+            outb(fadt->smi_cmd, fadt->acpi_enable);
+            //wait for ACPI to be enabled
+            for (int i = 0; i < 100; i++) {
+                if (inw(pm1a_cnt) & SCI_EN) break;
+                for (volatile int j = 0; j < 10000; j++);
             }
         }
     }
-    __asm__ volatile("mov $0x2000, %%eax\n\t"
-                     "mov $0x604, %%dx\n\t"
-                     "out %%ax, %%dx" : : : "eax", "edx");
-    outw(0x604, 0x2000 | SLP_EN);
-    kpanic();
+    
+    //perform shutdown
+    uint16_t pm1a_val = inw(pm1a_cnt);
+    serial_printf("PM1a original value: 0x%x\n", pm1a_val);
+    pm1a_val &= ~(7 << 10); //clear SLP_TYP
+    pm1a_val |= (slp_typ << 10) | SLP_EN;
+    serial_printf("PM1a shutdown value: 0x%x\n", pm1a_val);
+    
+    //disable interrupts for atomic shutdown
+    asm volatile("cli");
+    
+    //write PM1b first if it exists
+    if (fadt->pm1b_cnt_blk) {
+        uint16_t pm1b_val = inw(fadt->pm1b_cnt_blk);
+        pm1b_val &= ~(7 << 10);
+        pm1b_val |= (slp_typ << 10) | SLP_EN;
+        outw(fadt->pm1b_cnt_blk, pm1b_val);
+    }
+    
+    //write PM1a last to trigger shutdown
+    outw(pm1a_cnt, pm1a_val);
+    
+    //try alternative QEMU ACPI approach if PM1a is at 0x604
+    if (pm1a_cnt == 0x604) {
+        serial_printf("Trying QEMU ACPI shutdown with 0x2000\n");
+        outw(0x604, 0x2000);  // QEMU's expected shutdown value
+    }
+    
+    //give it a moment
+    for (volatile int i = 0; i < 1000; i++);
+    
+    //cleanup mappings
+    vmm_unmap_page_nofree(fadt_virt);
+    vmm_unmap_page_nofree(rsdt_virt);
+    
+    serial_printf("ACPI shutdown initiated\n");
+    
+    //if we reach here ACPI shutdown didn't work so halt forever
+    for (;;) {
+        asm volatile("hlt");
+    }
+    
+fallback_shutdown:
+    DEBUG_PRINT("ACPI shutdown failed, trying fallback methods");
+    //try QEMU/Bochs specific ports
+    outw(0x604, 0x2000);  //QEMU
+    outw(0xB004, 0x2000); //bochs
+    outb(0xF4, 0x00);     //QEMU isa-debug-exit
+    
+    //if all else fails just halt
+    for (;;) {
+        asm volatile("hlt");
+    }
 }
 
 //works in qemu idk how about real hardware
@@ -1389,10 +1538,10 @@ void kmain(uint32_t magic, uint32_t addr) {
             //find ATA device and mount the root filesystem
             device_t* ata_dev = device_find_by_type(DEVICE_TYPE_STORAGE);
             if (ata_dev) {
-                //mount the root filesystem
+                //mount the root filesystem with FAT16
                 if (vfs_mount("ata0", "/", "fat16") == 0) {
                     DEBUG_PRINT("Root filesystem mounted successfully");
-                    // Manually initialize our global fs object for the new command
+                    //manually initialize global fs object
                     if (fat16_init(&g_fat16_fs, ata_dev) == 0) {
                         g_fs_initialized = true;
                         DEBUG_PRINT("Global FAT16 FS object initialized for commands");

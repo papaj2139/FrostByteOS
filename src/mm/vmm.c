@@ -155,6 +155,33 @@ int vmm_unmap_page(uint32_t virtual_addr) {
     return 0;
 }
 
+int vmm_unmap_page_nofree(uint32_t virtual_addr) {
+    uint32_t pd_index = PAGE_DIRECTORY_INDEX(virtual_addr);
+    uint32_t pt_index = PAGE_TABLE_INDEX(virtual_addr);
+
+    page_directory_t directory = current_directory;
+    if (!directory) directory = kernel_directory;
+
+    if (!(directory[pd_index] & PAGE_PRESENT)) {
+        return -1; //page table doesn't exist
+    }
+
+    uint32_t pt_phys = directory[pd_index] & ~0xFFF;
+    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+
+    if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        return -1; //page not mapped
+    }
+
+    //clear page table entry without freeing the physical frame
+    page_table[pt_index] = 0;
+
+    //flush TLB
+    flush_tlb();
+
+    return 0;
+}
+
 uint32_t vmm_get_physical_addr(uint32_t virtual_addr) {
     uint32_t pd_index = PAGE_DIRECTORY_INDEX(virtual_addr);
     uint32_t pt_index = PAGE_TABLE_INDEX(virtual_addr);
@@ -201,74 +228,72 @@ void vmm_switch_directory(page_directory_t directory) {
 }
 
 
-// Add these functions to vmm.c
-
-// Map a page in a specific page directory
+//map a page in a specific page directory
 int vmm_map_page_in_directory(page_directory_t directory, uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags) {
     uint32_t pd_index = PAGE_DIRECTORY_INDEX(virtual_addr);
     uint32_t pt_index = PAGE_TABLE_INDEX(virtual_addr);
 
     if (!directory) {
-        return -1; // Invalid directory
+        return -1; //invalid directory
     }
 
-    // Check if page table exists
+    //check if page table exists
     if (!(directory[pd_index] & PAGE_PRESENT)) {
-        // Allocate new page table
+        //allocate new page table
         uint32_t pt_phys = pmm_alloc_page();
         if (!pt_phys) {
-            return -1; // Out of memory
+            return -1; //out of memory
         }
 
         directory[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
 
-        // Clear the new page table
+        //clear the new page table
         page_table_t pt = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
         memset(pt, 0, PAGE_SIZE);
     }
 
-    // Get page table
+    //get page table
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
     page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
 
-    // Map the page
+    //map the page
     page_table[pt_index] = (physical_addr & ~0xFFF) | flags;
 
     return 0;
 }
 
-// Map kernel space into a user page directory
+//map kernel space into a user page directory
 void vmm_map_kernel_space(page_directory_t directory) {
     if (!directory || !kernel_directory) {
         return;
     }
 
-    // Copy kernel mappings (higher half - starting from 3GB)
-    for (int i = 768; i < 1024; i++) { // 768 = 3GB / 4MB
+    //copy kernel mappings (higher half  starting from 3GB)
+    for (int i = 768; i < 1024; i++) { //768 = 3GB / 4MB
         directory[i] = kernel_directory[i];
     }
 }
 
-// Get the kernel page directory
+//get the kernel page directory
 page_directory_t vmm_get_kernel_directory(void) {
     return kernel_directory;
 }
 
-// Destroy a page directory and free its resources
+//destroy a page directory and free its resources
 void vmm_destroy_directory(page_directory_t directory) {
     if (!directory || directory == kernel_directory) {
-        return; // Don't destroy kernel directory or NULL pointer
+        return; //don't destroy kernel directory or NULL pointer
     }
 
-    // Free all user page tables (not kernel ones)
-    for (int i = 0; i < 768; i++) { // Only user space (0-3GB)
+    //free all user page tables (not kernel ones)
+    for (int i = 0; i < 768; i++) { //only user space (0-3GB)
         if (directory[i] & PAGE_PRESENT) {
             uint32_t pt_phys = directory[i] & ~0xFFF;
             pmm_free_page(pt_phys);
         }
     }
 
-    // Free the page directory itself
+    //free the page directory itself
     uint32_t dir_phys = VIRTUAL_TO_PHYSICAL((uint32_t)directory);
     pmm_free_page(dir_phys);
 }
