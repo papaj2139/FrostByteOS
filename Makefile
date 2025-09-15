@@ -115,11 +115,17 @@ heap.o: src/mm/heap.c
 paging_asm.o: src/mm/paging_asm.asm
 	$(ASM) $(ASMFLAGS) $< -o $@
 
+process.o: src/process.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+process_asm.o: src/process_asm.asm
+	$(ASM) $(ASMFLAGS) $< -o $@
+
 $(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
            keyboard.o mouse.o serial.o pc_speaker.o timer.o rtc.o ata.o \
            vga.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
            syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o fd.o \
-           pmm.o vmm.o heap.o paging_asm.o
+           pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 iso: $(KERNEL)

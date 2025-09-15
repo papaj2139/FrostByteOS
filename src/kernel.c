@@ -22,13 +22,13 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
+#include "process.h"
 #include <stdbool.h>
 
 
 /* TODO LIST:
     * = done
 
-    * Fix memory showing as 0mb
     - Add MiniFS (see minifs.c)
     - Add more commands
     - Add the Watchdog timer
@@ -1522,6 +1522,11 @@ void kmain(uint32_t magic, uint32_t addr) {
     DEBUG_PRINT("IDT installed");
     syscall_init();
     DEBUG_PRINT("Syscalls initialized");
+    
+    // Initialize process manager before timer to avoid scheduling before ready
+    process_init();
+    DEBUG_PRINT("Process manager initialized");
+    
     timer_init(100); //100 hz
     keyboard_init(); //enable IRQ1 and setup keyboard handler
     DEBUG_PRINT("Timer initialized");

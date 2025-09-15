@@ -5,6 +5,7 @@
 #include "mm/pmm.h"
 #include "interrupts/idt.h"
 #include "drivers/serial.h"
+#include "process.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -44,6 +45,14 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_getpid();
         case SYS_SLEEP:
             return sys_sleep(arg1);
+        case SYS_FORK:
+            return sys_fork();
+        case SYS_EXEC:
+            return sys_exec((const char*)arg1);
+        case SYS_WAIT:
+            return sys_wait((int32_t*)arg1);
+        case SYS_YIELD:
+            return sys_yield();
         default:
             print("Unknown syscall\n", 0x0F);
             return -1; //ENOSYS = Function not implemented
@@ -52,17 +61,8 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
 
 //syscall implementations
 int32_t sys_exit(int32_t status) {
-    print("Process exiting with status ", 0x0F);
-    if (status == 0) {
-        print("0\n", 0x0F);
-    } else {
-        print("non-zero\n", 0x0F);
-    }
-    //just halt theres no process manager yet
-    while(1) {
-        __asm__ volatile ("hlt");
-    }
-    return 0;
+    process_exit(status);
+    return 0; //Never reached
 }
 
 int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
@@ -158,24 +158,34 @@ int32_t sys_creat(const char* pathname, int32_t mode) {
 
 
 int32_t sys_getpid(void) {
-    //always return PID 1
-    return 1;
+    process_t* current = process_get_current();
+    return current ? current->pid : 0;
 }
 
 int32_t sys_sleep(uint32_t seconds) {
-    //just busy-wait there's no scheduler yet
-    print("Sleeping for ", 0x0F);
-    if (seconds == 1) {
-        print("1 second...\n", 0x0F);
-    } else {
-        print("multiple seconds...\n", 0x0F);
-    }
-    
-    for (uint32_t i = 0; i < seconds * 50000; i++) {
-        __asm__ volatile ("nop");
-    }
-    
-    print("Sleep completed!\n", 0x0F);
+    process_sleep(seconds * 100); //convert to ticks
+    return 0;
+}
+
+int32_t sys_fork(void) {
+    //TODO: implement fork() create copy of current process
+    return -1; //not implemented yet
+}
+
+int32_t sys_exec(const char* pathname) {
+    //TODO: implement exec() replace current process with new program
+    (void)pathname;
+    return -1; //not implemented yet
+}
+
+int32_t sys_wait(int32_t* status) {
+    //TODO: Implement wait() wait for child process to exit
+    (void)status;
+    return -1; //not implemented yet
+}
+
+int32_t sys_yield(void) {
+    process_yield();
     return 0;
 }
 
