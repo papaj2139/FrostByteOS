@@ -19,6 +19,11 @@ git clone https://github.com/FrostByte-OS/FrostByteOS.git
 cd FrostByteOS
 make
 ```
+If you're on a BSD:
+```bash
+gmake
+```
+
 if you want to run it in QEMU
 ```bash
 make run
