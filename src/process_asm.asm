@@ -112,6 +112,8 @@ context_switch_asm:
     mov fs, ax
     mov gs, ax
 
+    ;do not restore GPRs here; let user code set them and avoid clobbering
+
     ;perform the privilege-level switch
     iretd
 

@@ -217,9 +217,12 @@ int32_t sys_fork(void) {
     //disable interrupts during fork to avoid reentrancy
     uint32_t eflags;
     __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags) :: "memory");
+    serial_write_string("[FORK] post-cli\n");
 
-    //TEMP: create child as kernel-mode process to isolate user-mode setup
-    process_t* child = process_create(parent->name, (void*)parent->context.eip, false);
+    serial_write_string("[FORK] pre-create\n");
+
+    //create child as USER-MODE process
+    process_t* child = process_create(parent->name, (void*)parent->context.eip, true);
     if (!child) {
         serial_write_string("[FORK] process_create failed\n");
         //restore IF if it was set
@@ -228,14 +231,28 @@ int32_t sys_fork(void) {
     }
     serial_write_string("[FORK] created\n");
 
-    //clone user address space
+    //clone user address space once per-process CR3 is enabled but that later
     //if (clone_user_space(parent->page_directory, child->page_directory) != 0) {
     //    serial_write_string("[FORK] clone_user_space failed\n");
     //    process_destroy(child);
+    //    if (eflags & 0x200) __asm__ volatile ("sti");
     //    return -1;
     //}
 
-    //TEMP: skip context/TTY copy we only want to validate parent return path stability first
+    //inherit minimal context so child returns to the same user EIP with ESP preserved
+    //and EAX=0 in the child per POSIX semantics
+    child->context.eip = parent->context.eip;      //return point in user space
+    child->context.esp = parent->context.esp;      //user stack pointer at syscall entry
+    child->context.ebp = parent->context.esp;      //best-effort (we don't capture exact EBP)
+    child->context.cs  = 0x1B;                     //user code segment
+    child->context.ss  = 0x23;                     //user stack segment
+    child->context.ds = child->context.es = child->context.fs = child->context.gs = 0x23;
+    child->context.eflags = parent->context.eflags; //preserve IF and flags
+    child->context.eax = 0;                        //fork() returns 0 in child
+
+    //inherit TTY mode and controlling TTY
+    child->tty = parent->tty;
+    child->tty_mode = parent->tty_mode;
 
     //restore IF if it was set
     if (eflags & 0x200) __asm__ volatile ("sti");

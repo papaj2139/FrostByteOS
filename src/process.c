@@ -103,6 +103,7 @@ void process_reap_zombies(void) {
 }
 
 process_t* process_create(const char* name, void* entry_point, bool user_mode) {
+    serial_write_string("[PROC] create begin\n");
     //clean up any defunct processes so their slots/PIDs are reusable
     process_reap_zombies();
     //find free process slot
@@ -114,7 +115,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         }
     }
     
-    if (!proc) return NULL;  //no free slots
+    if (!proc) { serial_write_string("[PROC] no free slot\n"); return NULL; }  //no free slots
     
     //initialize process
     memset(proc, 0, sizeof(process_t));
@@ -127,6 +128,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
     
     //set up memory space
     if (user_mode) {
+        serial_write_string("[PROC] user path\n");
         //create new page directory for user process
         proc->page_directory = vmm_create_directory();
         if (!proc->page_directory) {
@@ -144,16 +146,20 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
                                   PAGE_PRESENT | PAGE_WRITABLE);
         
         //allocate kernel stack (kernel virtual memory)
+        serial_write_string("[PROC] kmalloc kstack (user)\n");
         void* kstk_base = kmalloc(KERNEL_STACK_SIZE);
         if (!kstk_base) {
+            serial_write_string("[PROC] kmalloc kstack failed (user)\n");
             vmm_destroy_directory(proc->page_directory);
             proc->state = PROC_UNUSED;
             return NULL;
         }
+        serial_write_string("[PROC] kstack ok (user)\n");
         proc->kernel_stack = (uint32_t)kstk_base + KERNEL_STACK_SIZE; //top of stack
         
         //set up user stack (top of user space)
         proc->user_stack_top = USER_VIRTUAL_END;
+        serial_write_string("[PROC] alloc user stack phys\n");
         uint32_t user_stack_phys = pmm_alloc_page();
         if (!user_stack_phys) {
             //free previously allocated kernel stack
@@ -162,8 +168,10 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
             proc->state = PROC_UNUSED;
             return NULL;
         }
+        serial_write_string("[PROC] user stack phys ok\n");
         
         //map user stack
+        serial_write_string("[PROC] map user stack\n");
         vmm_map_page_in_directory(proc->page_directory, 
                                 USER_VIRTUAL_END - 0x1000, 
                                 user_stack_phys, 
@@ -188,9 +196,18 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         proc->tty_mode = TTY_MODE_CANON | TTY_MODE_ECHO;
         
     } else {
+        serial_write_string("[PROC] kernel path\n");
         //kernel process use kernel page directory
         proc->page_directory = vmm_get_kernel_directory();
-        proc->kernel_stack = (uint32_t)kmalloc(KERNEL_STACK_SIZE) + KERNEL_STACK_SIZE;
+        serial_write_string("[PROC] kmalloc kstack (kern)\n");
+        void* kstk_base_k = kmalloc(KERNEL_STACK_SIZE);
+        if (!kstk_base_k) {
+            serial_write_string("[PROC] kmalloc kstack failed (kern)\n");
+            proc->state = PROC_UNUSED;
+            return NULL;
+        }
+        proc->kernel_stack = (uint32_t)kstk_base_k + KERNEL_STACK_SIZE;
+        serial_write_string("[PROC] kstack ok (kern)\n");
         
         //initialize CPU context for kernel mode
         proc->context.eip = (uint32_t)entry_point;
@@ -215,6 +232,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
     }
     
     proc->state = PROC_RUNNABLE;
+    serial_write_string("[PROC] create end\n");
     return proc;
 }
 

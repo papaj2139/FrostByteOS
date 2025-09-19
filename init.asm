@@ -8,9 +8,9 @@
 _start:
     ;exec /bin/forktest as it'll exec /bin/sh anyways
     mov eax, SYS_EXECVE
-    mov ebx, path_forktest    ; pathname
-    xor ecx, ecx        ; argv = NULL
-    xor edx, edx        ; envp = NULL
+    mov ebx, path_forktest    ;pathname
+    xor ecx, ecx        ;argv = NULL
+    xor edx, edx        ;envp = NULL
     int 0x80
 
     ;if exec returns it failed print message and exit(1)
@@ -53,4 +53,5 @@ print_string:
 
 section .data
 path_forktest db '/bin/forktest', 0
+path_sh db '/bin/sh', 0
 msg_fail db 'init: exec("/bin/sh") failed', 0x0A, 0

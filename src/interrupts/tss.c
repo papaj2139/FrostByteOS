@@ -6,8 +6,8 @@
 //global TSS
 static tss_t kernel_tss;
 
-//kernel stack for TSS
-static uint8_t kernel_stack[4096] __attribute__((aligned(16)));
+//kernel stack for TSS (increase size to tolerate deep syscall call chains)
+static uint8_t kernel_stack[16384] __attribute__((aligned(16)));
 
 void tss_init(void) {
     //clear TSS structure

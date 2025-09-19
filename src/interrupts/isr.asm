@@ -30,7 +30,7 @@ isr%1:
     iretd
 %endmacro
 
-; Define all 32 exception vectors
+;define exception vectors
 ISR_NOERR 0   ;division by zero error
 ISR_NOERR 1   ;debug
 ISR_NOERR 2   ;non-maskable interrupt

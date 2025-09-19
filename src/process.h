@@ -10,7 +10,7 @@ struct device;
 
 #define MAX_PROCESSES 64
 #define PROCESS_NAME_MAX 32
-#define KERNEL_STACK_SIZE 4096
+#define KERNEL_STACK_SIZE 16384
 
 //process states
 typedef enum {
