@@ -16,9 +16,11 @@
 #include "interrupts/gdt.h"
 #include "interrupts/tss.h"
 #include "drivers/mouse.h"
+#include "drivers/tty.h"
 #include "fs/fs.h"
 #include "fs/fat16.h"
 #include "fs/vfs.h"
+#include "fs/initramfs.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
@@ -158,6 +160,119 @@ static void hex_dump(const uint8_t* data, size_t size, unsigned char colour);
 
 void watchdogTick(void) {
     currentTick++;
+}
+
+//spawn a user program from VFS path by loading it to 0x01000000 and creating a user process
+//returns 1 on success 0 on failure
+static int spawn_user_from_vfs(const char* path) {
+    if (!path || !*path) return 0;
+    serial_write_string("\nLoading app from VFS: ");
+    serial_write_string(path);
+    serial_write_string("\n");
+
+    vfs_node_t* node = vfs_open(path, VFS_FLAG_READ);
+    if (!node) {
+        serial_write_string("[VFS] File not found\n");
+        return 0;
+    }
+
+    int fsize = vfs_get_size(node);
+    if (fsize <= 0) {
+        vfs_close(node);
+        serial_write_string("[VFS] Invalid file size\n");
+        return 0;
+    }
+
+    if (fsize > 4096) fsize = 4096; //ssingle page loader
+
+    //allocate a physical page and map it at a kernel temp address to copy
+    const uint32_t entry_va = 0x01000000;
+    const uint32_t temp_kmap = 0x00800000;
+    uint32_t code_phys = pmm_alloc_page();
+    if (!code_phys) {
+        vfs_close(node);
+        serial_write_string("[VFS] pmm_alloc_page failed\n");
+        return 0;
+    }
+    if (vmm_map_page(temp_kmap, code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+        vfs_close(node);
+        pmm_free_page(code_phys);
+        serial_write_string("[VFS] map temp page failed\n");
+        return 0;
+    }
+
+    memset((void*)temp_kmap, 0, 4096);
+    //read file into the mapped page
+    uint32_t offset = 0;
+    while (offset < (uint32_t)fsize) {
+        int r = vfs_read(node, offset, (uint32_t)(fsize - offset), (char*)((uint8_t*)temp_kmap + offset));
+        if (r <= 0) break;
+        offset += (uint32_t)r;
+    }
+    vfs_close(node);
+    vmm_unmap_page_nofree(temp_kmap);
+
+    //create the process
+    process_t* proc = process_create("/bin/sh", (void*)entry_va, true);
+    if (!proc) {
+        pmm_free_page(code_phys);
+        serial_write_string("[VFS] process_create failed\n");
+        return 0;
+    }
+
+    //map code into process and kernel address spaces
+    if (vmm_map_page_in_directory(proc->page_directory, entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        process_destroy(proc);
+        pmm_free_page(code_phys);
+        serial_write_string("[VFS] map in proc failed\n");
+        return 0;
+    }
+    if (vmm_map_page(entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        process_destroy(proc);
+        pmm_free_page(code_phys);
+        serial_write_string("[VFS] map in kernel failed\n");
+        return 0;
+    }
+
+    //create and map a user stack at 0x02000000
+    uint32_t ustack_phys = pmm_alloc_page();
+    if (!ustack_phys) {
+        serial_write_string("[VFS] alloc user stack failed\n");
+        process_destroy(proc);
+        return 0;
+    }
+    if (vmm_map_page(0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        serial_write_string("[VFS] map user stack in kernel failed\n");
+        pmm_free_page(ustack_phys);
+        process_destroy(proc);
+        return 0;
+    }
+    if (vmm_map_page_in_directory(proc->page_directory, 0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        serial_write_string("[VFS] map user stack in proc failed\n");
+        pmm_free_page(ustack_phys);
+        process_destroy(proc);
+        return 0;
+    }
+    proc->context.esp = 0x02000000 - 16;
+
+    //debugdump context and mappings
+    {
+        uint32_t phys_code = vmm_get_physical_addr(entry_va);
+        uint32_t phys_stack = vmm_get_physical_addr(0x02000000 - 0x1000);
+        char out[192];
+        ksnprintf(out, sizeof(out),
+                  "Boot: Spawned %s PID %u entry=0x%08x code_phys=0x%08x stack_top=0x%08x stack_phys=0x%08x\n",
+                  path, proc->pid, entry_va, phys_code, (uint32_t)(0x02000000 - 16), phys_stack);
+        serial_write_string(out);
+        ksnprintf(out, sizeof(out),
+                  "Ctx: CS=0x%04x SS=0x%04x DS=0x%04x EFLAGS=0x%08x EIP=0x%08x ESP=0x%08x\n",
+                  (unsigned)proc->context.cs, (unsigned)proc->context.ss, (unsigned)proc->context.ds,
+                  (unsigned)proc->context.eflags, (unsigned)proc->context.eip, (unsigned)proc->context.esp);
+        serial_write_string(out);
+    }
+
+    process_yield();
+    return 1;
 }
 
 
@@ -377,8 +492,8 @@ static void cmd_loadapp(const char *args) {
     (void)args;
     serial_write_string("\nLoading app from disk sector 50...\n");
 
-    //allocate buffer for one sector
-    static uint8_t buffer[512];
+    //allocate buffer for one page (8 sectors)
+    static uint8_t buffer[4096];
 
     serial_write_string("Loading user application...\n");
     device_t* ata_dev = device_find_by_name("ata0");
@@ -387,62 +502,92 @@ static void cmd_loadapp(const char *args) {
         return;
     }
 
-    int bytes_read = device_read(ata_dev, 50 * 512, buffer, 512); //read 1 sector from LBA 50
+    int bytes_read = device_read(ata_dev, 50 * 512, buffer, 4096); //read 8 sectors (4KB) from LBA 50
 
-    if (bytes_read != 512) {
+    if (bytes_read <= 0) {
         serial_write_string("Failed to read from ATA drive\n");
         return;
     }
 
-    //map 0x1000000 directly in kernel space and copy there
-    if (vmm_map_page(0x1000000, 0x1000000, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
-        serial_write_string("Failed to map user application memory!\n");
+    //prepare a user-space entry address and a backing physical page for the program
+    const uint32_t entry_va = 0x01000000; //16MB in user space
+    const uint32_t temp_kmap = 0x00800000; //temporary kernel mapping address for copying (8MB)
+
+    //allocate a physical page to hold the program code
+    uint32_t code_phys = pmm_alloc_page();
+    if (!code_phys) {
+        serial_write_string("Failed to allocate physical page for program code\n");
         return;
     }
 
-    //copy the application data
-    memcpy((void*)0x1000000, buffer, 512);
-    serial_write_string("User application loaded at 0x1000000\n");
-
-    //check if it has valid code (simple sanity check)
-    uint32_t* code = (uint32_t*)0x1000000;
-    serial_write_string("First 4 bytes of loaded code: ");
-    char hex[12];
-    for (int i = 0; i < 8; i++) {
-        hex[i] = "0123456789ABCDEF"[((uint8_t*)code)[i/2] >> ((i%2) ? 0 : 4) & 0xF];
+    //temporarily map the physical page into the kernel so we can copy the program into it
+    if (vmm_map_page(temp_kmap, code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+        serial_write_string("Failed to temporarily map program page into kernel\n");
+        pmm_free_page(code_phys);
+        return;
     }
-    hex[8] = '\n';
-    hex[9] = '\0';
-    serial_write_string(hex);
 
-    serial_write_string("Switching to user mode...\n");
+    //clear the page and copy the loaded image (up to 4KB)
+    memset((void*)temp_kmap, 0, 4096);
+    memcpy((void*)temp_kmap, buffer, (bytes_read > 4096) ? 4096 : (size_t)bytes_read);
 
-    //user mode swtich
-    __asm__ volatile (
-        "cli\n\t"                    //disable interrupts
-        "mov $0x23, %%ax\n\t"       //user data segment (GDT entry 4, RPL=3)
-        "mov %%ax, %%ds\n\t"
-        "mov %%ax, %%es\n\t"
-        "mov %%ax, %%fs\n\t"
-        "mov %%ax, %%gs\n\t"
+    //unmap the temporary kernel mapping (the data remains in the physical page)
+    vmm_unmap_page_nofree(temp_kmap);
 
-        //set up stack frame for iret to user mode
-        "pushl $0x23\n\t"           //SS (user data segment)
-        "pushl $0x2000000\n\t"      //ESP (user stack pointer)
-        "pushfl\n\t"                //EFLAGS
-        "popl %%eax\n\t"
-        "orl $0x200, %%eax\n\t"     //set IF to enable interrupts in user mode
-        "pushl %%eax\n\t"           
-        "pushl $0x1B\n\t"           //CS (user code segment, GDT entry 3, RPL=3)
-        "pushl $0x1000000\n\t"      //EIP (entry point)
-        "iret\n\t"                  //jump to user mode
-        :
-        :
-        : "eax", "memory"
-    );
+    //create a new user process with the chosen entry point
+    process_t* proc = process_create("userapp", (void*)entry_va, true);
+    if (!proc) {
+        serial_write_string("Failed to create process\n");
+        pmm_free_page(code_phys);
+        return;
+    }
 
-    //this shouldn't be reached
-    serial_write_string("User application returned unexpectedly.\n");
+    //map the program page into the new process address space at entry_va (writable for .data/.bss)
+    if (vmm_map_page_in_directory(proc->page_directory, entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        serial_write_string("Failed to map program into process address space\n");
+        process_destroy(proc);
+        pmm_free_page(code_phys);
+        return;
+    }
+
+    //map the program page into the current (kernel) directory
+    if (vmm_map_page(entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        serial_write_string("Failed to map program into kernel address space\n");
+        process_destroy(proc);
+        pmm_free_page(code_phys);
+        return;
+    }
+
+    //create and map a user stack at 0x02000000
+    uint32_t ustack_phys = pmm_alloc_page();
+    if (!ustack_phys) {
+        serial_write_string("Failed to allocate user stack page\n");
+        process_destroy(proc);
+        return;
+    }
+    //map into kernel directory (we run with kernel CR3 for now)
+    if (vmm_map_page(0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        serial_write_string("Failed to map user stack in kernel directory\n");
+        pmm_free_page(ustack_phys);
+        process_destroy(proc);
+        return;
+    }
+    //map into the process directory for future per-process CR3 switching
+    if (vmm_map_page_in_directory(proc->page_directory, 0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+        serial_write_string("Failed to map user stack in process directory\n");
+        pmm_free_page(ustack_phys);
+        process_destroy(proc);
+        return;
+    }
+    //set the initial user ESP near the top of the stack
+    proc->context.esp = 0x02000000 - 16;
+
+    char out[64];
+    ksnprintf(out, sizeof(out), "Boot: Spawned user shell PID %u entry=0x%08x\n", proc->pid, entry_va);
+    serial_write_string(out);
+
+    //yield to scheduler so the shell runs now
+    process_yield();
 }
 
 static void cmd_devices(const char *args) {
@@ -1283,6 +1428,7 @@ fallback_shutdown:
 }
 
 //works in qemu idk how about real hardware
+//TODO: should change this to reboot using ACPI
 void kreboot(void){
     __asm__ volatile("cli");
     //port 0xCF9 (reset control register)
@@ -1513,6 +1659,13 @@ void kmain(uint32_t magic, uint32_t addr) {
         DEBUG_PRINT("Failed to register mouse device");
     }
 
+    //register TTY pseudo-device (text console)
+    if (tty_register_device() == 0) {
+        DEBUG_PRINT("TTY device registered as tty0");
+    } else {
+        DEBUG_PRINT("Failed to register TTY device");
+    }
+
 
 
     //initialize interrupts
@@ -1523,7 +1676,7 @@ void kmain(uint32_t magic, uint32_t addr) {
     syscall_init();
     DEBUG_PRINT("Syscalls initialized");
     
-    // Initialize process manager before timer to avoid scheduling before ready
+    //initialize process manager before timer to avoid scheduling before ready
     process_init();
     DEBUG_PRINT("Process manager initialized");
     
@@ -1555,12 +1708,24 @@ void kmain(uint32_t magic, uint32_t addr) {
                     }
                 } else {
                     DEBUG_PRINT("Failed to mount root filesystem");
+                    //install initramfs as root
+                    initramfs_init();
+                    initramfs_populate_builtin();
+                    initramfs_install_as_root();
                 }
             } else {
                 DEBUG_PRINT("No storage device found");
+                //install initramfs as root (no disk available)
+                initramfs_init();
+                initramfs_populate_builtin();
+                initramfs_install_as_root();
             }
         } else {
             DEBUG_PRINT("Failed to register filesystems with VFS");
+            //install initramfs as root since no FS registered
+            initramfs_init();
+            initramfs_populate_builtin();
+            initramfs_install_as_root();
         }
     } else {
         DEBUG_PRINT("Failed to initialize VFS");
@@ -1589,6 +1754,21 @@ void kmain(uint32_t magic, uint32_t addr) {
     }
     kclear();
     SUCCESS_SOUND();
-    commandLoop();
-    kpanic(); //if we return here
+    //try to spawn /bin/init from current root FS (FAT16 or initramfs)
+    if (!spawn_user_from_vfs("/bin/init")) {
+        //ff not found on current root (e.g., FAT16 without /bin/sh) switch to initramfs
+        vfs_unmount("/");
+        initramfs_init();
+        initramfs_populate_builtin();
+        initramfs_install_as_root();
+        if (!spawn_user_from_vfs("/bin/init")) {
+            //try /bin/sh next  in cas /bin/init missing
+            if (!spawn_user_from_vfs("/bin/sh")) {
+            //final fallbackboot into user-space shell loaded from disk sector 50
+            cmd_loadapp(NULL);
+            }
+        }
+    }
+    //idle scheduler will run user processes
+    for (;;) { __asm__ volatile ("hlt"); }
 }

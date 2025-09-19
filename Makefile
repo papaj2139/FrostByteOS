@@ -37,6 +37,9 @@ keyboard.o: src/drivers/keyboard.c
 mouse.o: src/drivers/mouse.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+tty.o: src/drivers/tty.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 serial.o: src/drivers/serial.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -97,6 +100,36 @@ fs.o: src/fs/fs.c
 vfs.o: src/fs/vfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+initramfs.o: src/fs/initramfs.c src/fs/usershell_blob.h src/fs/init_blob.h src/fs/forktest_blob.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+usershell.bin: userapp.asm
+	$(ASM) -f bin $< -o $@
+
+#generate a header embedding the user shell binary for initramfs
+src/fs/usershell_blob.h: usershell.bin
+	xxd -i $< > $@
+	sed -i 's/unsigned char usershell_bin/const unsigned char usershell_bin/g' $@
+	sed -i 's/unsigned int usershell_bin_len/const unsigned int usershell_bin_len/g' $@
+
+init.bin: init.asm
+	$(ASM) -f bin $< -o $@
+
+#generate a header embedding the init binary for initramfs
+src/fs/init_blob.h: init.bin
+	xxd -i $< > $@
+	sed -i 's/unsigned char init_bin/const unsigned char init_bin/g' $@
+	sed -i 's/unsigned int init_bin_len/const unsigned int init_bin_len/g' $@
+
+forktest.bin: forktest.asm
+	$(ASM) -f bin $< -o $@
+
+#generate header embedding for initramfs
+src/fs/forktest_blob.h: forktest.bin
+	xxd -i $< > $@
+	sed -i 's/unsigned char forktest_bin/const unsigned char forktest_bin/g' $@
+	sed -i 's/unsigned int forktest_bin_len/const unsigned int forktest_bin_len/g' $@
+
 fat16_vfs.o: src/fs/fat16_vfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -122,9 +155,9 @@ process_asm.o: src/process_asm.asm
 	$(ASM) $(ASMFLAGS) $< -o $@
 
 $(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
-           keyboard.o mouse.o serial.o pc_speaker.o timer.o rtc.o ata.o \
+           keyboard.o mouse.o tty.o serial.o pc_speaker.o timer.o rtc.o ata.o \
            vga.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
-           syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o fd.o \
+           syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o fd.o initramfs.o \
            pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o
 	$(CC) $(LDFLAGS) -o $@ $^
 

@@ -2,6 +2,7 @@ section .text
 
 global context_switch_asm
 global switch_to_user_mode
+global enter_user_with_pd
 
 context_switch_asm:
     push ebp
@@ -52,8 +53,8 @@ context_switch_asm:
     ;restore context from new_context
     test edx, edx
     jz .done            ;skip restore if new_context is NULL
-    
-    ;restore segment registers first
+
+    ;restore data segment registers first (from context)
     mov ecx, [edx + 44]  ; ds
     mov ds, cx
     mov ecx, [edx + 48]  ; es
@@ -62,18 +63,17 @@ context_switch_asm:
     mov fs, cx
     mov ecx, [edx + 56]  ; gs
     mov gs, cx
-    ;don't restore SS yet need the stack
-    
-    ;restore eflags
-    mov ecx, [edx + 36]
-    push ecx
-    popfd
-    
-    ;restore stack pointer and segment
-    mov ecx, [edx + 60]  ;ss
+
+    ;determine target privilege level from CS selector in context
+    mov ecx, [edx + 40]   ; cs
+    test ecx, 3
+    jnz .to_user          ;if RPL!=0, switch to user with iret
+
+    ;kernel target (RPL=0): restore SS:ESP, EFLAGS, GPRs then near ret
+    mov ecx, [edx + 60]   ; ss
     mov ss, cx
-    mov esp, [edx + 24]  ;esp
-    
+    mov esp, [edx + 24]   ; esp
+
     ;restore general purpose registers
     mov eax, [edx + 0]
     mov ebx, [edx + 4]
@@ -81,44 +81,96 @@ context_switch_asm:
     mov esi, [edx + 16]
     mov edi, [edx + 20]
     mov ebp, [edx + 28]
-    
-    ;get the saved eip and edx
-    push dword [edx + 32]  ;push eip onto stack
-    mov edx, [edx + 12]    ;restore edx
-    
-    ;jump to new eip
-    ret                    ;return to pushed eip
+
+    ;restore EFLAGS
+    push dword [edx + 36]
+    popfd
+
+    ;return to saved EIP in same privilege
+    push dword [edx + 32]
+    mov edx, [edx + 12]   ;restore EDX last
+    ret
+
+.to_user:
+    ;disable interrupts while building the iret frame
+    cli
+    ;build an iret frame for a ring transition to user mode on the CURRENT (kernel) stack
+    ;order expected by iret with CPL change: EIP, CS, EFLAGS, ESP, SS (push in reverse)
+    push dword [edx + 60]      ; SS (user data)
+    push dword [edx + 24]      ; ESP (user stack)
+    push dword [edx + 36]      ; EFLAGS
+    push dword [edx + 40]      ; CS (user code)
+    push dword [edx + 32]      ; EIP (user entry)
+
+    ;restore minimal register (EBP) before iret
+    mov ebp, [edx + 28]
+
+    ;ensure user data segments are loaded before dropping to CPL=3
+    mov ax, 0x23            ;user data selector 
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    ;perform the privilege-level switch
+    iretd
 
 .done:
     pop ebp
     ret
 
-;switches from kernel mode to user mode
-switch_to_user_mode:
-    cli                     ;disable interrupts during switch
-    
-    mov eax, [esp + 4]      ;get eip parameter
-    mov ebx, [esp + 8]      ;get esp parameter
-    
-    ;set up stack for iret to user mode
-    ;stack layout for iret: SS, ESP, EFLAGS, CS, EIP
-    
-    push 0x23               ;user data segment (SS) - GDT entry 4, RPL=3
-    push ebx                ;user ESP
-    pushfd                  ;current EFLAGS
-    or dword [esp], 0x200   ;ensure interrupts enabled in user mode
-    push 0x1B               ;user code segment (CS) - GDT entry 3, RPL=3  
-    push eax                ;user EIP
-    
-    ;setup user data segments
-    mov ax, 0x23            ;user data segment
+;atomically switch to a given page directory and enter user mode at (EIP, ESP)
+;args (cdecl): [esp+4]=dir_phys, [esp+8]=user_eip, [esp+12]=user_esp
+enter_user_with_pd:
+    cli
+    mov eax, [esp + 4]      ;dir_phys
+    mov cr3, eax            ;switch to target page directory
+
+    mov ecx, [esp + 8]      ;user EIP
+    mov edx, [esp + 12]     ;user ESP
+
+    ;load user data segments before iret
+    mov ax, 0x23
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
-    
-    ;switch to user mode
-    iret
+
+    ;build iret frame: SS, ESP, EFLAGS, CS, EIP
+    push dword 0x23         ;SS (user data)
+    push edx                ;ESP (user stack)
+    pushfd                  ;EFLAGS
+    pop eax
+    and eax, ~0x200         ;IF=0 in user mode for first entry
+    push eax
+    push dword 0x1B         ;CS (user code)
+    push ecx                ;EIP (user entry)
+    iretd
+
+;switches from kernel mode to user mode
+switch_to_user_mode:
+    cli                     ;disable interrupts during switch
+
+    mov ecx, [esp + 4]      ;get EIP parameter into ECX
+    mov edx, [esp + 8]      ;get ESP parameter into EDX
+
+    ;setup user data segments before iret (use AX only)
+    mov ax, 0x23            ;user data segment selector
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    ;build iret frame: SS, ESP, EFLAGS, CS, EIP
+    push dword 0x23         ;SS (user data)
+    push edx                ;ESP (user stack)
+    pushfd                  ;EFLAGS
+    pop eax
+    or eax, 0x200           ;IF=1 in user mode (restore stable behavior)
+    push eax
+    push dword 0x1B         ;CS (user code)
+    push ecx                ;EIP (user entry)
+    iretd
 
 ;helper function to save current context (used by scheduler)
 global save_current_context

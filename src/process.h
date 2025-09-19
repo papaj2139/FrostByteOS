@@ -5,6 +5,9 @@
 #include <stdbool.h>
 #include "mm/vmm.h"
 
+//forward declaration to avoid including device_manager.h here
+struct device;
+
 #define MAX_PROCESSES 64
 #define PROCESS_NAME_MAX 32
 #define KERNEL_STACK_SIZE 4096
@@ -29,7 +32,7 @@ typedef struct {
 
 //process Control 
 typedef struct process {
-    uint32_t pid;                    //process ID
+    uint32_t pid;                    //process ID   
     uint32_t ppid;                   //parent process ID
     proc_state_t state;              //process state
     char name[PROCESS_NAME_MAX];     //process name
@@ -40,6 +43,7 @@ typedef struct process {
     uint32_t user_stack_top;         //yser stack top (virtual addr)
     uint32_t heap_start;             //user heap start
     uint32_t heap_end;               //user heap end
+    uint32_t user_eip;               //intended user-mode entry (virtual addr)
     
     //CPU context
     cpu_context_t context;           //saved CPU state
@@ -58,6 +62,12 @@ typedef struct process {
     
     //file descriptors (basic)
     int fd_table[16];                //file descriptor table
+
+    bool started;                    //process has been started (first run done)
+
+    //controlling TTY and its per-process mode
+    struct device* tty;              //controlling TTY device (e.g., tty0)
+    uint32_t tty_mode;               //TTY mode bits (see drivers/tty.h)
 } process_t;
 
 //process manager functions

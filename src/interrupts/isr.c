@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <string.h>
+#include "../drivers/serial.h"
 
 //forward declared from kernel.c
 void kpanic_msg(const char* reason);
@@ -65,5 +66,8 @@ void isr_exception_dispatch(int vector, unsigned int errcode) {
                   "#%u %s", (unsigned)vector, (char*)name);
     }
 
+    serial_write_string("[EXC] ");
+    serial_write_string(g_panic_buf);
+    serial_write_string("\n");
     kpanic_msg(g_panic_buf);
 }

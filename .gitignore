@@ -6,3 +6,6 @@ isodir/
 *.bin
 *.img
 *.txt
+src/fs/userspace_blob.h
+src/fs/forktest_blob.h
+src/fs/init_blob.h

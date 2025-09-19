@@ -2,6 +2,7 @@
 section .text
 
 extern syscall_dispatch
+extern syscall_capture_user_frame
 
 ;syscall handler entry point (interrupt 0x80)
 global syscall_handler_asm

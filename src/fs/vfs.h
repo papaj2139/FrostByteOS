@@ -91,6 +91,9 @@ int vfs_register_fs(const char* name, vfs_operations_t* ops);
 vfs_node_t* vfs_create_node(const char* name, uint32_t type, uint32_t flags);
 void vfs_destroy_node(vfs_node_t* node);
 
+// Set the root filesystem handlers directly (used by initramfs)
+int vfs_set_root_ops(vfs_operations_t* ops, void* private_data);
+
 //path manipulation functions
 char* vfs_get_parent_path(const char* path);
 char* vfs_get_basename(const char* path);
