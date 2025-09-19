@@ -37,7 +37,7 @@ make CC=i386-elf-gcc
 
 # Notes
 - The OS uses a primitive initramfs; during compilation the Makefile assembles 'init.asm' and 'userapp.asm' (the shell) and puts the binary code into header files which the initramfs puts into files at runtime so the kernel can execute them
-- The execution path by default is /bin/init -> /bin/forktest` (to change it to just execute /bin/sh directly change the filename in init.asm)
+- The execution path by default is /bin/init -> /bin/forktest` (to change it to just execute /bin/sh directly change the filename in init.asm, altho forktest does exec /bin/sh anyway)
 
 
 # Credits
