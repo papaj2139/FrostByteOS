@@ -19,6 +19,11 @@ git clone https://github.com/FrostByte-OS/FrostByteOS.git
 cd FrostByteOS
 make
 ```
+If you're on a BSD:
+```bash
+gmake
+```
+
 if you want to run it in QEMU
 ```bash
 make run
@@ -30,6 +35,11 @@ if you'd like to use i386-elf-gcc
 make CC=i386-elf-gcc
 ```
 
+# Notes
+- The OS uses a primitive initramfs; during compilation the Makefile assembles 'init.asm' 'forktest.asm' and 'fbsh.asm' (the shell) and puts the binary code into header files which the initramfs puts into files at runtime so the kernel can execute them
+- The execution path by default is /bin/init -> /bin/forktest` (to change it to just execute /bin/sh directly change the filename in init.asm, altho forktest does exec /bin/sh anyway)
+- /bin/init just calls exec /bin/forktest will expand later
+- Fork() syscall is the WORST thing in this codebase; in general the process manager IS SO unstable its unimaginable
 
 
 # Credits

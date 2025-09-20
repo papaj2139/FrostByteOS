@@ -6,3 +6,4 @@ isodir/
 *.bin
 *.img
 *.txt
+src/fs/*_blob.h

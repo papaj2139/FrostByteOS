@@ -142,6 +142,16 @@ void vfs_destroy_node(vfs_node_t* node) {
     kfree(node);
 }
 
+// Allow setting root node ops and private data directly (e.g., for initramfs)
+int vfs_set_root_ops(vfs_operations_t* ops, void* private_data) {
+    if (!vfs_root || !ops) return -1;
+    vfs_root->ops = ops;
+    vfs_root->private_data = private_data;
+    vfs_root->type = VFS_FILE_TYPE_DIRECTORY;
+    vfs_root->flags = VFS_FLAG_READ;
+    return 0;
+}
+
 //get parent path from a full path
 char* vfs_get_parent_path(const char* path) {
     if (!path) return NULL;
@@ -334,19 +344,17 @@ vfs_node_t* vfs_resolve_path(const char* path) {
 
     //find the filesystem mounted at the root
     vfs_mount_t* root_mount = vfs_find_mount("/");
+    vfs_node_t* current_node = NULL;
     if (!root_mount) {
-        vfs_debug("No root filesystem mounted!");
-        //ff asking for "/" specifically and nothing is mounted return the generic root
-        if (strcmp(path, "/") == 0) {
-            vfs_root->ref_count++;
-            return vfs_root;
-        }
-        return NULL;
+        // Fallback to the generic root node (e.g., initramfs installed via vfs_set_root_ops)
+        if (!vfs_root) return NULL;
+        current_node = vfs_root;
+        current_node->ref_count++;
+    } else {
+        //start traversal from the actual mounted filesystem root
+        current_node = root_mount->root;
+        current_node->ref_count++;
     }
-
-    //start traversal from the actual mounted filesystem root
-    vfs_node_t* current_node = root_mount->root;
-    current_node->ref_count++;
 
     //if path is just "/" it's done
     if (strcmp(path, "/") == 0) {

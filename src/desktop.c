@@ -124,8 +124,8 @@ static void window_add_button(window_t *win, int x, int y, const char *label, ui
     c->type = WC_BUTTON;
     c->x = x;
     c->y = y;
-    c->w = 40;       // standard button width
-    c->h = 16;       // standard button height
+    c->w = 40;        // standard button width
+    c->h = 16;        // standard button height
     c->color = colour;
     strncpy(c->text, label, sizeof(c->text)-1);
     c->text[sizeof(c->text)-1] = '\0';
@@ -147,7 +147,7 @@ static void window_add_rect(window_t *win, int x, int y, int w, int h, uint8_t c
 
 static void draw_window(window_t *win) {
     if (!win->active) return;
-    
+
     draw_rect(win->x + 1, win->y + 1, win->w - 2, win->h - 2, win->fill);
 
     for (int i = 0; i < win->w; i++) {
@@ -170,7 +170,8 @@ static void draw_window(window_t *win) {
             case WC_LABEL: draw_string_small(cx, cy, c->text, c->color); break;
             case WC_RECT:  draw_rect(cx, cy, c->w, c->h, c->color); break;
             case WC_BUTTON: draw_rect(cx, cy, c->w, c->h, c->color); draw_string_small(cx + 2, cy + 2, c->text, 0); break;
-
+            case WC_TEXTAREA: //unsued but handling enum for the compiler 
+                break;
         }
     }
 }
@@ -183,10 +184,10 @@ void test_btn(void){
 
 static int create_process(process_type_t type, int x, int y) {
     if (process_count >= MAX_PROCESSES) return -1;
-    
+
     int pid = next_pid++;
     process_t *proc = &processes[process_count++];
-    
+
     proc->pid = pid;
     proc->type = type;
     proc->active = 1;
@@ -198,7 +199,7 @@ static int create_process(process_type_t type, int x, int y) {
     proc->window.fill = 8;
     proc->window.titlebar = 0;
     proc->window.content_count = 0;
-    
+
     switch (type) {
         case PROC_WELCOME:
             proc->window.w = 150;
@@ -206,7 +207,7 @@ static int create_process(process_type_t type, int x, int y) {
             strncpy(proc->window.title, "Welcome!", sizeof(proc->window.title)-1);
             window_add_label(&proc->window, 10, 20, "Welcome to frostbyte!", 15);
             break;
-            
+
         case PROC_CALCULATOR:
             proc->window.w = 180;
             proc->window.h = 120;
@@ -214,7 +215,7 @@ static int create_process(process_type_t type, int x, int y) {
             window_add_label(&proc->window, 10, 10, "Calculator App", 15);
             window_add_label(&proc->window, 10, 25, "Display: 0", 14);
             // Add calculator buttons
-            window_add_button(&proc->window, 10, 40, "Test", test_btn, 12);
+            window_add_button(&proc->window, 10, 40, "Test", 12, test_btn);
             window_add_label(&proc->window, 17, 43, "7", 0);
             window_add_rect(&proc->window, 35, 40, 20, 15, 12);
             window_add_label(&proc->window, 42, 43, "8", 0);
@@ -223,7 +224,7 @@ static int create_process(process_type_t type, int x, int y) {
             window_add_rect(&proc->window, 85, 40, 20, 15, 12);
             window_add_label(&proc->window, 92, 43, "+", 0);
             break;
-            
+
         case PROC_NOTEPAD:
             proc->window.w = 200;
             proc->window.h = 150;
@@ -232,7 +233,7 @@ static int create_process(process_type_t type, int x, int y) {
             window_add_rect(&proc->window, 10, 25, 170, 100, 7);
             window_add_label(&proc->window, 15, 30, current_notepad_text, 0);
             break;
-            
+
         case PROC_ABOUT:
             proc->window.w = 160;
             proc->window.h = 100;
@@ -242,7 +243,7 @@ static int create_process(process_type_t type, int x, int y) {
             window_add_label(&proc->window, 10, 40, "Built with C", 14);
             break;
     }
-    
+
     return pid;
 }
 
@@ -321,12 +322,12 @@ static void action_textmode(void) {
 
 static void draw_taskbar(void) {
     draw_rect(0, vga_height() - TASKBAR_HEIGHT, vga_width(), TASKBAR_HEIGHT, 12);
-    
+
     // Draw start button
     int button_color = start_menu_open ? 8 : 14; // Darker when pressed
     draw_rect(2, vga_height() - TASKBAR_HEIGHT + 2, start_button_width, TASKBAR_HEIGHT - 4, button_color);
     draw_string_small(6, vga_height() - TASKBAR_HEIGHT + 4, "Start", 0);
-    
+
     // Draw process indicators in taskbar
     int taskbar_x = start_button_width + 10;
     for (int i = 0; i < process_count; i++) {
@@ -341,15 +342,15 @@ static void draw_taskbar(void) {
 
 static void draw_start_menu(void) {
     if (!start_menu_open) return;
-    
+
     int menu_width = 80;
     int menu_height = start_menu_item_count * 12 + 4;
     int menu_x = 2;
     int menu_y = vga_height() - TASKBAR_HEIGHT - menu_height;
-    
+
     // Menu background
     draw_rect(menu_x, menu_y, menu_width, menu_height, 7);
-    
+
     // Menu border
     for (int i = 0; i < menu_width; i++) {
         putpx(menu_x + i, menu_y, 0);
@@ -359,7 +360,7 @@ static void draw_start_menu(void) {
         putpx(menu_x, menu_y + j, 0);
         putpx(menu_x + menu_width - 1, menu_y + j, 0);
     }
-    
+
     // Draw menu items
     for (int i = 0; i < start_menu_item_count; i++) {
         draw_string_small(menu_x + 4, menu_y + 2 + i * 12, start_menu_items[i].name, 0);
@@ -367,21 +368,21 @@ static void draw_start_menu(void) {
 }
 
 static int clicked_start_button(int mx, int my) {
-    return mx >= 2 && my >= vga_height() - TASKBAR_HEIGHT + 2 && 
+    return mx >= 2 && my >= vga_height() - TASKBAR_HEIGHT + 2 &&
            mx < 2 + start_button_width && my < vga_height() - 2;
 }
 
 static int clicked_start_menu_item(int mx, int my) {
     if (!start_menu_open) return -1;
-    
+
     int menu_width = 80;
     int menu_height = start_menu_item_count * 12 + 4;
     int menu_x = 2;
     int menu_y = vga_height() - TASKBAR_HEIGHT - menu_height;
-    
-    if (mx < menu_x || my < menu_y || mx >= menu_x + menu_width || my >= menu_y + menu_height) 
+
+    if (mx < menu_x || my < menu_y || mx >= menu_x + menu_width || my >= menu_y + menu_height)
         return -1;
-    
+
     int item_index = (my - menu_y - 2) / 12;
     if (item_index >= 0 && item_index < start_menu_item_count) {
         return item_index;
@@ -391,7 +392,7 @@ static int clicked_start_menu_item(int mx, int my) {
 
 static int clicked_taskbar_process(int mx, int my) {
     if (my < vga_height() - TASKBAR_HEIGHT + 2 || my >= vga_height() - 2) return -1;
-    
+
     int taskbar_x = start_button_width + 10;
     for (int i = 0; i < process_count; i++) {
         if (processes[i].active) {
@@ -456,7 +457,7 @@ static process_t* find_window_at_position(int mx, int my) {
 static void bring_to_front(int pid) {
     process_t *proc = get_process(pid);
     if (!proc) return;
-    
+
     int index = -1;
     for (int i = 0; i < process_count; i++) {
         if (processes[i].pid == pid) {
@@ -464,9 +465,9 @@ static void bring_to_front(int pid) {
             break;
         }
     }
-    
+
     if (index == -1 || index == process_count - 1) return;
-    
+
     process_t temp = processes[index];
     for (int i = index; i < process_count - 1; i++) {
         processes[i] = processes[i + 1];
@@ -509,7 +510,7 @@ void cmd_desktop(const char *args) {
     int last_cy = cy;
 
     mouse_init();
-    
+
     //find mouse device for polling
     device_t* mouse_dev = device_find_by_subtype(DEVICE_SUBTYPE_MOUSE);
     if (!mouse_dev) {
@@ -525,7 +526,7 @@ void cmd_desktop(const char *args) {
     int has_dirty = 0;
     int dirty_x = 0, dirty_y = 0, dirty_w = 0, dirty_h = 0;
     int8_t pkt[3];
-    
+
     for (;;) {
         //handle mouse input using device manager if available
         int bytes_read = 0;
@@ -577,7 +578,7 @@ void cmd_desktop(const char *args) {
                                 close_process(clicked_proc->pid);
                                 needs_redraw = 1;
                             } else if (mouse_over(cx, cy, clicked_proc->window.x + 1, clicked_proc->window.y + 1,
-                                                  clicked_proc->window.w - 2, 8)) {
+                                                      clicked_proc->window.w - 2, 8)) {
                                 win_dragging = clicked_proc->pid;
                                 drag_offset_x = cx - clicked_proc->window.x;
                                 drag_offset_y = cy - clicked_proc->window.y;
@@ -586,37 +587,37 @@ void cmd_desktop(const char *args) {
                             } else {
                                 //app-specific click handling
                                 if (clicked_proc->type == PROC_CALCULATOR) {
-                                     window_t *w = &clicked_proc->window;
-                                    int base_x = w->x;
-                                    int base_y = w->y + 10; //content Y offset
+                                       window_t *w = &clicked_proc->window;
+                                     int base_x = w->x;
+                                     int base_y = w->y + 10; //content Y offset
 
-                                    int btn_y = base_y + 40; //buttons row Y
-                                    //calculator
-                                    //7
-                                    if (mouse_over(cx, cy, base_x + 10, btn_y, 20, 15)) {
-                                        calc_current = calc_current * 10 + 7;
-                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
-                                        needs_redraw = 1;
-                                    }
-                                    //8
-                                    else if (mouse_over(cx, cy, base_x + 35, btn_y, 20, 15)) {
-                                        calc_current = calc_current * 10 + 8;
-                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
-                                        needs_redraw = 1;
-                                    }
-                                    //9
-                                    else if (mouse_over(cx, cy, base_x + 60, btn_y, 20, 15)) {
-                                        calc_current = calc_current * 10 + 9;
-                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
-                                        needs_redraw = 1;
-                                    }
-                                    //+
-                                    else if (mouse_over(cx, cy, base_x + 85, btn_y, 20, 15)) {
-                                        calc_total += calc_current;
-                                        calc_current = 0;
-                                        ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_total);
-                                        needs_redraw = 1;
-                                    }
+                                     int btn_y = base_y + 40; //buttons row Y
+                                     //calculator
+                                     //7
+                                     if (mouse_over(cx, cy, base_x + 10, btn_y, 20, 15)) {
+                                         calc_current = calc_current * 10 + 7;
+                                         ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                         needs_redraw = 1;
+                                     }
+                                     //8
+                                     else if (mouse_over(cx, cy, base_x + 35, btn_y, 20, 15)) {
+                                         calc_current = calc_current * 10 + 8;
+                                         ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                         needs_redraw = 1;
+                                     }
+                                     //9
+                                     else if (mouse_over(cx, cy, base_x + 60, btn_y, 20, 15)) {
+                                         calc_current = calc_current * 10 + 9;
+                                         ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_current);
+                                         needs_redraw = 1;
+                                     }
+                                     //+
+                                     else if (mouse_over(cx, cy, base_x + 85, btn_y, 20, 15)) {
+                                         calc_total += calc_current;
+                                         calc_current = 0;
+                                         ksnprintf(w->content[1].text, sizeof(w->content[1].text), "Display: %d", calc_total);
+                                         needs_redraw = 1;
+                                     }
                                 }
                             }
                         }
@@ -681,7 +682,7 @@ void cmd_desktop(const char *args) {
                 unsigned short ev = kbd_poll_event();
                 if (ev) {
                     if ((ev & 0xFF00u) == 0xE000u) {
-                        //ignore extended keys for notepad atleast fornow 
+                        //ignore extended keys for notepad atleast fornow
                     } else {
                         char key = (char)(ev & 0xFFu);
                         size_t len = strlen(current_notepad_text);
@@ -698,7 +699,7 @@ void cmd_desktop(const char *args) {
                             }
                         }
 
-                        //update notepad text label 
+                        //update notepad text label
                         if (processes[i].window.content_count >= 3) {
                             strncpy(processes[i].window.content[2].text, current_notepad_text, sizeof(processes[i].window.content[2].text) - 1);
                             processes[i].window.content[2].text[sizeof(processes[i].window.content[2].text) - 1] = '\0';

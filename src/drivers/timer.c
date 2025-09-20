@@ -3,6 +3,9 @@
 #include "../interrupts/pic.h"
 #include "../io.h"
 
+//forward declaration to avoid circular dependency
+void process_timer_tick(void);
+
 #define PIT_FREQUENCY 1193180u
 
 static volatile uint64_t g_ticks = 0;
@@ -10,6 +13,9 @@ static uint32_t g_hz = 0;
 
 static void timer_irq_handler(void) {
     g_ticks++;
+    
+    //call process manager timer tick for scheduling
+    process_timer_tick();
 }
 
 void timer_init(uint32_t frequency) {

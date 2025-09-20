@@ -12,6 +12,11 @@
 #define SYS_GETPID  20
 #define SYS_SLEEP   162
 #define SYS_CREAT   8
+#define SYS_FORK    2
+#define SYS_EXECVE  11     
+#define SYS_WAIT    7
+#define SYS_YIELD   158
+#define SYS_IOCTL   54
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -35,5 +40,10 @@ int32_t sys_close(int32_t fd);
 int32_t sys_getpid(void);
 int32_t sys_sleep(uint32_t seconds);
 int32_t sys_creat(const char* pathname, int32_t mode);
+int32_t sys_fork(void);
+int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[]);
+int32_t sys_wait(int32_t* status);
+int32_t sys_yield(void);
+int32_t sys_ioctl(int32_t fd, uint32_t cmd, void* arg);
 
 #endif

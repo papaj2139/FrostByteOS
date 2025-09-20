@@ -99,12 +99,15 @@ void* kmalloc(size_t size) {
 
     //need to expand heap
     size_t needed = size + sizeof(heap_block_t);
+    //remember where the new region will begin before expansion
+    uint32_t old_end = heap_end;
     if (expand_heap(needed) != 0) {
         return 0; //out of memory
     }
 
-    //create new block at end
-    heap_block_t* new_block = (heap_block_t*)(heap_end - PAGE_SIZE);
+    //create new block at the start of the newly expanded region
+    //old_end marks the first byte of the newly mapped space
+    heap_block_t* new_block = (heap_block_t*)(old_end);
     new_block->size = size;
     new_block->free = 0;
     new_block->next = 0;

@@ -3,6 +3,7 @@ section .text
 
 extern irq_dispatch
 extern isr_exception_dispatch
+extern isr_exception_dispatch_ext
 
 ;exception stubs (ISRs 0-31)
 %macro ISR_NOERR 1
@@ -30,7 +31,7 @@ isr%1:
     iretd
 %endmacro
 
-; Define all 32 exception vectors
+;define exception vectors
 ISR_NOERR 0   ;division by zero error
 ISR_NOERR 1   ;debug
 ISR_NOERR 2   ;non-maskable interrupt
@@ -45,7 +46,34 @@ ISR_ERR 10    ;invalid TSS
 ISR_ERR 11    ;segment not present
 ISR_ERR 12    ;stack-segment fault
 ISR_ERR 13    ;general protection fault
-ISR_ERR 14    ;page fault
+;page fault handler with extended context passing
+global isr14
+isr14:
+    pushad
+    ;after pushad, the CPU-pushed frame is located above the 32-byte pushad area
+    ;layout at that point (from lower to higher addresses):
+    ; [ ... pushad 32 bytes ... ] then: [ERR] [EIP] [CS] [EFLAGS] [USERESP?] [SS?]
+    ;ERR is at [esp + 32]
+    mov eax, [esp + 32]   ;errcode
+    mov ecx, [esp + 36]   ;eip
+    mov edx, [esp + 40]   ;cs
+    mov ebx, [esp + 44]   ;eflags
+    mov esi, [esp + 48]   ;useresp (only present on CPL change)
+    mov edi, [esp + 52]   ;ss (only present on CPL change)
+
+    ;push args for C handler (in reverse order): ss, useresp, eflags, cs, eip, errcode, vector
+    push edi    ;ss
+    push esi    ;useresp
+    push ebx    ;eflags
+    push edx    ;cs
+    push ecx    ;eip
+    push eax    ;errcode
+    push dword 14 ;vector
+    call isr_exception_dispatch_ext
+    add esp, 28
+    popad
+    add esp, 4             ;discard original CPU-pushed error code
+    iretd
 ISR_NOERR 15  ;reserved
 ISR_NOERR 16  ;x87 floating-point exception
 ISR_ERR 17    ;alignment check
