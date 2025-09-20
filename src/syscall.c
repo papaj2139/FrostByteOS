@@ -21,6 +21,15 @@ void kpanic_msg(const char* reason);
 //external assembly handler
 extern void syscall_handler_asm(void);
 
+//mark entry/exit of syscalls for scheduler to restore correct context
+void syscall_mark_enter(void) {
+    process_t* cur = process_get_current();
+    if (cur) cur->in_kernel = true;
+}
+void syscall_mark_exit(void) {
+    process_t* cur = process_get_current();
+    if (cur) cur->in_kernel = false;
+}
 
 //initialize syscall system
 void syscall_init(void) {
@@ -39,8 +48,6 @@ void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint
     cur->context.eflags = eflags;
     cur->context.esp = useresp;
     cur->context.ss = ss;
-    //we are now inside a syscall ensure resumption uses kernel context if we block
-    cur->in_kernel = true;
 }
 
 //clone user space from src->dst directories (user part only)

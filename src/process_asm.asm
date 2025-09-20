@@ -19,24 +19,24 @@ context_switch_asm:
     ;push all GPRs to capture their original values
     pushad                  ;pushes EAX, ECX, EDX, EBX, ESP(before), EBP, ESI, EDI
     
-    ;after pushad layout at [esp+offset]:
-    ; 0: EDI, 4: ESI, 8: EBP, 12: saved ESP, 16: EBX, 20: EDX, 24: ECX, 28: EAX
+    ;ater pushad layout at [esp+offset]:
+    ;0: EAX, 4: ECX, 8: EDX, 12: EBX, 16: original ESP, 20: EBP, 24: ESI, 28: EDI
     ;store into cpu_context_t in order: eax, ebx, ecx, edx, esi, edi, esp, ebp
-    mov eax, [esp + 28]     ;EAX
+    mov eax, [esp + 0]      ;EAX
     mov [esi + 0], eax
-    mov eax, [esp + 16]     ;EBX
+    mov eax, [esp + 12]     ;EBX
     mov [esi + 4], eax
-    mov eax, [esp + 24]     ;ECX
+    mov eax, [esp + 4]      ;ECX
     mov [esi + 8], eax
-    mov eax, [esp + 20]     ;EDX
+    mov eax, [esp + 8]      ;EDX
     mov [esi + 12], eax
-    mov eax, [esp + 4]      ;ESI
+    mov eax, [esp + 24]     ;ESI
     mov [esi + 16], eax
-    mov eax, [esp + 0]      ;EDI
+    mov eax, [esp + 28]     ;EDI
     mov [esi + 20], eax
-    mov eax, [esp + 12]     ;original ESP (before pushad)
+    mov eax, [esp + 16]     ;original ESP
     mov [esi + 24], eax
-    mov eax, [esp + 8]      ;EBP
+    mov eax, [esp + 20]     ;EBP
     mov [esi + 28], eax
     
     ;save eip (return address)
@@ -71,6 +71,15 @@ context_switch_asm:
     ;unwind pushad
     add esp, 32
 
+    ;build a stable fake frame for kernel resume on the old (current) stack
+    ;layout: [ESP]: saved EBP (original caller EBP), [ESP+4]: return EIP (saved above)
+    mov eax, [esi + 32]     ;saved return EIP (caller of context_switch_asm)
+    mov ecx, [ebp]          ;original caller EBP to restore
+    sub esp, 8              ;allocate space for fake [EBP][RET]
+    mov [esp], ecx          ;saved EBP
+    mov [esp + 4], eax      ;return address
+    mov [esi + 28], esp     ;context->ebp points to start of fake frame
+
 .restore_new:
     ;restore context from new_context
     test edi, edi
@@ -91,12 +100,13 @@ context_switch_asm:
     test ecx, 3
     jnz .to_user          ;if RPL!=0, switch to user with iret
 
-    ;kernel target (RPL=0): restore SS:ESP, EFLAGS, GPRs then near ret
+    ;kernel target (RPL=0): restore stack/regs then return via saved frame
     ;use EDX as a stable base pointer to the context to avoid clobbering EDI early
     mov edx, edi
-    mov ecx, [edx + 60]   ;ss
-    mov ss, cx
-    mov esp, [edx + 24]   ;esp
+    cli                     ;avoid IRQs during stack pivot
+    ;do not modify SS kernel SS is constant
+    ;for a proper function return ESP must point to saved EBP (not the ESP snapshot)
+    mov esp, [edx + 28]   ;esp = saved EBP
 
     ;restore general purpose registers (read from EDX base)
     mov eax, [edx + 0]
@@ -104,15 +114,17 @@ context_switch_asm:
     mov ecx, [edx + 8]
     mov esi, [edx + 16]
     mov edi, [edx + 20]
-    mov ebp, [edx + 28]
+    ;do not write EBP here it will be restored from the saved stack frame
 
-    ;restore EFLAGS
-    push dword [edx + 36]
+    ;restore EFLAGS (ensure IF=1 so timer continues)
+    mov eax, [edx + 36]     
+    or eax, 0x200
+    push eax
     popfd
 
-    ;return to saved EIP in same privilege
-    push dword [edx + 32]
-    mov edx, [edx + 12]   ;restore EDX last
+    ;restore EDX last and return using the saved frame (pop ebp; ret)
+    mov edx, [edx + 12]
+    pop ebp
     ret
 
 .to_user:

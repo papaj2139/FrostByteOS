@@ -51,11 +51,18 @@ void process_init(void) {
         kernel_proc->kernel_stack = (uint32_t)kstk_base + KERNEL_STACK_SIZE;
         kernel_proc->kcontext.eip = (uint32_t)kernel_idle;
         kernel_proc->kcontext.esp = kernel_proc->kernel_stack - 16;
-        kernel_proc->kcontext.ebp = kernel_proc->kcontext.esp;
         kernel_proc->kcontext.eflags = 0x202;
         kernel_proc->kcontext.cs = 0x08;
         kernel_proc->kcontext.ds = kernel_proc->kcontext.es = kernel_proc->kcontext.fs = kernel_proc->kcontext.gs = 0x10;
         kernel_proc->kcontext.ss = 0x10;
+        //prepare a fake call frame: [EBP]=0, [RET]=kernel_idle so 'pop ebp; ret' works
+        uint32_t* ksp = (uint32_t*)kernel_proc->kcontext.esp;
+        ksp -= 2;              //make room for EBP and RET
+        ksp[0] = 0;            //fake EBP
+        ksp[1] = kernel_proc->kcontext.eip;  //return address -> kernel_idle
+        kernel_proc->kcontext.esp = (uint32_t)ksp;
+        //EBP field must point to the location of the saved EBP on the stack
+        kernel_proc->kcontext.ebp = (uint32_t)ksp;
     }
     
     current_process = kernel_proc;
@@ -92,7 +99,7 @@ uint32_t process_get_next_pid(void) {
             if (next_pid >= MAX_PROCESSES) next_pid = 1;
             return pid;
         }
-    }
+    }   
     //fallback monotonically allocate (should not happen under normal table size)
     uint32_t pid = next_pid++;
     if (next_pid >= MAX_PROCESSES) next_pid = 1;
@@ -119,7 +126,11 @@ void process_reap_zombies(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t* p = &process_table[i];
         if (p->state == PROC_ZOMBIE && p != current_process) {
-            process_destroy(p);
+            //do NOT reap zombies that still have a living parent
+            //they must be reaped by their parent via sys_wait()
+            if (p->parent == NULL || p->parent->state == PROC_UNUSED) {
+                process_destroy(p);
+            }
         }
     }
 }
@@ -237,8 +248,13 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         
         //initialize CPU context for kernel mode
         proc->context.eip = (uint32_t)entry_point;
-        proc->context.esp = proc->kernel_stack - 16;
-        proc->context.ebp = proc->context.esp;
+        //build a fake call frame so kernel restore via 'pop ebp; ret' works
+        uint32_t* ksp = (uint32_t*)(proc->kernel_stack - 16);
+        ksp -= 2;                 //space for [EBP] and [RET]
+        ksp[0] = 0;               //fake saved EBP
+        ksp[1] = proc->context.eip; //return address -> entry_point
+        proc->context.esp = (uint32_t)ksp;
+        proc->context.ebp = (uint32_t)ksp;
         proc->context.eflags = 0x202;  //interrupts enabled
         proc->context.cs = 0x08;  //kernel code segment
         proc->context.ds = proc->context.es = proc->context.fs = proc->context.gs = 0x10;  //kernel data segment
@@ -323,6 +339,33 @@ void schedule(void) {
     
     //if no runnable process found stay with current (or kernel)
     if (!next) {
+        serial_write_string("[SCHED] no runnable process found\n");
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            process_t* p = &process_table[i];
+            serial_write_string("[SCHED] pid=");
+            serial_printf("%d", (int)p->pid);
+            serial_write_string(" state=");
+            switch (p->state) {
+                case PROC_UNUSED:
+                    serial_write_string("UNUSED\n");
+                    break;
+                case PROC_EMBRYO:
+                    serial_write_string("EMBRYO\n");
+                    break;
+                case PROC_RUNNABLE:
+                    serial_write_string("RUNNABLE\n");
+                    break;
+                case PROC_RUNNING:
+                    serial_write_string("RUNNING\n");
+                    break;
+                case PROC_SLEEPING:
+                    serial_write_string("SLEEPING\n");
+                    break;
+                case PROC_ZOMBIE:
+                    serial_write_string("ZOMBIE\n");
+                    break;
+            }
+        }
         if (current_process->state == PROC_RUNNING) {
             current_process->time_slice = TIME_SLICE_TICKS;  //reset time slice
             return;
@@ -345,7 +388,7 @@ void schedule(void) {
         current_process = next;
 
         //NOTE: CR3 switching is disabled for stability processes run under the kernel page directory
-        //TODO: re-enable per-process CR3 once syscall/IRQ paths are fully verified under user PDs
+        //TODO: re-enable per-process CR3 once syscall/IRQ p aths are fully verified under user PDs
 
         //enter user or kernel via context switch (iret path handles CPL3 transition)
         if ((next->context.cs & 3) == 3) {
@@ -360,9 +403,65 @@ void schedule(void) {
             serial_printf("%d", (int)next->pid);
             serial_write_string(" ctx=");
             if (next->in_kernel) serial_write_string("kernel\n"); else serial_write_string("user\n");
+            //if resuming inside kernel for a user process dump the kernel frame diagnostics
+            if (next->in_kernel) {
+                serial_write_string("[SCHED] kret(eff) eip=0x");
+                serial_printf("%x", (uint32_t)next->kcontext.eip);
+                serial_write_string(" esp=0x");
+                serial_printf("%x", (uint32_t)next->kcontext.esp);
+                serial_write_string(" ebp=0x");
+                serial_printf("%x", (uint32_t)next->kcontext.ebp);
+                serial_write_string("\n");
+                uint32_t ebp_ptr2 = next->kcontext.ebp;
+                if (ebp_ptr2 >= 0xC0000000 && ebp_ptr2 < 0xC1000000) {
+                    uint32_t saved_ebp2 = *((uint32_t*)ebp_ptr2);
+                    uint32_t ret_eip2 = *(((uint32_t*)ebp_ptr2) + 1);
+                    serial_write_string("[SCHED] kframe(eff) [EBP]=0x");
+                    serial_printf("%x", saved_ebp2);
+                    serial_write_string(" [RET]=0x");
+                    serial_printf("%x", ret_eip2);
+                    serial_write_string("\n");
+                }
+            }
             context_switch(old, next);
         } else {
-            //switching to a kernel target no privilege change
+            //switching to a kernel target (e.x resuming inside a syscall)
+            //still ensure the TSS uses this process kernel stack for any future user->kernel IRQ
+            tss_set_kernel_stack(next->kernel_stack);
+            //if switching to kernel idle ensure a clean known-good kcontext
+            if (next->pid == 0) {
+                next->kcontext.eip = (uint32_t)kernel_idle;
+                //build a fake call frame so 'pop ebp; ret' works in context_switch_asm
+                uint32_t* ksp = (uint32_t*)(next->kernel_stack - 16);
+                ksp -= 2;             //make room for [EBP] and [RET]
+                ksp[0] = 0;           //fake saved EBP
+                ksp[1] = next->kcontext.eip; //return address -> kernel_idle
+                next->kcontext.esp = (uint32_t)ksp;
+                next->kcontext.ebp = (uint32_t)ksp; //ESP must point at saved EBP location
+                next->kcontext.eflags = 0x202;
+                next->kcontext.cs = 0x08;
+                next->kcontext.ds = next->kcontext.es = next->kcontext.fs = next->kcontext.gs = 0x10;
+                next->kcontext.ss = 0x10;
+            }
+            //diagnose kernel resume target
+            serial_write_string("[SCHED] kret eip=0x");
+            serial_printf("%x", (uint32_t)next->kcontext.eip);
+            serial_write_string(" esp=0x");
+            serial_printf("%x", (uint32_t)next->kcontext.esp);
+            serial_write_string(" ebp=0x");
+            serial_printf("%x", (uint32_t)next->kcontext.ebp);
+            serial_write_string("\n");
+            //peek at the saved frame words if EBP looks sane
+            uint32_t ebp_ptr = next->kcontext.ebp;
+            if (ebp_ptr >= 0xC0000000 && ebp_ptr < 0xC1000000) {
+                uint32_t saved_ebp = *((uint32_t*)ebp_ptr);
+                uint32_t ret_eip = *(((uint32_t*)ebp_ptr) + 1);
+                serial_write_string("[SCHED] kframe [EBP]=0x");
+                serial_printf("%x", saved_ebp);
+                serial_write_string(" [RET]=0x");
+                serial_printf("%x", ret_eip);
+                serial_write_string("\n");
+            }
             serial_write_string("[SCHED] switch ");
             serial_printf("%d", (int)old->pid);
             serial_write_string(" -> ");
@@ -419,6 +518,9 @@ void process_timer_tick(void) {
         if (p->state == PROC_SLEEPING && p->wakeup_tick != 0 && (uint32_t)now >= p->wakeup_tick) {
             p->wakeup_tick = 0;
             p->state = PROC_RUNNABLE;
+            //force resume to user context after a blocked syscall
+            p->in_kernel = false;
+            p->context.eax = 0; //sys_sleep returns 0 on success
             serial_write_string("[TICK] wake pid=\n");
             serial_printf("%d", (int)p->pid);
             serial_write_string("\n");

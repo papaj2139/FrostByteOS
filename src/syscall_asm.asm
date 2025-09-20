@@ -3,6 +3,8 @@ section .text
 
 extern syscall_dispatch
 extern syscall_capture_user_frame
+extern syscall_mark_enter
+extern syscall_mark_exit
 
 ;syscall handler entry point (interrupt 0x80)
 global syscall_handler_asm
@@ -12,6 +14,8 @@ syscall_handler_asm:
     mov ebp, esp
     ;preserve all GPRs across the capture call
     pushad
+    ;mark that we're now executing in kernel for this process (safe GPRs preserved)
+    call syscall_mark_enter
     ;capture the user return frame (EIP, CS, EFLAGS, USERESP, SS)
     ;at entry (before push ebp): [ESP+0]=EIP, [ESP+4]=CS, [ESP+8]=EFLAGS, [ESP+12]=USERESP, [ESP+16]=SS
     ;after push ebp those are at [EBP+4..+20]
@@ -45,7 +49,12 @@ syscall_handler_asm:
     
     ;clean up arguments from stack
     add esp, 24  ;6 arguments * 4 bytes each
-        
+    
+    ;clear in-kernel before returning to user preserve EAX (syscall return)
+    push eax
+    call syscall_mark_exit
+    pop eax
+
     ;restore registers
     pop edi
     pop esi
