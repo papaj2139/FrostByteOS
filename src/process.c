@@ -354,9 +354,20 @@ void schedule(void) {
             }
             //ensure TSS uses this process's kernel stack for privilege transitions
             tss_set_kernel_stack(next->kernel_stack);
+            serial_write_string("[SCHED] switch ");
+            serial_printf("%d", (int)old->pid);
+            serial_write_string(" -> ");
+            serial_printf("%d", (int)next->pid);
+            serial_write_string(" ctx=");
+            if (next->in_kernel) serial_write_string("kernel\n"); else serial_write_string("user\n");
             context_switch(old, next);
         } else {
             //switching to a kernel target no privilege change
+            serial_write_string("[SCHED] switch ");
+            serial_printf("%d", (int)old->pid);
+            serial_write_string(" -> ");
+            serial_printf("%d", (int)next->pid);
+            serial_write_string(" ctx=kernel\n");
             context_switch(old, next);
         }
     }
@@ -408,6 +419,9 @@ void process_timer_tick(void) {
         if (p->state == PROC_SLEEPING && p->wakeup_tick != 0 && (uint32_t)now >= p->wakeup_tick) {
             p->wakeup_tick = 0;
             p->state = PROC_RUNNABLE;
+            serial_write_string("[TICK] wake pid=\n");
+            serial_printf("%d", (int)p->pid);
+            serial_write_string("\n");
         }
     }
     if (current_process && current_process->time_slice > 0) {
@@ -426,9 +440,13 @@ void context_switch(process_t* old_proc, process_t* new_proc) {
 
     //save current kernel CPU state into old_proc->kcontext to avoid clobbering
     //the user-mode return frame stored in old_proc->context
-    cpu_context_t* new_ctx_ptr = ((new_proc->context.cs & 3) == 3)
-                                 ? &new_proc->context
-                                 : &new_proc->kcontext;
+    //if the process is currently inside a syscall (in_kernel) resume its kernel context
+    //otherwise select user vs kernel by CS RPL
+    cpu_context_t* new_ctx_ptr = (new_proc->in_kernel)
+                                 ? &new_proc->kcontext
+                                 : (((new_proc->context.cs & 3) == 3)
+                                       ? &new_proc->context
+                                       : &new_proc->kcontext);
 
     context_switch_asm(&old_proc->kcontext, new_ctx_ptr);
 }

@@ -21,6 +21,7 @@ void kpanic_msg(const char* reason);
 //external assembly handler
 extern void syscall_handler_asm(void);
 
+
 //initialize syscall system
 void syscall_init(void) {
     //install syscall handler at interrupt 0x80
@@ -38,6 +39,8 @@ void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint
     cur->context.eflags = eflags;
     cur->context.esp = useresp;
     cur->context.ss = ss;
+    //we are now inside a syscall ensure resumption uses kernel context if we block
+    cur->in_kernel = true;
 }
 
 //clone user space from src->dst directories (user part only)
@@ -214,13 +217,13 @@ int32_t sys_sleep(uint32_t seconds) {
     uint64_t now = timer_get_ticks();
     uint32_t ticks = seconds * 100;
     serial_write_string("[SLEEP] seconds=\n");
-    serial_printf("%d", seconds);
+    serial_printf("%d", (int)seconds);
     serial_write_string(" ticks=\n");
-    serial_printf("%d", ticks);
+    serial_printf("%d", (int)ticks);
     serial_write_string(" now=\n");
-    serial_printf("%u", (uint32_t)now);
+    serial_printf("%d", (int)(uint32_t)now);
     serial_write_string(" wake_at=\n");
-    serial_printf("%u", (uint32_t)(now + ticks));
+    serial_printf("%d", (int)(uint32_t)(now + ticks));
     serial_write_string("\n");
     process_sleep(ticks); //convert to ticks
     serial_write_string("[SLEEP] woke up\n");

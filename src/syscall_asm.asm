@@ -54,5 +54,5 @@ syscall_handler_asm:
     pop ebx
     pop ebp
     
-    ;return
+    ;return to user
     iretd
