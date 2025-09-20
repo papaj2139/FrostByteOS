@@ -45,12 +45,14 @@ typedef struct process {
     uint32_t heap_end;               //user heap end
     uint32_t user_eip;               //intended user-mode entry (virtual addr)
     
-    //CPU context
-    cpu_context_t context;           //saved CPU state
+    //CPU contexts
+    cpu_context_t context;           //saved user-mode CPU state (for iret to ring 3)
+    cpu_context_t kcontext;          //saved kernel-mode CPU state (for resuming blocked syscalls)
     
     //scheduling
     uint32_t time_slice;             //remaining time slice
     uint32_t priority;               //process priority (0 = highest)
+    uint32_t wakeup_tick;            //absolute tick to wake from sleep (0 = not sleeping)
     
     //parent/child relationships
     struct process* parent;          //parent process
@@ -64,6 +66,7 @@ typedef struct process {
     int fd_table[16];                //file descriptor table
 
     bool started;                    //process has been started (first run done)
+    bool in_kernel;                  //currently executing in kernel (resume via kcontext)
 
     //controlling TTY and its per-process mode
     struct device* tty;              //controlling TTY device (e.g., tty0)

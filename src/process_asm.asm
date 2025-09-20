@@ -9,72 +9,96 @@ context_switch_asm:
     mov ebp, esp
     
     ;get parameters
-    mov eax, [ebp + 8]  ;old_context
-    mov edx, [ebp + 12] ;new_context
+    mov esi, [ebp + 8]  ;old_context
+    mov edi, [ebp + 12] ;new_context
     
-    ;save current context to old_context
-    test eax, eax
+    ;save current context to old_context (if provided)
+    test esi, esi
     jz .restore_new     ;skip save if old_context is NULL
     
-    ;save general purpose registers
-    mov [eax + 0],  eax     ;save eax
-    mov [eax + 4],  ebx     ;save ebx
-    mov [eax + 8],  ecx     ;save ecx
-    mov [eax + 12], edx     ;save edx (will be overwritten save original)
-    mov [eax + 16], esi     ;save esi
-    mov [eax + 20], edi     ;save edi
-    mov [eax + 24], esp     ;save esp
-    mov [eax + 28], ebp     ;save ebp
+    ;push all GPRs to capture their original values
+    pushad                  ;pushes EAX, ECX, EDX, EBX, ESP(before), EBP, ESI, EDI
+    
+    ;after pushad layout at [esp+offset]:
+    ; 0: EDI, 4: ESI, 8: EBP, 12: saved ESP, 16: EBX, 20: EDX, 24: ECX, 28: EAX
+    ;store into cpu_context_t in order: eax, ebx, ecx, edx, esi, edi, esp, ebp
+    mov eax, [esp + 28]     ;EAX
+    mov [esi + 0], eax
+    mov eax, [esp + 16]     ;EBX
+    mov [esi + 4], eax
+    mov eax, [esp + 24]     ;ECX
+    mov [esi + 8], eax
+    mov eax, [esp + 20]     ;EDX
+    mov [esi + 12], eax
+    mov eax, [esp + 4]      ;ESI
+    mov [esi + 16], eax
+    mov eax, [esp + 0]      ;EDI
+    mov [esi + 20], eax
+    mov eax, [esp + 12]     ;original ESP (before pushad)
+    mov [esi + 24], eax
+    mov eax, [esp + 8]      ;EBP
+    mov [esi + 28], eax
     
     ;save eip (return address)
     mov ecx, [ebp + 4]      ;get return address from stack
-    mov [eax + 32], ecx     ;save as eip
+    mov [esi + 32], ecx     ;save as eip
     
     ;save eflags
     pushfd
     pop ecx
-    mov [eax + 36], ecx
+    mov [esi + 36], ecx
     
     ;save segment registers (16-bit values)
+    xor ecx, ecx
     mov cx, cs
-    mov [eax + 40], ecx
+    mov [esi + 40], ecx
+    xor ecx, ecx
     mov cx, ds
-    mov [eax + 44], ecx
+    mov [esi + 44], ecx
+    xor ecx, ecx
     mov cx, es
-    mov [eax + 48], ecx
+    mov [esi + 48], ecx
+    xor ecx, ecx
     mov cx, fs
-    mov [eax + 52], ecx
+    mov [esi + 52], ecx
+    xor ecx, ecx
     mov cx, gs
-    mov [eax + 56], ecx
+    mov [esi + 56], ecx
+    xor ecx, ecx
     mov cx, ss
-    mov [eax + 60], ecx
+    mov [esi + 60], ecx
+
+    ;unwind pushad
+    add esp, 32
 
 .restore_new:
     ;restore context from new_context
-    test edx, edx
+    test edi, edi
     jz .done            ;skip restore if new_context is NULL
 
     ;restore data segment registers first (from context)
-    mov ecx, [edx + 44]  ; ds
+    mov ecx, [edi + 44]  ;ds
     mov ds, cx
-    mov ecx, [edx + 48]  ; es
+    mov ecx, [edi + 48]  ;es
     mov es, cx
-    mov ecx, [edx + 52]  ; fs
+    mov ecx, [edi + 52]  ;fs
     mov fs, cx
-    mov ecx, [edx + 56]  ; gs
+    mov ecx, [edi + 56]  ;gs
     mov gs, cx
 
     ;determine target privilege level from CS selector in context
-    mov ecx, [edx + 40]   ; cs
+    mov ecx, [edi + 40]   ;cs
     test ecx, 3
     jnz .to_user          ;if RPL!=0, switch to user with iret
 
     ;kernel target (RPL=0): restore SS:ESP, EFLAGS, GPRs then near ret
-    mov ecx, [edx + 60]   ; ss
+    ;use EDX as a stable base pointer to the context to avoid clobbering EDI early
+    mov edx, edi
+    mov ecx, [edx + 60]   ;ss
     mov ss, cx
-    mov esp, [edx + 24]   ; esp
+    mov esp, [edx + 24]   ;esp
 
-    ;restore general purpose registers
+    ;restore general purpose registers (read from EDX base)
     mov eax, [edx + 0]
     mov ebx, [edx + 4]
     mov ecx, [edx + 8]
@@ -96,11 +120,14 @@ context_switch_asm:
     cli
     ;build an iret frame for a ring transition to user mode on the CURRENT (kernel) stack
     ;order expected by iret with CPL change: EIP, CS, EFLAGS, ESP, SS (push in reverse)
-    push dword [edx + 60]      ; SS (user data)
-    push dword [edx + 24]      ; ESP (user stack)
-    push dword [edx + 36]      ; EFLAGS
-    push dword [edx + 40]      ; CS (user code)
-    push dword [edx + 32]      ; EIP (user entry)
+    push dword [edi + 60]      ;SS (user data)
+    push dword [edi + 24]      ;ESP (user stack)
+    push dword [edi + 36]      ;EFLAGS
+    push dword [edi + 40]      ;CS (user code)
+    push dword [edi + 32]      ;EIP (user entry)
+
+    ;use EDX as a stable base pointer to context while restoring GPRs
+    mov edx, edi
 
     ;restore minimal register (EBP) before iret
     mov ebp, [edx + 28]
@@ -112,7 +139,13 @@ context_switch_asm:
     mov fs, ax
     mov gs, ax
 
-    ;do not restore GPRs here; let user code set them and avoid clobbering
+    ;restore general purpose registers from saved user context
+    mov eax, [edx + 0]
+    mov ebx, [edx + 4]
+    mov ecx, [edx + 8]
+    mov esi, [edx + 16]
+    mov edi, [edx + 20]
+    mov edx, [edx + 12]     ;restore EDX last (base no longer needed)
 
     ;perform the privilege-level switch
     iretd

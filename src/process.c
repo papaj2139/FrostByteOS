@@ -22,6 +22,15 @@ static uint32_t scheduler_ticks = 0;
 //time slice for round-robin scheduling (in timer ticks)
 #define TIME_SLICE_TICKS 10
 
+//idle loop for the kernel process (PID 0)
+static void kernel_idle(void) {
+    for (;;) {
+        __asm__ volatile ("sti; hlt");
+        //cooperative scheduling periodically yield so newly runnable tasks run
+        schedule();
+    }
+}
+
 void process_init(void) {
     //initialize process table
     memset(process_table, 0, sizeof(process_table));
@@ -35,6 +44,19 @@ void process_init(void) {
     kernel_proc->page_directory = vmm_get_kernel_directory();
     kernel_proc->priority = 0;
     kernel_proc->time_slice = TIME_SLICE_TICKS;
+
+    //allocate a dedicated kernel stack and initialize kernel CPU context
+    void* kstk_base = kmalloc(KERNEL_STACK_SIZE);
+    if (kstk_base) {
+        kernel_proc->kernel_stack = (uint32_t)kstk_base + KERNEL_STACK_SIZE;
+        kernel_proc->kcontext.eip = (uint32_t)kernel_idle;
+        kernel_proc->kcontext.esp = kernel_proc->kernel_stack - 16;
+        kernel_proc->kcontext.ebp = kernel_proc->kcontext.esp;
+        kernel_proc->kcontext.eflags = 0x202;
+        kernel_proc->kcontext.cs = 0x08;
+        kernel_proc->kcontext.ds = kernel_proc->kcontext.es = kernel_proc->kcontext.fs = kernel_proc->kcontext.gs = 0x10;
+        kernel_proc->kcontext.ss = 0x10;
+    }
     
     current_process = kernel_proc;
     next_pid = 1;
@@ -176,6 +198,10 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
                                 USER_VIRTUAL_END - 0x1000, 
                                 user_stack_phys, 
                                 PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        //map the user stack into the kernel directory since we currently
+        //run all processes under the kernel CR3 (no per-process address space)
+        (void)vmm_map_page(USER_VIRTUAL_END - 0x1000, user_stack_phys,
+                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
         
         //set up heap
         proc->heap_start = USER_VIRTUAL_START + 0x100000;  //1MB offset
@@ -217,6 +243,9 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         proc->context.cs = 0x08;  //kernel code segment
         proc->context.ds = proc->context.es = proc->context.fs = proc->context.gs = 0x10;  //kernel data segment
         proc->context.ss = 0x10;  //kernel stack segment
+
+        //mirror into kcontext (we use kcontext when restoring kernel targets)
+        proc->kcontext = proc->context;
     }
     
     //set parent-child relationship
@@ -356,10 +385,10 @@ void process_exit(int exit_code) {
 
 void process_sleep(uint32_t ticks) {
     if (!current_process) return;
-    
+    //set absolute wakeup tick and sleep cooperatively
+    uint64_t now = timer_get_ticks();
+    current_process->wakeup_tick = (uint32_t)(now + ticks);
     current_process->state = PROC_SLEEPING;
-    //TODO: Add to sleep queue with wake time
-    
     schedule();
 }
 
@@ -372,6 +401,15 @@ void process_wake(process_t* proc) {
 //called by timer interrupt to handle time slicing
 void process_timer_tick(void) {
     scheduler_ticks++;
+    //wake sleeping tasks whose deadline has passed
+    uint64_t now = timer_get_ticks();
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = &process_table[i];
+        if (p->state == PROC_SLEEPING && p->wakeup_tick != 0 && (uint32_t)now >= p->wakeup_tick) {
+            p->wakeup_tick = 0;
+            p->state = PROC_RUNNABLE;
+        }
+    }
     if (current_process && current_process->time_slice > 0) {
         current_process->time_slice--;
         if (current_process->time_slice == 0) {
@@ -384,10 +422,13 @@ void process_timer_tick(void) {
 //context switching function
 void context_switch(process_t* old_proc, process_t* new_proc) {
     //note: keep using the kernel page directory for now (no CR3 switch)
-    //this mirrors the previously working behavior to avoid triple faults
     //need to stabilize per-process address space
-    (void)old_proc; (void)new_proc;
-    
-    //save old context and restore new context using assembly
-    context_switch_asm(&old_proc->context, &new_proc->context);
+
+    //save current kernel CPU state into old_proc->kcontext to avoid clobbering
+    //the user-mode return frame stored in old_proc->context
+    cpu_context_t* new_ctx_ptr = ((new_proc->context.cs & 3) == 3)
+                                 ? &new_proc->context
+                                 : &new_proc->kcontext;
+
+    context_switch_asm(&old_proc->kcontext, new_ctx_ptr);
 }

@@ -10,6 +10,7 @@
 #include "drivers/keyboard.h"
 #include "drivers/tty.h"
 #include "process.h"
+#include "drivers/timer.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -111,6 +112,9 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
 
 //syscall implementations
 int32_t sys_exit(int32_t status) {
+    serial_write_string("[EXIT] sys_exit called with status=\n");
+    serial_printf("%d", status);
+    serial_write_string("\n");
     process_exit(status);
     return 0; //Never reached
 }
@@ -120,6 +124,8 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     serial_printf("%d", fd);
     serial_write_string(", count: ");
     serial_printf("%d", count);
+    serial_write_string(", buf=0x");
+    serial_printf("%x", (uint32_t)buf);
     serial_write_string("\n");
     
     if (fd == 1 || fd == 2) {
@@ -205,7 +211,19 @@ int32_t sys_getpid(void) {
 }
 
 int32_t sys_sleep(uint32_t seconds) {
-    process_sleep(seconds * 100); //convert to ticks
+    uint64_t now = timer_get_ticks();
+    uint32_t ticks = seconds * 100;
+    serial_write_string("[SLEEP] seconds=\n");
+    serial_printf("%d", seconds);
+    serial_write_string(" ticks=\n");
+    serial_printf("%d", ticks);
+    serial_write_string(" now=\n");
+    serial_printf("%u", (uint32_t)now);
+    serial_write_string(" wake_at=\n");
+    serial_printf("%u", (uint32_t)(now + ticks));
+    serial_write_string("\n");
+    process_sleep(ticks); //convert to ticks
+    serial_write_string("[SLEEP] woke up\n");
     return 0;
 }
 
@@ -253,6 +271,9 @@ int32_t sys_fork(void) {
     //inherit TTY mode and controlling TTY
     child->tty = parent->tty;
     child->tty_mode = parent->tty_mode;
+
+    //ensure parent saved user context reflects fork return value as well
+    parent->context.eax = (uint32_t)child->pid;
 
     //restore IF if it was set
     if (eflags & 0x200) __asm__ volatile ("sti");
@@ -459,6 +480,11 @@ int32_t sys_wait(int32_t* status) {
                     //store raw exit code
                     *status = ec;
                 }
+                serial_write_string("[WAIT] returning pid=\n");
+                serial_printf("%d", pid);
+                serial_write_string(" status=\n");
+                serial_printf("%d", ec);
+                serial_write_string("\n");
                 process_destroy(child);
                 return pid;
             }
@@ -467,6 +493,9 @@ int32_t sys_wait(int32_t* status) {
         //no zombies if no children at all return -1 immediately
         if (!parent->children) return -1;
         //sleep until a child exits
+        serial_write_string("[WAIT] sleeping parent pid=\n");
+        serial_printf("%d", (int)parent->pid);
+        serial_write_string("\n");
         parent->state = PROC_SLEEPING;
         schedule();
     }

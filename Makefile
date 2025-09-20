@@ -100,17 +100,17 @@ fs.o: src/fs/fs.c
 vfs.o: src/fs/vfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-initramfs.o: src/fs/initramfs.c src/fs/usershell_blob.h src/fs/init_blob.h src/fs/forktest_blob.h
+initramfs.o: src/fs/initramfs.c src/fs/fbsh_blob.h src/fs/init_blob.h src/fs/forktest_blob.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-usershell.bin: userapp.asm
+fbsh.bin: fbsh.asm
 	$(ASM) -f bin $< -o $@
 
 #generate a header embedding the user shell binary for initramfs
-src/fs/usershell_blob.h: usershell.bin
+src/fs/fbsh_blob.h: fbsh.bin
 	xxd -i $< > $@
-	sed -i 's/unsigned char usershell_bin/const unsigned char usershell_bin/g' $@
-	sed -i 's/unsigned int usershell_bin_len/const unsigned int usershell_bin_len/g' $@
+	sed -i 's/unsigned char fbsh_bin/const unsigned char fbsh_bin/g' $@
+	sed -i 's/unsigned int fbsh_bin_len/const unsigned int fbsh_bin_len/g' $@
 
 init.bin: init.asm
 	$(ASM) -f bin $< -o $@

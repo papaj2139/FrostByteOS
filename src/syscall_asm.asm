@@ -10,6 +10,21 @@ syscall_handler_asm:
     ;save registers
     push ebp
     mov ebp, esp
+    ;preserve all GPRs across the capture call
+    pushad
+    ;capture the user return frame (EIP, CS, EFLAGS, USERESP, SS)
+    ;at entry (before push ebp): [ESP+0]=EIP, [ESP+4]=CS, [ESP+8]=EFLAGS, [ESP+12]=USERESP, [ESP+16]=SS
+    ;after push ebp those are at [EBP+4..+20]
+    push dword [ebp + 20]   ;SS
+    push dword [ebp + 16]   ;USERESP
+    push dword [ebp + 12]   ;EFLAGS
+    push dword [ebp + 8]    ;CS
+    push dword [ebp + 4]    ;EIP
+    call syscall_capture_user_frame
+    add esp, 20
+    ;restore original user register values
+    popad
+    ;now save caller-saved registers for dispatcher call
     push ebx
     push ecx
     push edx

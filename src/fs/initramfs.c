@@ -161,9 +161,9 @@ int initramfs_add_file(const char* path, const uint8_t* data, uint32_t size) {
     return irfs_add_file_at(dir, fname, data, size);
 }
 
-//userspace shell binary gets generated at build time from userapp.asm
-//via Makefile rule that produces this header with arrays usershell_bin / usershell_bin_len
-#include "usershell_blob.h"
+//fbsh shell binary gets generated at build time from userapp.asm
+//via Makefile rule that produces this header with arrays fbsh_bin / fbsh_bin_len
+#include "fbsh_blob.h"
 //init program binary generated from init.asm
 #include "init_blob.h"
 //forktest binary
@@ -266,7 +266,7 @@ void initramfs_populate_builtin(void) {
     const char* motd = "Welcome to FrostByte (initramfs)\n";
     initramfs_add_file("/etc/motd", (const uint8_t*)motd, (uint32_t)strlen(motd));
     //add the userspace shell at /bin/sh
-    initramfs_add_file("/bin/sh", (const uint8_t*)usershell_bin, (uint32_t)usershell_bin_len);
+    initramfs_add_file("/bin/sh", (const uint8_t*)fbsh_bin, (uint32_t)fbsh_bin_len);
     //add init that execs /bin/sh
     initramfs_add_file("/bin/init", (const uint8_t*)init_bin, (uint32_t)init_bin_len);
     //add forktest program
