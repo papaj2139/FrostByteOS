@@ -220,17 +220,11 @@ static int spawn_user_from_vfs(const char* path) {
         return 0;
     }
 
-    //map code into process and kernel address spaces
+    //map code into the process address space only
     if (vmm_map_page_in_directory(proc->page_directory, entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
         process_destroy(proc);
         pmm_free_page(code_phys);
         serial_write_string("[VFS] map in proc failed\n");
-        return 0;
-    }
-    if (vmm_map_page(entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        process_destroy(proc);
-        pmm_free_page(code_phys);
-        serial_write_string("[VFS] map in kernel failed\n");
         return 0;
     }
 
@@ -238,12 +232,6 @@ static int spawn_user_from_vfs(const char* path) {
     uint32_t ustack_phys = pmm_alloc_page();
     if (!ustack_phys) {
         serial_write_string("[VFS] alloc user stack failed\n");
-        process_destroy(proc);
-        return 0;
-    }
-    if (vmm_map_page(0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        serial_write_string("[VFS] map user stack in kernel failed\n");
-        pmm_free_page(ustack_phys);
         process_destroy(proc);
         return 0;
     }
@@ -255,14 +243,12 @@ static int spawn_user_from_vfs(const char* path) {
     }
     proc->context.esp = 0x02000000 - 16;
 
-    //debugdump context and mappings
+    //debugdump context and mappings (use known physical pages)
     {
-        uint32_t phys_code = vmm_get_physical_addr(entry_va);
-        uint32_t phys_stack = vmm_get_physical_addr(0x02000000 - 0x1000);
         char out[192];
         ksnprintf(out, sizeof(out),
                   "Boot: Spawned %s PID %u entry=0x%08x code_phys=0x%08x stack_top=0x%08x stack_phys=0x%08x\n",
-                  path, proc->pid, entry_va, phys_code, (uint32_t)(0x02000000 - 16), phys_stack);
+                  path, proc->pid, entry_va, (uint32_t)code_phys, (uint32_t)(0x02000000 - 16), (uint32_t)ustack_phys);
         serial_write_string(out);
         ksnprintf(out, sizeof(out),
                   "Ctx: CS=0x%04x SS=0x%04x DS=0x%04x EFLAGS=0x%08x EIP=0x%08x ESP=0x%08x\n",
