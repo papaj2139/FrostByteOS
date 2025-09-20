@@ -13,6 +13,7 @@
 #include "drivers/timer.h"
 #include <stdint.h>
 #include <string.h>
+#include "debug.h"
 
 //forward declarations
 void print(char* msg, unsigned char colour);
@@ -122,14 +123,17 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
 
 //syscall implementations
 int32_t sys_exit(int32_t status) {
+    #if LOG_PROC
     serial_write_string("[EXIT] sys_exit called with status=\n");
     serial_printf("%d", status);
     serial_write_string("\n");
+    #endif
     process_exit(status);
     return 0; //Never reached
 }
 
 int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
+    #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Write called - fd: ");
     serial_printf("%d", fd);
     serial_write_string(", count: ");
@@ -137,27 +141,36 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     serial_write_string(", buf=0x");
     serial_printf("%x", (uint32_t)buf);
     serial_write_string("\n");
+    #endif
     
     if (fd == 1 || fd == 2) {
+        #if LOG_SYSCALL
         serial_write_string("[SYSCALL] Writing to TTY\n");
+        #endif
         int written = tty_write(buf, count);
         return (written < 0) ? written : (int32_t)count;
     }
     
     vfs_file_t* file = fd_get(fd);
     if (!file) {
+        #if LOG_SYSCALL
         serial_write_string("[SYSCALL] Invalid file descriptor\n");
+        #endif
         return -1; //EBADF
     }
 
+    #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Writing to file via VFS\n");
+    #endif
     int bytes_written = vfs_write(file->node, file->offset, count, buf);
     if (bytes_written >= 0) {
         file->offset += bytes_written;
     }
+    #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Write completed, bytes: ");
     serial_printf("%d", bytes_written);
     serial_write_string("\n");
+    #endif
     return bytes_written;
 }
 
@@ -223,6 +236,7 @@ int32_t sys_getpid(void) {
 int32_t sys_sleep(uint32_t seconds) {
     uint64_t now = timer_get_ticks();
     uint32_t ticks = seconds * 100;
+    #if LOG_PROC
     serial_write_string("[SLEEP] seconds=\n");
     serial_printf("%d", (int)seconds);
     serial_write_string(" ticks=\n");
@@ -232,32 +246,45 @@ int32_t sys_sleep(uint32_t seconds) {
     serial_write_string(" wake_at=\n");
     serial_printf("%d", (int)(uint32_t)(now + ticks));
     serial_write_string("\n");
+    #endif
     process_sleep(ticks); //convert to ticks
+    #if LOG_PROC
     serial_write_string("[SLEEP] woke up\n");
+    #endif
     return 0;
 }
 
 int32_t sys_fork(void) {
     process_t* parent = process_get_current();
     if (!parent) return -1;
+    #if LOG_PROC
     serial_write_string("[FORK] enter\n");
+    #endif
 
     //disable interrupts during fork to avoid reentrancy
     uint32_t eflags;
     __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags) :: "memory");
+    #if LOG_PROC
     serial_write_string("[FORK] post-cli\n");
+    #endif
 
+    #if LOG_PROC
     serial_write_string("[FORK] pre-create\n");
+    #endif
 
     //create child as USER-MODE process
     process_t* child = process_create(parent->name, (void*)parent->context.eip, true);
     if (!child) {
+        #if LOG_PROC
         serial_write_string("[FORK] process_create failed\n");
+        #endif
         //restore IF if it was set
         if (eflags & 0x200) __asm__ volatile ("sti");
         return -1;
     }
+    #if LOG_PROC
     serial_write_string("[FORK] created\n");
+    #endif
 
     //clone user address space once per-process CR3 is enabled but that later
     //if (clone_user_space(parent->page_directory, child->page_directory) != 0) {
@@ -287,7 +314,9 @@ int32_t sys_fork(void) {
 
     //restore IF if it was set
     if (eflags & 0x200) __asm__ volatile ("sti");
+    #if LOG_PROC
     serial_write_string("[FORK] return\n");
+    #endif
 
     //return child's PID in parent
     return (int32_t)child->pid;
@@ -300,14 +329,18 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     //open the target program from VFS
     vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ);
     if (!node) {
+        #if LOG_PROC
         serial_write_string("[EXEC] File not found\n");
+        #endif
         return -1;
     }
 
     int fsize = vfs_get_size(node);
     if (fsize <= 0) {
         vfs_close(node);
+        #if LOG_PROC
         serial_write_string("[EXEC] Invalid file size\n");
+        #endif
         return -1;
     }
     if (fsize > 4096) fsize = 4096; //single-page flat loader for now
@@ -320,14 +353,18 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     uint32_t new_code_phys = pmm_alloc_page();
     if (!new_code_phys) {
         vfs_close(node);
+        #if LOG_PROC
         serial_write_string("[EXEC] pmm_alloc_page failed for code\n");
+        #endif
         return -1;
     }
 
     if (vmm_map_page(temp_kmap, new_code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
         vfs_close(node);
         pmm_free_page(new_code_phys);
+        #if LOG_PROC
         serial_write_string("[EXEC] map temp page failed\n");
+        #endif
         return -1;
     }
 
@@ -346,7 +383,9 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     uint32_t old_code_phys = vmm_get_physical_addr(entry_va) & ~0xFFF;
     if (vmm_map_page(entry_va, new_code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
         pmm_free_page(new_code_phys);
+        #if LOG_PROC
         serial_write_string("[EXEC] map code in kernel dir failed\n");
+        #endif
         return -1;
     }
 
@@ -364,14 +403,18 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     //create a fresh user stack page and map it
     uint32_t new_stack_phys = pmm_alloc_page();
     if (!new_stack_phys) {
+        #if LOG_PROC
         serial_write_string("[EXEC] alloc user stack failed\n");
+        #endif
         return -1;
     }
     uint32_t ustack_va = ustack_top - 0x1000;
     uint32_t old_stack_phys = vmm_get_physical_addr(ustack_va) & ~0xFFF;
     if (vmm_map_page(ustack_va, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
         pmm_free_page(new_stack_phys);
+        #if LOG_PROC
         serial_write_string("[EXEC] map user stack (kernel dir) failed\n");
+        #endif
         return -1;
     }
     if (cur && cur->page_directory) {
@@ -409,7 +452,9 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
 
     //ensure it fits in one page (naive check)
     if (strings_size + vector_bytes + 64 > 4096) {
+        #if LOG_PROC
         serial_write_string("[EXEC] argv/envp too large for one-page stack\n");
+        #endif
         return -1;
     }
 
@@ -468,7 +513,9 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
         cur->tty_mode = TTY_MODE_CANON | TTY_MODE_ECHO;
     }
 
+    #if LOG_PROC
     serial_write_string("[EXEC] Success\n");
+    #endif
     //jump directly to user mode at the new entry execve() does not return on success
     switch_to_user_mode(entry_va, sp);
     //not reached
@@ -490,11 +537,13 @@ int32_t sys_wait(int32_t* status) {
                     //store raw exit code
                     *status = ec;
                 }
+                #if LOG_PROC
                 serial_write_string("[WAIT] returning pid=\n");
                 serial_printf("%d", pid);
                 serial_write_string(" status=\n");
                 serial_printf("%d", ec);
                 serial_write_string("\n");
+                #endif
                 process_destroy(child);
                 return pid;
             }
@@ -503,9 +552,11 @@ int32_t sys_wait(int32_t* status) {
         //no zombies if no children at all return -1 immediately
         if (!parent->children) return -1;
         //sleep until a child exits
+        #if LOG_PROC
         serial_write_string("[WAIT] sleeping parent pid=\n");
         serial_printf("%d", (int)parent->pid);
         serial_write_string("\n");
+        #endif
         parent->state = PROC_SLEEPING;
         schedule();
     }

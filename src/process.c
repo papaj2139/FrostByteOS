@@ -7,6 +7,7 @@
 #include "drivers/tty.h"
 #include "drivers/timer.h"
 #include "drivers/serial.h"
+#include "debug.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -136,7 +137,9 @@ void process_reap_zombies(void) {
 }
 
 process_t* process_create(const char* name, void* entry_point, bool user_mode) {
+    #if LOG_PROC
     serial_write_string("[PROC] create begin\n");
+    #endif
     //clean up any defunct processes so their slots/PIDs are reusable
     process_reap_zombies();
     //find free process slot
@@ -161,7 +164,9 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
     
     //set up memory space
     if (user_mode) {
+        #if LOG_PROC
         serial_write_string("[PROC] user path\n");
+        #endif
         //create new page directory for user process
         proc->page_directory = vmm_create_directory();
         if (!proc->page_directory) {
@@ -179,7 +184,9 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
                                   PAGE_PRESENT | PAGE_WRITABLE);
         
         //allocate kernel stack (kernel virtual memory)
+        #if LOG_PROC
         serial_write_string("[PROC] kmalloc kstack (user)\n");
+        #endif
         void* kstk_base = kmalloc(KERNEL_STACK_SIZE);
         if (!kstk_base) {
             serial_write_string("[PROC] kmalloc kstack failed (user)\n");
@@ -187,12 +194,16 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
             proc->state = PROC_UNUSED;
             return NULL;
         }
+        #if LOG_PROC
         serial_write_string("[PROC] kstack ok (user)\n");
+        #endif
         proc->kernel_stack = (uint32_t)kstk_base + KERNEL_STACK_SIZE; //top of stack
         
         //set up user stack (top of user space)
         proc->user_stack_top = USER_VIRTUAL_END;
+        #if LOG_PROC
         serial_write_string("[PROC] alloc user stack phys\n");
+        #endif
         uint32_t user_stack_phys = pmm_alloc_page();
         if (!user_stack_phys) {
             //free previously allocated kernel stack
@@ -201,10 +212,14 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
             proc->state = PROC_UNUSED;
             return NULL;
         }
+        #if LOG_PROC
         serial_write_string("[PROC] user stack phys ok\n");
+        #endif
         
         //map user stack
+        #if LOG_PROC
         serial_write_string("[PROC] map user stack\n");
+        #endif
         vmm_map_page_in_directory(proc->page_directory, 
                                 USER_VIRTUAL_END - 0x1000, 
                                 user_stack_phys, 
@@ -233,10 +248,14 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         proc->tty_mode = TTY_MODE_CANON | TTY_MODE_ECHO;
         
     } else {
+        #if LOG_PROC
         serial_write_string("[PROC] kernel path\n");
+        #endif
         //kernel process use kernel page directory
         proc->page_directory = vmm_get_kernel_directory();
+        #if LOG_PROC
         serial_write_string("[PROC] kmalloc kstack (kern)\n");
+        #endif
         void* kstk_base_k = kmalloc(KERNEL_STACK_SIZE);
         if (!kstk_base_k) {
             serial_write_string("[PROC] kmalloc kstack failed (kern)\n");
@@ -244,7 +263,9 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
             return NULL;
         }
         proc->kernel_stack = (uint32_t)kstk_base_k + KERNEL_STACK_SIZE;
+        #if LOG_PROC
         serial_write_string("[PROC] kstack ok (kern)\n");
+        #endif
         
         //initialize CPU context for kernel mode
         proc->context.eip = (uint32_t)entry_point;
@@ -277,7 +298,9 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
     }
     
     proc->state = PROC_RUNNABLE;
+    #if LOG_PROC
     serial_write_string("[PROC] create end\n");
+    #endif
     return proc;
 }
 
@@ -339,33 +362,30 @@ void schedule(void) {
     
     //if no runnable process found stay with current (or kernel)
     if (!next) {
+        #if LOG_SCHED
         serial_write_string("[SCHED] no runnable process found\n");
-        for (int i = 0; i < MAX_PROCESSES; i++) {
-            process_t* p = &process_table[i];
-            serial_write_string("[SCHED] pid=");
-            serial_printf("%d", (int)p->pid);
-            serial_write_string(" state=");
-            switch (p->state) {
-                case PROC_UNUSED:
-                    serial_write_string("UNUSED\n");
-                    break;
-                case PROC_EMBRYO:
-                    serial_write_string("EMBRYO\n");
-                    break;
-                case PROC_RUNNABLE:
-                    serial_write_string("RUNNABLE\n");
-                    break;
-                case PROC_RUNNING:
-                    serial_write_string("RUNNING\n");
-                    break;
-                case PROC_SLEEPING:
-                    serial_write_string("SLEEPING\n");
-                    break;
-                case PROC_ZOMBIE:
-                    serial_write_string("ZOMBIE\n");
-                    break;
+        #endif
+        #if LOG_SCHED_TABLE
+        static uint32_t last_dump_tick = 0;
+        if (scheduler_ticks != last_dump_tick) {
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                process_t* p = &process_table[i];
+                if (p->state == PROC_UNUSED) continue; //skip empty slots
+                serial_write_string("[SCHED] pid=");
+                serial_printf("%d", (int)p->pid);
+                serial_write_string(" state=");
+                switch (p->state) {
+                    case PROC_EMBRYO:   serial_write_string("EMBRYO\n");   break;
+                    case PROC_RUNNABLE: serial_write_string("RUNNABLE\n"); break;
+                    case PROC_RUNNING:  serial_write_string("RUNNING\n");  break;
+                    case PROC_SLEEPING: serial_write_string("SLEEPING\n"); break;
+                    case PROC_ZOMBIE:   serial_write_string("ZOMBIE\n");   break;
+                    default: break;
+                }
             }
+            last_dump_tick = scheduler_ticks;
         }
+        #endif
         if (current_process->state == PROC_RUNNING) {
             current_process->time_slice = TIME_SLICE_TICKS;  //reset time slice
             return;
@@ -397,13 +417,8 @@ void schedule(void) {
             }
             //ensure TSS uses this process's kernel stack for privilege transitions
             tss_set_kernel_stack(next->kernel_stack);
-            serial_write_string("[SCHED] switch ");
-            serial_printf("%d", (int)old->pid);
-            serial_write_string(" -> ");
-            serial_printf("%d", (int)next->pid);
-            serial_write_string(" ctx=");
-            if (next->in_kernel) serial_write_string("kernel\n"); else serial_write_string("user\n");
-            //if resuming inside kernel for a user process dump the kernel frame diagnostics
+            // If resuming inside kernel for a user process, dump the kernel frame diagnostics
+            #if LOG_SCHED_DIAG
             if (next->in_kernel) {
                 serial_write_string("[SCHED] kret(eff) eip=0x");
                 serial_printf("%x", (uint32_t)next->kcontext.eip);
@@ -423,12 +438,21 @@ void schedule(void) {
                     serial_write_string("\n");
                 }
             }
+            #endif
+            #if LOG_SCHED
+            serial_write_string("[SCHED] switch ");
+            serial_printf("%d", (int)old->pid);
+            serial_write_string(" -> ");
+            serial_printf("%d", (int)next->pid);
+            serial_write_string(" ctx=");
+            if (next->in_kernel) serial_write_string("kernel\n"); else serial_write_string("user\n");
+            #endif
             context_switch(old, next);
         } else {
-            //switching to a kernel target (e.x resuming inside a syscall)
-            //still ensure the TSS uses this process kernel stack for any future user->kernel IRQ
+            //switching to a kernel target (e.g., resuming inside a syscall or kernel thread)
+            //still ensure the TSS uses this process's kernel stack for any future user->kernel IRQ
             tss_set_kernel_stack(next->kernel_stack);
-            //if switching to kernel idle ensure a clean known-good kcontext
+            //if switching to kernel idle ensure a known-good kcontext
             if (next->pid == 0) {
                 next->kcontext.eip = (uint32_t)kernel_idle;
                 //build a fake call frame so 'pop ebp; ret' works in context_switch_asm
@@ -444,6 +468,7 @@ void schedule(void) {
                 next->kcontext.ss = 0x10;
             }
             //diagnose kernel resume target
+            #if LOG_SCHED_DIAG
             serial_write_string("[SCHED] kret eip=0x");
             serial_printf("%x", (uint32_t)next->kcontext.eip);
             serial_write_string(" esp=0x");
@@ -451,7 +476,7 @@ void schedule(void) {
             serial_write_string(" ebp=0x");
             serial_printf("%x", (uint32_t)next->kcontext.ebp);
             serial_write_string("\n");
-            //peek at the saved frame words if EBP looks sane
+            //look at the saved frame words if EBP looks sane
             uint32_t ebp_ptr = next->kcontext.ebp;
             if (ebp_ptr >= 0xC0000000 && ebp_ptr < 0xC1000000) {
                 uint32_t saved_ebp = *((uint32_t*)ebp_ptr);
@@ -462,11 +487,14 @@ void schedule(void) {
                 serial_printf("%x", ret_eip);
                 serial_write_string("\n");
             }
+            #endif
+            #if LOG_SCHED
             serial_write_string("[SCHED] switch ");
             serial_printf("%d", (int)old->pid);
             serial_write_string(" -> ");
             serial_printf("%d", (int)next->pid);
             serial_write_string(" ctx=kernel\n");
+            #endif
             context_switch(old, next);
         }
     }
@@ -521,9 +549,11 @@ void process_timer_tick(void) {
             //force resume to user context after a blocked syscall
             p->in_kernel = false;
             p->context.eax = 0; //sys_sleep returns 0 on success
+            #if LOG_TICK
             serial_write_string("[TICK] wake pid=\n");
             serial_printf("%d", (int)p->pid);
             serial_write_string("\n");
+            #endif
         }
     }
     if (current_process && current_process->time_slice > 0) {
