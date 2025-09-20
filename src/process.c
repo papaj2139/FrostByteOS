@@ -224,10 +224,8 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
                                 USER_VIRTUAL_END - 0x1000, 
                                 user_stack_phys, 
                                 PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-        //map the user stack into the kernel directory since we currently
-        //run all processes under the kernel CR3 (no per-process address space)
-        (void)vmm_map_page(USER_VIRTUAL_END - 0x1000, user_stack_phys,
-                           PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        //no longer map the user stack into the kernel directory with per-process
+        //CR3 switching the stack lives only in the process address space
         
         //set up heap
         proc->heap_start = USER_VIRTUAL_START + 0x100000;  //1MB offset
@@ -567,9 +565,6 @@ void process_timer_tick(void) {
 
 //context switching function
 void context_switch(process_t* old_proc, process_t* new_proc) {
-    //note: keep using the kernel page directory for now (no CR3 switch)
-    //need to stabilize per-process address space
-
     //save current kernel CPU state into old_proc->kcontext to avoid clobbering
     //the user-mode return frame stored in old_proc->context
     //if the process is currently inside a syscall (in_kernel) resume its kernel context
@@ -579,6 +574,12 @@ void context_switch(process_t* old_proc, process_t* new_proc) {
                                  : (((new_proc->context.cs & 3) == 3)
                                        ? &new_proc->context
                                        : &new_proc->kcontext);
+
+    //switch CR3 to the appropriate page directory for PID 0 use kernel dir
+    page_directory_t target_dir = (new_proc->pid == 0 || !new_proc->page_directory)
+                                  ? vmm_get_kernel_directory()
+                                  : new_proc->page_directory;
+    vmm_switch_directory(target_dir);
 
     context_switch_asm(&old_proc->kcontext, new_ctx_ptr);
 }

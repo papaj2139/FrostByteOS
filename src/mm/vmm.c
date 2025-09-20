@@ -282,6 +282,11 @@ page_directory_t vmm_create_directory(void) {
         directory[i] = kernel_directory[i];
     }
 
+    //also copy the identity-mapped PDEs for 0..8MB used by scratch mapping helpers
+    //PDE size is 4MB so indices 0 and 1 cover 0..8MB
+    directory[0] = kernel_directory[0];
+    directory[1] = kernel_directory[1];
+
     return directory;
 }
 
@@ -351,10 +356,13 @@ void vmm_destroy_directory(page_directory_t directory) {
 
     //free all user page tables (not kernel ones)
     for (int i = 0; i < 768; i++) { //only user space (0-3GB)
-        if (directory[i] & PAGE_PRESENT) {
-            uint32_t pt_phys = directory[i] & ~0xFFF;
-            pmm_free_page(pt_phys);
+        if (!(directory[i] & PAGE_PRESENT)) continue;
+        //do NOT free shared identity-mapped PTs (0..8MB) copied from kernel dir
+        if (i < 2 && kernel_directory && directory[i] == kernel_directory[i]) {
+            continue;
         }
+        uint32_t pt_phys = directory[i] & ~0xFFF;
+        pmm_free_page(pt_phys);
     }
 
     //free the page directory itself

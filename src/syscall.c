@@ -57,6 +57,10 @@ static int clone_user_space(page_directory_t src, page_directory_t dst) {
     const uint32_t TMP_SRC = 0xE0000000; //high kernel scratch outside kernel heap
     const uint32_t TMP_DST = 0xE0001000;
     for (int i = 0; i < 768; i++) { //user space only
+        //skip cloning PDE 0 and 1 (0 to 8MB identity region) these PTs are shared with the kernel
+        //so cloning into them would overwrite global identity mappings (e.x VGA 0xB8000)
+        //causing text output to disappear
+        if (i < 2) continue;
         if (!(src[i] & PAGE_PRESENT)) continue;
         uint32_t pt_src_phys = src[i] & ~0xFFF;
         page_table_t pt_src = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_src_phys);
@@ -286,13 +290,15 @@ int32_t sys_fork(void) {
     serial_write_string("[FORK] created\n");
     #endif
 
-    //clone user address space once per-process CR3 is enabled but that later
-    //if (clone_user_space(parent->page_directory, child->page_directory) != 0) {
-    //    serial_write_string("[FORK] clone_user_space failed\n");
-    //    process_destroy(child);
-    //    if (eflags & 0x200) __asm__ volatile ("sti");
-    //    return -1;
-    //}
+    //clone user address space now that per-process CR3 is enabled
+    if (clone_user_space(parent->page_directory, child->page_directory) != 0) {
+        #if LOG_PROC
+        serial_write_string("[FORK] clone_user_space failed\n");
+        #endif
+        process_destroy(child);
+        if (eflags & 0x200) __asm__ volatile ("sti");
+        return -1;
+    }
 
     //inherit minimal context so child returns to the same user EIP with ESP preserved
     //and EAX=0 in the child per POSIX semantics
@@ -336,6 +342,11 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     }
 
     int fsize = vfs_get_size(node);
+    #if LOG_PROC
+    serial_write_string("[EXEC] opened file, size=\n");
+    serial_printf("%d", fsize);
+    serial_write_string("\n");
+    #endif
     if (fsize <= 0) {
         vfs_close(node);
         #if LOG_PROC
@@ -348,6 +359,7 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     const uint32_t entry_va = 0x01000000;      //program entry VA
     const uint32_t temp_kmap = 0x00800000;     //temp kernel VA for copying
     const uint32_t ustack_top = 0x02000000;    //user stack top
+    process_t* cur = process_get_current();
 
     //allocate a new physical page for code
     uint32_t new_code_phys = pmm_alloc_page();
@@ -358,7 +370,17 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
         #endif
         return -1;
     }
+    #if LOG_PROC
+    serial_write_string("[EXEC] code phys=0x\n");
+    serial_printf("%x", new_code_phys);
+    serial_write_string("\n");
+    #endif
 
+    //perform temporary mapping and file copy under the kernel directory
+    //disable interrupts to prevent preemption while CR3 is set to kernel dir
+    uint32_t eflags_save;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    vmm_switch_directory(vmm_get_kernel_directory());
     if (vmm_map_page(temp_kmap, new_code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
         vfs_close(node);
         pmm_free_page(new_code_phys);
@@ -367,33 +389,56 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
         #endif
         return -1;
     }
+    #if LOG_PROC
+    serial_write_string("[EXEC] temp map ok at 0x00800000\n");
+    #endif
 
     //zero and copy program into page
     memset((void*)temp_kmap, 0, 4096);
     uint32_t offset = 0;
     while (offset < (uint32_t)fsize) {
         int r = vfs_read(node, offset, (uint32_t)(fsize - offset), (char*)((uint8_t*)temp_kmap + offset));
+        #if LOG_PROC
+        serial_write_string("[EXEC] read chunk r=\n");
+        serial_printf("%d", r);
+        serial_write_string(" off=\n");
+        serial_printf("%d", (int)offset);
+        serial_write_string("\n");
+        #endif
         if (r <= 0) break;
         offset += (uint32_t)r;
     }
     vfs_close(node);
     vmm_unmap_page_nofree(temp_kmap);
+    //switch back to the current process directory for installing user mappings
+    if (cur && cur->page_directory) {
+        vmm_switch_directory(cur->page_directory);
+    }
+    //restore IF if it was set
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
+    #if LOG_PROC
+    serial_write_string("[EXEC] copied bytes=\n");
+    serial_printf("%d", (int)offset);
+    serial_write_string("\n");
+    #endif
 
-    //replace mapping at entry_va with new code page
-    uint32_t old_code_phys = vmm_get_physical_addr(entry_va) & ~0xFFF;
-    if (vmm_map_page(entry_va, new_code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+    //replace mapping at entry_va with new code page in the process directory only
+    uint32_t old_code_phys = vmm_get_physical_addr(entry_va) & ~0xFFF; //assumes current_directory is cur's dir
+    if (!cur || !cur->page_directory ||
+        vmm_map_page_in_directory(cur->page_directory, entry_va, new_code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
         pmm_free_page(new_code_phys);
         #if LOG_PROC
-        serial_write_string("[EXEC] map code in kernel dir failed\n");
+        serial_write_string("[EXEC] map code in proc dir failed\n");
         #endif
         return -1;
     }
-
-    //map into the process's user directory for future per-process CR3 use
-    process_t* cur = process_get_current();
-    if (cur && cur->page_directory) {
-        (void)vmm_map_page_in_directory(cur->page_directory, entry_va, new_code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
-    }
+    #if LOG_PROC
+    serial_write_string("[EXEC] mapped code at entry_va=0x\n");
+    serial_printf("%x", entry_va);
+    serial_write_string(" phys=0x\n");
+    serial_printf("%x", new_code_phys);
+    serial_write_string("\n");
+    #endif
 
     //free old code phys if it existed and differs
     if (old_code_phys && old_code_phys != new_code_phys) {
@@ -410,16 +455,21 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     }
     uint32_t ustack_va = ustack_top - 0x1000;
     uint32_t old_stack_phys = vmm_get_physical_addr(ustack_va) & ~0xFFF;
-    if (vmm_map_page(ustack_va, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+    //map the user stack only into the process directory
+    if (vmm_map_page_in_directory(cur->page_directory, ustack_va, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
         pmm_free_page(new_stack_phys);
         #if LOG_PROC
-        serial_write_string("[EXEC] map user stack (kernel dir) failed\n");
+        serial_write_string("[EXEC] map user stack (proc dir) failed\n");
         #endif
         return -1;
     }
-    if (cur && cur->page_directory) {
-        (void)vmm_map_page_in_directory(cur->page_directory, ustack_va, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
-    }
+    #if LOG_PROC
+    serial_write_string("[EXEC] mapped stack va=0x\n");
+    serial_printf("%x", ustack_va);
+    serial_write_string(" phys=0x\n");
+    serial_printf("%x", new_stack_phys);
+    serial_write_string("\n");
+    #endif
     if (old_stack_phys && old_stack_phys != new_stack_phys) {
         pmm_free_page(old_stack_phys);
     }
@@ -514,9 +564,17 @@ int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[])
     }
 
     #if LOG_PROC
-    serial_write_string("[EXEC] Success\n");
+    serial_write_string("[EXEC] Success, jumping to user EIP=0x\n");
+    serial_printf("%x", entry_va);
+    serial_write_string(" ESP=0x\n");
+    serial_printf("%x", sp);
+    serial_write_string("\n");
     #endif
-    //jump directly to user mode at the new entry execve() does not return on success
+    //ensure CR3 is set to the current process directory before jumping
+    vmm_switch_directory(cur->page_directory);
+    //clear in-kernel flag since we are not returning through the syscall exit path
+    syscall_mark_exit();
+    //jump directly to user mode at the new entry; execve() does not return on success
     switch_to_user_mode(entry_va, sp);
     //not reached
     return -1;
