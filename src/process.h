@@ -72,6 +72,9 @@ typedef struct process {
     //controlling TTY and its per-process mode
     struct device* tty;              //controlling TTY device (e.g., tty0)
     uint32_t tty_mode;               //TTY mode bits (see drivers/tty.h)
+
+    //current working directory (absolute normalized path)
+    char cwd[256];
 } process_t;
 
 //process manager functions

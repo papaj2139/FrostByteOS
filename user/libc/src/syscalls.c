@@ -26,6 +26,21 @@
 #define SYS_MMAP    168
 #define SYS_MUNMAP  169
 #define SYS_TIME    170
+#define SYS_CHDIR   171
+#define SYS_GETCWD  172
+#define SYS_CLOCK_GETTIME 173
+#define SYS_GETTIMEOFDAY  174
+#define SYS_NANOSLEEP     175
+
+typedef struct { 
+    int tv_sec; 
+    int tv_nsec; 
+} timespec32_t;
+
+ typedef struct { 
+    int tv_sec; 
+    int tv_usec; 
+} timeval32_t;
 
 static inline int syscall3(int n, int a, int b, int c) {
     int ret;
@@ -162,4 +177,26 @@ int munmap(void* addr, size_t length) {
 
 int time(void) {
     return syscall0(SYS_TIME);
+}
+
+int chdir(const char* path) {
+    return syscall1(SYS_CHDIR, (int)path);
+}
+
+char* getcwd(char* buf, size_t size) {
+    int r = syscall2(SYS_GETCWD, (int)buf, (int)size);
+    if (r < 0) return (char*)0;
+    return buf;
+}
+
+int clock_gettime(int clk_id, void* ts_out) {
+    return syscall2(SYS_CLOCK_GETTIME, clk_id, (int)ts_out);
+}
+
+int gettimeofday(void* tv_out, void* tz_ignored) {
+    return syscall2(SYS_GETTIMEOFDAY, (int)tv_out, (int)tz_ignored);
+}
+
+int nanosleep(const void* req_ts, void* rem_ts) {
+    return syscall2(SYS_NANOSLEEP, (int)req_ts, (int)rem_ts);
 }

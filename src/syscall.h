@@ -28,6 +28,11 @@
 #define SYS_MMAP    168
 #define SYS_MUNMAP  169
 #define SYS_TIME    170
+#define SYS_CHDIR   171
+#define SYS_GETCWD  172
+#define SYS_CLOCK_GETTIME 173
+#define SYS_GETTIMEOFDAY  174
+#define SYS_NANOSLEEP     175
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -68,5 +73,10 @@ int32_t sys_readdir_fd(int32_t fd, uint32_t index, char* name_buf, uint32_t buf_
 int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot, uint32_t flags);
 int32_t sys_munmap(uint32_t addr, uint32_t length);
 int32_t sys_time(void);
+int32_t sys_chdir(const char* path);
+int32_t sys_getcwd(char* buf, uint32_t bufsize);
+int32_t sys_clock_gettime(uint32_t clock_id, void* ts_out);
+int32_t sys_gettimeofday(void* tv_out, void* tz_ignored);
+int32_t sys_nanosleep(const void* req_ts, void* rem_ts);
 
 #endif

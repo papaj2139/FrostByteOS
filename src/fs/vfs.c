@@ -216,6 +216,66 @@ int vfs_path_compare(const char* path1, const char* path2) {
     return strcmp(path1, path2) == 0;
 }
 
+//normalize 'path' against base (if relative) resolving '.' and '..' components
+//the result is always an absolute path beginning with '/' returns 0 on success -1 on overflow/invalid
+static int vfs_push_seg(char segs[][64], int* segc, const char* s, size_t len) {
+    if (!s || !segc) return -1;
+    if (len == 0) return 0;
+    if (*segc >= (int)(32)) return -1;
+    if (len >= 64) len = 63;
+    memcpy(segs[*segc], s, len);
+    segs[*segc][len] = '\0';
+    (*segc)++;
+    return 0;
+}
+
+static void vfs_parse_into(char segs[][64], int* segc, const char* p) {
+    if (!p) return;
+    while (*p == '/') p++;
+    while (*p) {
+        const char* start = p;
+        while (*p && *p != '/') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0) { while (*p == '/') p++; continue; }
+        if (len == 1 && start[0] == '.') {
+            //skip
+        } else if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (*segc > 0) (*segc)--; //pop
+        } else {
+            vfs_push_seg(segs, segc, start, len);
+        }
+        while (*p == '/') p++;
+    }
+}
+
+int vfs_normalize_path(const char* base, const char* path, char* out, size_t outsz) {
+    if (!path || !out || outsz == 0) return -1;
+    char segs[32][64];
+    int segc = 0;
+    if (path[0] == '/') {
+        vfs_parse_into(segs, &segc, path);
+    } else {
+        const char* b = (base && base[0]) ? base : "/";
+        if (b[0] == '/') vfs_parse_into(segs, &segc, b);
+        vfs_parse_into(segs, &segc, path);
+    }
+    size_t pos = 0;
+    if (pos < outsz) out[pos++] = '/'; else return -1;
+    if (segc == 0) { if (pos < outsz) { out[pos] = '\0'; return 0; } else return -1; }
+    for (int i = 0; i < segc; i++) {
+        size_t sl = strlen(segs[i]);
+        if (pos + sl >= outsz) return -1;
+        memcpy(&out[pos], segs[i], sl); pos += sl;
+        if (i != segc - 1) {
+            if (pos + 1 >= outsz) return -1;
+            out[pos++] = '/';
+        }
+    }
+    if (pos >= outsz) return -1;
+    out[pos] = '\0';
+    return 0;
+}
+
 //find a mount point that matches the given path
 static vfs_mount_t* vfs_find_mount(const char* path) {
     if (!path) return NULL;
@@ -475,8 +535,14 @@ static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth) {
                             if (nl > 0 && newpath[nl-1] != '/') strncat(newpath, "/", sizeof(newpath) - nl - 1);
                             strncat(newpath, rest, sizeof(newpath) - strlen(newpath) - 1);
                         }
+                        //normalize composed path to fold any '.'/'..' before recursing
+                        char norm[1024];
+                        if (vfs_normalize_path("/", newpath, norm, sizeof(norm)) != 0) {
+                            vfs_close(child);
+                            return NULL;
+                        }
                         vfs_close(child);
-                        return vfs_resolve_path_internal(newpath, depth + 1);
+                        return vfs_resolve_path_internal(norm, depth + 1);
                     }
                 }
                 current_node = child;

@@ -105,7 +105,14 @@ int main(int argc, char** argv, char** envp) {
     print("FrostByte Shell\n");
     char buf[256];
     for (;;) {
-        print("fbsh> ");
+        char cwd[256];
+        cwd[0] = 0;
+        if (getcwd(cwd, sizeof(cwd))) {
+            print(cwd);
+            print("> ");
+        } else {
+            print("fbsh> ");
+        }
         int n = read(0, buf, sizeof(buf) - 1);
         if (n <= 0) continue;
         buf[n] = 0;
@@ -146,11 +153,29 @@ int main(int argc, char** argv, char** envp) {
             continue;
         }
 
-        //try to execute command
+        //tokenize
         char* av[16];
         int ac = split_args(s, av, 16);
-        if (ac > 0) {
-            run_command(av, envp);
+        if (ac <= 0) continue;
+
+        if (strcmp(av[0], "pwd") == 0) {
+            char cwdbuf[256];
+            if (getcwd(cwdbuf, sizeof(cwdbuf))) {
+                print(cwdbuf); print("\n");
+            } else {
+                print("/\n");
+            }
+            continue;
         }
+        if (strcmp(av[0], "cd") == 0) {
+            const char* target = (ac > 1) ? av[1] : "/";
+            if (chdir(target) != 0) {
+                print("cd: failed\n");
+            }
+            continue;
+        }
+
+        //try to execute external command
+        run_command(av, envp);
     }
 }

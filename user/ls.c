@@ -6,7 +6,7 @@ static void putc1(char c) { write(1, &c, 1); }
 
 int main(int argc, char** argv, char** envp) {
     (void)envp;
-    const char* path = "/";
+    const char* path = ".";
     if (argc > 1 && argv && argv[1] && argv[1][0]) {
         path = argv[1];
     }

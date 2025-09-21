@@ -45,6 +45,8 @@ void process_init(void) {
     kernel_proc->page_directory = vmm_get_kernel_directory();
     kernel_proc->priority = 0;
     kernel_proc->time_slice = TIME_SLICE_TICKS;
+    //kernel current working directory is root
+    strcpy(kernel_proc->cwd, "/");
 
     //allocate a dedicated kernel stack and initialize kernel CPU context
     void* kstk_base = kmalloc(KERNEL_STACK_SIZE);
@@ -160,6 +162,13 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
     proc->state = PROC_EMBRYO;
     strncpy(proc->name, name, PROCESS_NAME_MAX - 1);
     proc->priority = 1;  //default priority
+    //inherit cwd from parent if available else set to '/'
+    if (current_process && current_process->cwd[0]) {
+        strncpy(proc->cwd, current_process->cwd, sizeof(proc->cwd) - 1);
+        proc->cwd[sizeof(proc->cwd) - 1] = '\0';
+    } else {
+        strcpy(proc->cwd, "/");
+    }
     proc->time_slice = TIME_SLICE_TICKS;
     
     //set up memory space

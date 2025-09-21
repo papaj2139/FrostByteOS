@@ -13,6 +13,7 @@ typedef enum {
     DEVFS_NODE_ZERO,
     DEVFS_NODE_KMSG,
     DEVFS_NODE_RANDOM,
+    DEVFS_NODE_URANDOM,
     DEVFS_NODE_DEVICE, //generic device backed by device_manager
 } devfs_node_kind_t;
 
@@ -92,6 +93,21 @@ static int devfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* bu
                 buffer[i] = (char)(s & 0xFF);
             }
             rng_state = s;
+            return (int)size;
+        }
+        case DEVFS_NODE_URANDOM: {
+            //same as RANDOM non-blocking PRNG
+            static uint32_t rng_state2 = 0;
+            if (rng_state2 == 0) {
+                rng_state2 = (uint32_t)timer_get_ticks() ^ 0xC3C3C3C3u;
+                if (rng_state2 == 0) rng_state2 = 0x87654321u;
+            }
+            uint32_t s = rng_state2;
+            for (uint32_t i = 0; i < size; i++) {
+                s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                buffer[i] = (char)(s & 0xFF);
+            }
+            rng_state2 = s;
             return (int)size;
         }
         case DEVFS_NODE_DEVICE:
@@ -193,8 +209,12 @@ static int devfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
         *out = devfs_make_node("random", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_RANDOM, NULL, node);
         return *out ? 0 : -1;
     }
+    if (index == 4) {
+        *out = devfs_make_node("urandom", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_URANDOM, NULL, node);
+        return *out ? 0 : -1;
+    }
     //enumerate devices from device manager
-    uint32_t di = index - 4;
+    uint32_t di = index - 5;
     device_t* dev = NULL;
     if (device_enumerate(di, &dev) != 0 || !dev) return -1;
     *out = devfs_make_node(dev->name, VFS_FILE_TYPE_DEVICE, DEVFS_NODE_DEVICE, dev, node);
@@ -218,6 +238,10 @@ static int devfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) {
     if (strcmp(name, "random") == 0) { 
         *out = devfs_make_node("random", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_RANDOM, NULL, node); 
         return *out ? 0 : -1; 
+    }
+    if (strcmp(name, "urandom") == 0) {
+        *out = devfs_make_node("urandom", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_URANDOM, NULL, node);
+        return *out ? 0 : -1;
     }
     //lookup device by name
     device_t* dev = device_find_by_name(name);

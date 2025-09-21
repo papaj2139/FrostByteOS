@@ -2,6 +2,7 @@
 #define VFS_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "../device_manager.h"
 
 //file types
@@ -106,6 +107,8 @@ const vfs_mount_t* vfs_get_mounts(void);
 char* vfs_get_parent_path(const char* path);
 char* vfs_get_basename(const char* path);
 int vfs_path_compare(const char* path1, const char* path2);
+//normalize 'path' against base (if path is relative) resolving '.' and '..' into out
+int vfs_normalize_path(const char* base, const char* path, char* out, size_t outsz);
 
 //root node
 extern vfs_node_t* vfs_root;

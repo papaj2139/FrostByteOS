@@ -29,22 +29,115 @@
 #define MMAP_SCAN_END   0x7F000000u   //keep under 2GiB to avoid sign issues
 #define USER_HEAP_BASE 0x03000000u
 
+static const int mdays_norm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+
+//timekeeping base captured at first use
+static uint64_t g_boot_epoch = 0;     //seconds since epoch at boot
+static uint64_t g_boot_ticks = 0;     //timer ticks at the moment of boot capture
+static uint32_t g_hz_cached = 0;      //timer frequency (ticks per second)
+
+//32-bit user ABI for timespec/timeval structures
+typedef struct { 
+    uint32_t tv_sec; 
+    uint32_t tv_nsec; 
+} timespec32_t;
+
+typedef struct { 
+    uint32_t tv_sec; 
+    uint32_t tv_usec; 
+} timeval32_t;
 
 //external assembly handler
 extern void syscall_handler_asm(void);
+
+//divide 64-bit unsigned by 32-bit unsigned return quotient store remainder
+static uint64_t udivmod_u64_u32(uint64_t n, uint32_t d, uint32_t* rem)
+{
+    //simple binary long division
+    uint64_t q = 0;
+    uint64_t r = 0;
+    for (int i = 63; i >= 0; --i) {
+        r = (r << 1) | ((n >> i) & 1ull);
+        if (r >= d) { r -= d; q |= (1ull << i); }
+    }
+    if (rem) *rem = (uint32_t)r;
+    return q;
+}
 
 //compute UNIX epoch seconds from RTC time (naive and UTC assumption)
 static int is_leap(unsigned y) { 
     return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0); 
 }
-static const int mdays_norm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+
+//forward declaration
+static int normalize_user_path(const char* in, char* out, size_t outsz);
+
+int32_t sys_chdir(const char* path) {
+    if (!path) return -1;
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    vfs_node_t* node = vfs_resolve_path(abspath);
+    if (!node) return -1;
+    int ok = (node->type == VFS_FILE_TYPE_DIRECTORY);
+    vfs_close(node);
+    if (!ok) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    strncpy(cur->cwd, abspath, sizeof(cur->cwd) - 1);
+    cur->cwd[sizeof(cur->cwd) - 1] = '\0';
+    return 0;
+}
+
+int32_t sys_getcwd(char* buf, uint32_t bufsize) {
+    if (!buf || bufsize == 0) return -1;
+    process_t* cur = process_get_current();
+    if (!cur || !cur->cwd[0]) {
+        if (bufsize < 2) return -1;
+        buf[0] = '/'; buf[1] = '\0';
+        return 0;
+    }
+    size_t len = strlen(cur->cwd);
+    if (len + 1 > bufsize) return -1;
+    memcpy(buf, cur->cwd, len + 1);
+    return 0;
+}
+
+static uint64_t rtc_to_epoch_seconds(void) {
+    rtc_time_t t;
+    if (!rtc_read(&t)) return 0;
+    unsigned y = t.year;
+    unsigned m = t.month;
+    unsigned d = t.day;
+    unsigned hh = t.hour;
+    unsigned mm = t.minute;
+    unsigned ss = t.second;
+    if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return 0;
+    uint64_t days = 0;
+    for (unsigned yr = 1970; yr < y; ++yr) days += is_leap(yr) ? 366 : 365;
+    for (unsigned i = 1; i < m; ++i) {
+        days += mdays_norm[i-1];
+        if (i == 2 && is_leap(y)) days += 1;
+    }
+    days += (d - 1);
+    uint64_t secs = days * 86400ull + hh * 3600ull + mm * 60ull + ss;
+    return secs;
+}
+
+static void ensure_time_base(void) {
+    if (g_hz_cached == 0) g_hz_cached = timer_get_frequency();
+    if (g_boot_epoch == 0) {
+        uint64_t now = rtc_to_epoch_seconds();
+        if (now == 0) now = 1735689600ull; //fallback 2025-01-01 UTC
+        g_boot_epoch = now;
+        g_boot_ticks = timer_get_ticks();
+    }
+}
 
 //mark entry/exit of syscalls for scheduler to restore correct context
 void syscall_mark_enter(void) {
     process_t* cur = process_get_current();
     if (cur) cur->in_kernel = true;
 }
-
 
 //find a free virtual region of 'length' bytes in the current process directory
 static uint32_t mmap_find_free_region(page_directory_t dir, uint32_t length, uint32_t hint_start) {
@@ -69,6 +162,14 @@ static uint32_t mmap_find_free_region(page_directory_t dir, uint32_t length, uin
 void syscall_mark_exit(void) {
     process_t* cur = process_get_current();
     if (cur) cur->in_kernel = false;
+}
+
+//normalize a user-provided path against the current process CWD into an absolute path
+static int normalize_user_path(const char* in, char* out, size_t outsz) {
+    if (!in || !out || outsz == 0) return -1;
+    process_t* cur = process_get_current();
+    const char* base = (cur && cur->cwd[0]) ? cur->cwd : "/";
+    return vfs_normalize_path(base, in, out, outsz);
 }
 
 //initialize syscall system
@@ -205,6 +306,16 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_munmap(arg1, arg2);
         case SYS_TIME:
             return sys_time();
+        case SYS_CLOCK_GETTIME:
+            return sys_clock_gettime(arg1, (void*)arg2);
+        case SYS_GETTIMEOFDAY:
+            return sys_gettimeofday((void*)arg1, (void*)arg2);
+        case SYS_NANOSLEEP:
+            return sys_nanosleep((const void*)arg1, (void*)arg2);
+        case SYS_CHDIR:
+            return sys_chdir((const char*)arg1);
+        case SYS_GETCWD:
+            return sys_getcwd((char*)arg1, arg2);
         default:
             print("Unknown syscall\n", 0x0F);
             return -1; //ENOSYS = Function not implemented
@@ -350,8 +461,9 @@ int32_t sys_open(const char* pathname, int32_t flags) {
     } else {
         vfs_flags = VFS_FLAG_READ; //default to read-only
     }
-    
-    vfs_node_t* node = vfs_open(pathname, vfs_flags);
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
+    vfs_node_t* node = vfs_open(abspath, vfs_flags);
     if (!node) {
         return -1;
     }
@@ -364,13 +476,14 @@ int32_t sys_close(int32_t fd) {
 }
 
 int32_t sys_creat(const char* pathname, int32_t mode) {
-    int result = vfs_create(pathname, mode);
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
+    int result = vfs_create(abspath, mode);
     if (result != 0) {
         return -1;
     }
     return sys_open(pathname, 0); //open the file with default flags
 }
-
 
 int32_t sys_getpid(void) {
     process_t* current = process_get_current();
@@ -477,13 +590,15 @@ int32_t sys_fork(void) {
 
 int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[]) {
     if (!pathname) return -1;
+    //normalize path against CWD
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
 
-    int er = elf_execve(pathname, argv, envp);
+    int er = elf_execve(abspath, argv, envp);
     if (er == 0) return 0;   //not returned
     //any failure (including not an ELF) equals error
     return -1;
 }
-
 
 static inline uint32_t page_align_up(uint32_t addr) {
     return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -627,21 +742,26 @@ int32_t sys_ioctl(int32_t fd, uint32_t cmd, void* arg) {
     return file->node->ops->ioctl(file->node, cmd, arg);
 }
 
-
 int32_t sys_unlink(const char* path) {
     if (!path) return -1;
-    return vfs_unlink(path);
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    return vfs_unlink(abspath);
 }
 
 int32_t sys_mkdir(const char* path, int32_t mode) {
     (void)mode; //modes not supported yet
     if (!path) return -1;
-    return vfs_mkdir(path, 0);
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    return vfs_mkdir(abspath, 0);
 }
 
 int32_t sys_rmdir(const char* path) {
     if (!path) return -1;
-    return vfs_rmdir(path);
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    return vfs_rmdir(abspath);
 }
 
 int32_t sys_readdir_fd(int32_t fd, uint32_t index, char* name_buf, uint32_t buf_size, uint32_t* out_type) {
@@ -664,16 +784,19 @@ int32_t sys_readdir_fd(int32_t fd, uint32_t index, char* name_buf, uint32_t buf_
     return 0;
 }
 
-
 int32_t sys_mount(const char* device, const char* mount_point, const char* fs_type) {
     if (!device || !mount_point || !fs_type) return -1;
-    int r = vfs_mount(device, mount_point, fs_type);
+    char mp[VFS_MAX_PATH];
+    if (normalize_user_path(mount_point, mp, sizeof(mp)) != 0) return -1;
+    int r = vfs_mount(device, mp, fs_type);
     return (r == 0) ? 0 : -1;
 }
 
 int32_t sys_umount(const char* mount_point) {
     if (!mount_point) return -1;
-    int r = vfs_unmount(mount_point);
+    char mp[VFS_MAX_PATH];
+    if (normalize_user_path(mount_point, mp, sizeof(mp)) != 0) return -1;
+    int r = vfs_unmount(mp);
     return (r == 0) ? 0 : -1;
 }
 
@@ -764,22 +887,67 @@ int32_t sys_munmap(uint32_t addr, uint32_t length) {
 }
 
 int32_t sys_time(void) {
-    rtc_time_t t;
-    if (!rtc_read(&t)) return -1;
-    unsigned y = t.year;
-    unsigned m = t.month;
-    unsigned d = t.day;
-    unsigned hh = t.hour;
-    unsigned mm = t.minute;
-    unsigned ss = t.second;
-    if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return -1;
-    uint64_t days = 0;
-    for (unsigned yr = 1970; yr < y; ++yr) days += is_leap(yr) ? 366 : 365;
-    for (unsigned i = 1; i < m; ++i) {
-        days += mdays_norm[i-1];
-        if (i == 2 && is_leap(y)) days += 1;
-    }
-    days += (d - 1);
-    uint64_t secs = days * 86400ull + hh * 3600ull + mm * 60ull + ss;
+    ensure_time_base();
+    uint64_t ticks = timer_get_ticks() - g_boot_ticks;
+    uint32_t hz = (g_hz_cached ? g_hz_cached : timer_get_frequency());
+    uint64_t q = 0;
+    if (hz) q = udivmod_u64_u32(ticks, hz, NULL);
+    uint64_t secs = g_boot_epoch + q;
     return (int32_t)secs;
+}
+
+int32_t sys_clock_gettime(uint32_t clock_id, void* ts_out) {
+    if (!ts_out) return -1;
+    ensure_time_base();
+    uint64_t ticks = timer_get_ticks() - g_boot_ticks;
+    uint32_t hz = (g_hz_cached ? g_hz_cached : timer_get_frequency());
+    uint64_t sec = 0, nsec = 0;
+    if (hz == 0) hz = 100; //fallback
+    uint32_t rem32 = 0;
+    sec = udivmod_u64_u32(ticks, hz, &rem32);
+    nsec = udivmod_u64_u32((uint64_t)rem32 * 1000000000u, hz, NULL);
+    if (clock_id == 0) { //CLOCK_REALTIME
+        sec += g_boot_epoch;
+    } else {
+        //CLOCK_MONOTONIC or others treated as monotonic
+    }
+    timespec32_t* ts = (timespec32_t*)ts_out;
+    ts->tv_sec = (uint32_t)sec;
+    ts->tv_nsec = (uint32_t)nsec;
+    return 0;
+}
+
+int32_t sys_gettimeofday(void* tv_out, void* tz_ignored) {
+    (void)tz_ignored;
+    if (!tv_out) return -1;
+    ensure_time_base();
+    uint64_t ticks = timer_get_ticks() - g_boot_ticks;
+    uint32_t hz = (g_hz_cached ? g_hz_cached : timer_get_frequency());
+    if (hz == 0) hz = 100;
+    uint32_t rem32 = 0;
+    uint64_t q = udivmod_u64_u32(ticks, hz, &rem32);
+    uint64_t sec = g_boot_epoch + q;
+    uint64_t usec = udivmod_u64_u32((uint64_t)rem32 * 1000000u, hz, NULL);
+    timeval32_t* tv = (timeval32_t*)tv_out;
+    tv->tv_sec = (uint32_t)sec;
+    tv->tv_usec = (uint32_t)usec;
+    return 0;
+}
+
+int32_t sys_nanosleep(const void* req_ts, void* rem_ts) {
+    (void)rem_ts; //not supporting remainder yet
+    if (!req_ts) return -1;
+    const timespec32_t* ts = (const timespec32_t*)req_ts;
+    uint64_t nsec = (uint64_t)ts->tv_sec * 1000000000ull + (uint64_t)ts->tv_nsec;
+    if (ts->tv_nsec >= 1000000000ull) return -1;
+    uint32_t hz = timer_get_frequency();
+    if (hz == 0) hz = 100;
+    uint32_t ns_rem = 0;
+    uint64_t whole = udivmod_u64_u32(nsec, 1000000000u, &ns_rem);
+    uint64_t ticks = whole * hz;
+    ticks += udivmod_u64_u32((uint64_t)ns_rem * hz, 1000000000u, NULL);
+    if (ticks == 0 && nsec > 0) ticks = 1;
+    if (ticks > 0xFFFFFFFFu) ticks = 0xFFFFFFFFu;
+    process_sleep((uint32_t)ticks);
+    return 0;
 }

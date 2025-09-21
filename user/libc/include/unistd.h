@@ -8,6 +8,21 @@
 #define MAP_ANON    0x1
 #define MAP_FIXED   0x10
 
+//clock IDs
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+
+//32-bit ABI time types
+typedef struct { 
+    int tv_sec; 
+    int tv_nsec; 
+} timespec_t;
+
+typedef struct { 
+    int tv_sec; 
+    int tv_usec; 
+} timeval_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,6 +50,11 @@ int creat(const char* path, int mode);
 int time(void);
 void* mmap(void* addr, size_t length, int prot, int flags);
 int munmap(void* addr, size_t length);
+int chdir(const char* path);
+char* getcwd(char* buf, size_t size);
+int clock_gettime(int clk_id, void* ts_out);      
+int gettimeofday(void* tv_out, void* tz_ignored); 
+int nanosleep(const void* req_ts, void* rem_ts);  
 
 #ifdef __cplusplus
 }
