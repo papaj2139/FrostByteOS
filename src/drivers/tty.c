@@ -3,9 +3,7 @@
 #include "../device_manager.h"
 #include "../drivers/serial.h"
 #include <string.h>
-
-//forward decl from kernel for text output
-void print(char* msg, unsigned char colour);
+#include "../kernel/cga.h"
 
 static device_t g_tty_dev;
 static uint32_t g_tty_mode = (TTY_MODE_CANON | TTY_MODE_ECHO);
@@ -57,7 +55,7 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
         for (;;) {
             unsigned short ev = kbd_getevent();
             if ((ev & 0xFF00u) == 0xE000u) {
-                continue; // skip extended keys in raw for now
+                continue; //skip extended keys in raw for now
             }
             char c = (char)(ev & 0xFF);
             if (c == '\r') c = '\n';

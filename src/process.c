@@ -71,7 +71,7 @@ void process_init(void) {
 }
 
 //translate a VA to PA in a given page directory without switching CR3
-static uint32_t va_to_pa_in_dir(page_directory_t directory, uint32_t va) {
+static __attribute__((unused)) uint32_t va_to_pa_in_dir(page_directory_t directory, uint32_t va) {
     if (!directory) return 0;
     #define PD_INDEX(addr) ((addr) >> 22)
     #define PT_INDEX(addr) (((addr) >> 12) & 0x3FF)
@@ -227,8 +227,8 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         //no longer map the user stack into the kernel directory with per-process
         //CR3 switching the stack lives only in the process address space
         
-        //set up heap
-        proc->heap_start = USER_VIRTUAL_START + 0x100000;  //1MB offset
+        //set up heap: place outside 0..8MB identity region so PDEs can be user-accessible
+        proc->heap_start = 0x03000000;  //USER_HEAP_BASE (must match sys_brk/sbrk)
         proc->heap_end = proc->heap_start;
         
         //initialize CPU context for user mode

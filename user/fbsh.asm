@@ -1,5 +1,5 @@
 [bits 32]
-[org 0x1000000]
+global _start
 
 %define SYS_WRITE 4
 %define SYS_READ  3

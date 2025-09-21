@@ -74,4 +74,7 @@ int device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size);
 int device_write(device_t* device, uint32_t offset, const void* buffer, uint32_t size);
 int device_ioctl(device_t* device, uint32_t cmd, void* arg);
 
+//enumerate devices in registration order returns 0 on success and stores pointer in *out
+int device_enumerate(uint32_t index, device_t** out);
+
 #endif

@@ -100,7 +100,7 @@ static device_t mouse_device;
 
 device_t* mouse_create_device(void) {
     //initialize device structure
-    strcpy(mouse_device.name, "ps2mouse0");
+    strcpy(mouse_device.name, "ps2mouse");
     mouse_device.type = DEVICE_TYPE_INPUT;
     mouse_device.subtype = DEVICE_SUBTYPE_MOUSE;
     mouse_device.status = DEVICE_STATUS_UNINITIALIZED;

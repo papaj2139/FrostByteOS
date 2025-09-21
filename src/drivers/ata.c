@@ -5,6 +5,37 @@
 #include <stdint.h>
 #include <string.h>
 
+//forward declarations
+static int ata_device_init(device_t* device);
+int ata_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size);
+int ata_device_write(device_t* device, uint32_t offset, const void* buffer, uint32_t size);
+int ata_device_ioctl(device_t* device, uint32_t cmd, void* arg);
+void ata_device_cleanup(device_t* device);
+
+//device operations for ATA
+static const device_ops_t ata_ops = {
+    .init = ata_device_init,
+    .read = ata_device_read,
+    .write = ata_device_write,
+    .ioctl = ata_device_ioctl,
+    .cleanup = ata_device_cleanup
+};
+
+//partition device support (primary MBR partitions only)
+typedef struct {
+    device_t* base;       //underlying ATA device
+    uint32_t start_lba;   //starting LBA
+    uint32_t sectors;     //number of sectors
+} ata_part_priv_t;
+
+static device_t ata_devices[4];
+static ata_device_data_t ata_device_data[4];
+static int ata_drive_count = 0;
+static device_t ata_part_devices[16];
+static ata_part_priv_t ata_part_privs[16];
+static int ata_part_count = 0;
+
+
 static void ata_debug(const char* msg) {
     serial_write_string("[ATA] ");
     serial_write_string(msg);
@@ -24,25 +55,80 @@ static void ata_debug_hex(const char* msg, uint32_t value) {
     serial_write_string("\n");
 }
 
-//forward declarations
-static int ata_device_init(device_t* device);
-int ata_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size);
-int ata_device_write(device_t* device, uint32_t offset, const void* buffer, uint32_t size);
-int ata_device_ioctl(device_t* device, uint32_t cmd, void* arg);
-void ata_device_cleanup(device_t* device);
+static int ata_part_init(device_t* d) { 
+    (void)d; 
+    return 0; 
+}
 
-//device operations for ATA
-static const device_ops_t ata_ops = {
-    .init = ata_device_init,
-    .read = ata_device_read,
-    .write = ata_device_write,
-    .ioctl = ata_device_ioctl,
-    .cleanup = ata_device_cleanup
+static int ata_part_read(device_t* d, uint32_t offset, void* buffer, uint32_t size) {
+    ata_part_priv_t* pp = (ata_part_priv_t*)d->private_data;
+    if (!pp || !pp->base) return -1;
+    uint64_t part_bytes = (uint64_t)pp->sectors * 512ull;
+    if ((uint64_t)offset + (uint64_t)size > part_bytes) return -1;
+    uint32_t abs_off = (uint32_t)(pp->start_lba * 512ull + (uint64_t)offset);
+    return device_read(pp->base, abs_off, buffer, size);
+}
+static int ata_part_write(device_t* d, uint32_t offset, const void* buffer, uint32_t size) {
+    ata_part_priv_t* pp = (ata_part_priv_t*)d->private_data;
+    if (!pp || !pp->base) return -1;
+    uint64_t part_bytes = (uint64_t)pp->sectors * 512ull;
+    if ((uint64_t)offset + (uint64_t)size > part_bytes) return -1;
+    uint32_t abs_off = (uint32_t)(pp->start_lba * 512ull + (uint64_t)offset);
+    return device_write(pp->base, abs_off, buffer, size);
+}
+static int ata_part_ioctl(device_t* d, uint32_t cmd, void* arg) { 
+    (void)d; 
+    (void)cmd; 
+    (void)arg; 
+    return -1; 
+}
+static void ata_part_cleanup(device_t* d) { (void)d; }
+
+static const device_ops_t ata_part_ops = {
+    .init = ata_part_init,
+    .read = ata_part_read,
+    .write = ata_part_write,
+    .ioctl = ata_part_ioctl,
+    .cleanup = ata_part_cleanup
 };
 
-static device_t ata_devices[4];
-static ata_device_data_t ata_device_data[4];
-static int ata_drive_count = 0;
+static void ata_register_partitions(device_t* base_dev, int drive_no) {
+    if (ata_part_count >= (int)(sizeof(ata_part_devices)/sizeof(ata_part_devices[0]))) return;
+    //read MBR sector
+    uint8_t mbr[512];
+    if (device_read(base_dev, 0, mbr, 512) != 512) return;
+    if (!(mbr[510] == 0x55 && mbr[511] == 0xAA)) return;
+    //partition table at 446
+    for (int i = 0; i < 4 && ata_part_count < 16; i++) {
+        uint8_t* e = &mbr[446 + i * 16];
+        uint8_t ptype = e[4];
+        uint32_t lba_start = (uint32_t)e[8] | ((uint32_t)e[9] << 8) | ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+        uint32_t sectors = (uint32_t)e[12] | ((uint32_t)e[13] << 8) | ((uint32_t)e[14] << 16) | ((uint32_t)e[15] << 24);
+        if (ptype == 0 || sectors == 0) continue;
+        //create partition device
+        device_t* pd = &ata_part_devices[ata_part_count];
+        ata_part_priv_t* pp = &ata_part_privs[ata_part_count];
+        memset(pd, 0, sizeof(*pd));
+        memset(pp, 0, sizeof(*pp));
+        pp->base = base_dev;
+        pp->start_lba = lba_start;
+        pp->sectors = sectors;
+        pd->private_data = pp;
+        //name: ata<drive_no>p<idx+1>
+        strcpy(pd->name, "ata");
+        char ns[4]; itoa(drive_no, ns); strcat(pd->name, ns); strcat(pd->name, "p");
+        char ps[3]; itoa(i+1, ps); strcat(pd->name, ps);
+        pd->type = DEVICE_TYPE_STORAGE;
+        pd->subtype = DEVICE_SUBTYPE_STORAGE_ATA;
+        pd->status = DEVICE_STATUS_UNINITIALIZED;
+        pd->ops = &ata_part_ops;
+        if (device_register(pd) == 0) {
+            device_init(pd);
+            pd->status = DEVICE_STATUS_READY;
+            ata_part_count++;
+        }
+    }
+}
 
 void ata_init(void) {
     //idk might ad something here laer
@@ -311,9 +397,10 @@ void ata_probe_and_register(void) {
             //try to initialize the device
             if (ata_device_init(dev) == 0) {
                 //device found configure and register it
+                int drive_no = ata_drive_count;
                 strcpy(dev->name, "ata");
                 char num_str[2];
-                itoa(ata_drive_count, num_str);
+                itoa(drive_no, num_str);
                 strcat(dev->name, num_str);
                 
                 dev->type = DEVICE_TYPE_STORAGE;
@@ -324,6 +411,8 @@ void ata_probe_and_register(void) {
 
                 if (device_register(dev) == 0) {
                     device_init(dev); //finalize initialization through device manager
+                    //scan MBR and register primary partitions
+                    ata_register_partitions(dev, drive_no);
                     ata_drive_count++;
                 }
             }

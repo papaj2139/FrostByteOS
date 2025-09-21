@@ -36,6 +36,7 @@ typedef struct process {
     uint32_t ppid;                   //parent process ID
     proc_state_t state;              //process state
     char name[PROCESS_NAME_MAX];     //process name
+    char cmdline[128];               //argv[0] or command name (for /proc/<pid>/cmdline)
     
     //MM
     page_directory_t page_directory; //virtual memory space

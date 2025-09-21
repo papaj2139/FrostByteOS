@@ -1,9 +1,28 @@
 #include "serial.h"
 #include "../io.h"
+#include "../device_manager.h"
 #include <string.h>
 #include <stdarg.h>
+#include "../kernel/klog.h"
 
 static uint16_t serial_port = SERIAL_COM1_BASE;
+static device_t g_serial_dev;
+
+//forward declarations for device ops
+static int serial_dev_init(struct device* d);
+static int serial_dev_read(struct device* d, uint32_t off, void* buf, uint32_t sz);
+static int serial_dev_write(struct device* d, uint32_t off, const void* buf, uint32_t sz);
+static int serial_dev_ioctl(struct device* d, uint32_t cmd, void* arg);
+static void serial_dev_cleanup(struct device* d);
+
+static const device_ops_t serial_ops = {
+    .init = serial_dev_init,
+    .read = serial_dev_read,
+    .write = serial_dev_write,
+    .ioctl = serial_dev_ioctl,
+    .cleanup = serial_dev_cleanup,
+};
+
 
 int serial_init(void) {
     //disable all interrupts
@@ -46,6 +65,11 @@ int serial_is_transmit_fifo_empty(uint16_t com) {
     return inb(SERIAL_LINE_STATUS_PORT(com)) & 0x20;
 }
 
+static inline int serial_is_receive_ready(uint16_t com) {
+    //LSR bit 0 = data ready (at least one byte in RX buffer)
+    return inb(SERIAL_LINE_STATUS_PORT(com)) & 0x01;
+}
+
 void serial_write_char(char c) {
     //wait for transmit to be ready
     while (serial_is_transmit_fifo_empty(serial_port) == 0);
@@ -56,11 +80,13 @@ void serial_write_char(char c) {
 
 void serial_write_string(const char* str) {
     if (!str) return;
-    
-    while (*str) {
-        serial_write_char(*str);
-        str++;
+    const char* p = str;
+    size_t n = strlen(str);
+    for (size_t i = 0; i < n; ++i) {
+        serial_write_char(p[i]);
     }
+    //mirror into kernel log
+    klog_write(p, n);
 }
 
 void serial_printf(const char* format, ...) {
@@ -151,4 +177,47 @@ void serial_printf(const char* format, ...) {
     serial_write_string(buffer);
     
     va_end(args);
+}
+
+//device manager integration for /dev/serial0
+static int serial_dev_init(struct device* d) {
+    (void)d; return serial_init();
+}
+static int serial_dev_read(struct device* d, uint32_t off, void* buf, uint32_t sz) {
+    (void)d; (void)off;
+    if (!buf || sz == 0) return 0;
+    char* out = (char*)buf;
+    uint32_t read = 0;
+    //non-blocking poll read up to sz bytes available in UART RX buffer
+    while (read < sz && serial_is_receive_ready(serial_port)) {
+        out[read++] = (char)inb(SERIAL_DATA_PORT(serial_port));
+    }
+    return (int)read; //may be 0 if no data available
+}
+static int serial_dev_write(struct device* d, uint32_t off, const void* buf, uint32_t sz) {
+    (void)d; (void)off;
+    const char* p = (const char*)buf;
+    for (uint32_t i = 0; i < sz; i++) serial_write_char(p[i]);
+    return (int)sz;
+}
+static int serial_dev_ioctl(struct device* d, uint32_t cmd, void* arg) { 
+    (void)d; (void)cmd; (void)arg; 
+    return -1; 
+}
+static void serial_dev_cleanup(struct device* d) { (void)d; }
+
+int serial_register_device(void) {
+    memset(&g_serial_dev, 0, sizeof(g_serial_dev));
+    strcpy(g_serial_dev.name, "serial0");
+    g_serial_dev.type = DEVICE_TYPE_OUTPUT;
+    g_serial_dev.subtype = DEVICE_SUBTYPE_GENERIC;
+    g_serial_dev.status = DEVICE_STATUS_UNINITIALIZED;
+    g_serial_dev.ops = &serial_ops;
+    if (device_register(&g_serial_dev) != 0) return -1;
+    if (device_init(&g_serial_dev) != 0) { 
+        device_unregister(g_serial_dev.device_id); 
+        return -1; 
+    }
+    g_serial_dev.status = DEVICE_STATUS_READY;
+    return 0;
 }

@@ -37,6 +37,8 @@ struct vfs_operations {
     int (*finddir)(vfs_node_t* node, const char* name, vfs_node_t** out);
     int (*get_size)(vfs_node_t* node);
     int (*ioctl)(vfs_node_t* node, uint32_t request, void* arg);
+    int (*readlink)(vfs_node_t* node, char* buf, uint32_t bufsize);
+    int (*symlink)(vfs_node_t* parent, const char* name, const char* target);
 };
 
 //VFS node structure
@@ -58,8 +60,9 @@ struct vfs_node {
 struct vfs_mount {
     char mount_point[VFS_MAX_PATH];  //mount point path
     vfs_node_t* root;                //root node of mounted filesystem
-    vfs_node_t* mount_device;        //device node this filesystem is on
+    device_t* mount_device;          //physical device this filesystem is on (NULL for virtual FS)
     void* private_data;              //filesystem-specific mount data
+    char fs_name[32];                //filesystem type name
     vfs_mount_t* next;               //next mount in the list
 };
 
@@ -83,6 +86,8 @@ int vfs_create(const char* path, uint32_t flags);
 int vfs_unlink(const char* path);
 int vfs_mkdir(const char* path, uint32_t flags);
 int vfs_rmdir(const char* path);
+int vfs_symlink(const char* target, const char* linkpath);
+int vfs_readlink(const char* path, char* buf, uint32_t bufsize);
 int vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out);
 int vfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out);
 int vfs_get_size(vfs_node_t* node);
@@ -91,8 +96,11 @@ int vfs_register_fs(const char* name, vfs_operations_t* ops);
 vfs_node_t* vfs_create_node(const char* name, uint32_t type, uint32_t flags);
 void vfs_destroy_node(vfs_node_t* node);
 
-// Set the root filesystem handlers directly (used by initramfs)
+//set the root filesystem handlers directly (used by initramfs)
 int vfs_set_root_ops(vfs_operations_t* ops, void* private_data);
+
+//enumerate current mounts (read-only) returns head of internal list
+const vfs_mount_t* vfs_get_mounts(void);
 
 //path manipulation functions
 char* vfs_get_parent_path(const char* path);

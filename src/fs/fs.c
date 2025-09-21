@@ -1,6 +1,8 @@
 #include "fs.h"
 #include "../drivers/serial.h"
 #include "fat16_vfs.h"
+#include "devfs.h"
+#include "procfs.h"
 
 static void fs_debug(const char* msg) {
     serial_write_string("[FS] ");
@@ -67,12 +69,30 @@ int fs_list_directory(filesystem_t* fs) {
 }
 
 int fs_vfs_init(void) {
+    int ok = 0;
     //register FAT16 filesystem with VFS
-    if (vfs_register_fs("fat16", &fat16_vfs_ops) != 0) {
+    if (vfs_register_fs("fat16", &fat16_vfs_ops) == 0) {
+        fs_debug("FAT16 registered with VFS");
+        ok = 1;
+    } else {
         fs_debug("Failed to register FAT16 with VFS");
-        return -1;
     }
 
-    fs_debug("FAT16 registered with VFS");
-    return 0;
+    //register DevFS
+    if (vfs_register_fs("devfs", &devfs_ops) == 0) {
+        fs_debug("DevFS registered with VFS");
+        ok = 1;
+    } else {
+        fs_debug("Failed to register DevFS with VFS");
+    }
+
+    //register ProcFS
+    if (vfs_register_fs("procfs", &procfs_ops) == 0) {
+        fs_debug("ProcFS registered with VFS");
+        ok = 1;
+    } else {
+        fs_debug("Failed to register ProcFS with VFS");
+    }
+
+    return ok ? 0 : -1;
 }

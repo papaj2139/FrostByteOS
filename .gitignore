@@ -7,3 +7,5 @@ isodir/
 *.img
 *.txt
 src/fs/*_blob.h
+*.cpio
+initramfs_root/

@@ -1,7 +1,9 @@
 #include "vfs.h"
 #include "fs.h"
 #include "../drivers/serial.h"
+#include "../debug.h"
 #include <string.h>
+#include <stdbool.h>
 #include "../libc/stdlib.h"
 #include "../mm/heap.h"
 
@@ -18,19 +20,27 @@ typedef struct vfs_fs_type {
 static vfs_fs_type_t* registered_fs_types = NULL;
 static vfs_mount_t* mount_list = NULL;
 
+static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth);
+
 //VFS debug function
 static void vfs_debug(const char* msg) {
+    (void)msg;
+#if LOG_VFS
     serial_write_string("[VFS] ");
     serial_write_string(msg);
     serial_write_string("\n");
+#endif
 }
 
 static void vfs_debug_path(const char* prefix, const char* path) {
+    (void)prefix; (void)path;
+#if LOG_VFS
     serial_write_string("[VFS] ");
     serial_write_string(prefix);
     serial_write_string(": ");
     serial_write_string(path);
     serial_write_string("\n");
+#endif
 }
 
 //initialize VFS
@@ -134,15 +144,10 @@ void vfs_destroy_node(vfs_node_t* node) {
         node->ops->close(node);
     }
 
-    //free private data if needed
-    if (node->private_data) {
-        kfree(node->private_data);
-    }
-
     kfree(node);
 }
 
-// Allow setting root node ops and private data directly (e.g., for initramfs)
+//allow setting root node ops and private data directly (e.x for initramfs)
 int vfs_set_root_ops(vfs_operations_t* ops, void* private_data) {
     if (!vfs_root || !ops) return -1;
     vfs_root->ops = ops;
@@ -215,15 +220,25 @@ int vfs_path_compare(const char* path1, const char* path2) {
 static vfs_mount_t* vfs_find_mount(const char* path) {
     if (!path) return NULL;
 
-    vfs_mount_t* current = mount_list;
-    while (current) {
-        //check if this mount point matches the path
-        if (vfs_path_compare(current->mount_point, path)) {
-            return current;
+    //choose the longest mount point that is a prefix of 'path'
+    vfs_mount_t* best = NULL;
+    size_t best_len = 0;
+    for (vfs_mount_t* cur = mount_list; cur; cur = cur->next) {
+        const char* mp = cur->mount_point;
+        size_t ml = strlen(mp);
+        if (ml == 0) continue;
+        //'/' matches everything but has length 1 prefer longer matches
+        if (strncmp(path, mp, ml) == 0) {
+            //ensure boundary: either exact match or next char in path is '/'
+            if (path[ml] == '\0' || path[ml] == '/') {
+                if (ml > best_len) { 
+                    best = cur; 
+                    best_len = ml; 
+                }
+            }
         }
-        current = current->next;
     }
-    return NULL;
+    return best;
 }
 
 //mount a filesystem
@@ -237,11 +252,14 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
         return -1;
     }
 
-    //find the device
-    device_t* dev = device_find_by_name(device);
-    if (!dev) {
-        vfs_debug("Device not found");
-        return -1;
+    //find the device optional for virual FS'es
+    device_t* dev = NULL;
+    if (device && strcmp(device, "none") != 0) {
+        dev = device_find_by_name(device);
+        if (!dev) {
+            vfs_debug("Device not found");
+            return -1;
+        }
     }
 
     //allocate mount structure
@@ -256,26 +274,31 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
     strncpy(mount->mount_point, mount_point, sizeof(mount->mount_point) - 1);
     mount->mount_point[sizeof(mount->mount_point) - 1] = '\0';
 
-    //create a filesystem structure
-    filesystem_t* fs = (filesystem_t*)kmalloc(sizeof(filesystem_t));
-    if (!fs) {
-        kfree(mount);
-        vfs_debug("Failed to allocate filesystem structure");
-        return -1;
-    }
-
-    //initialize filesystem
-    if (fs_init(fs, dev) != 0) {
-        kfree(fs);
-        kfree(mount);
-        vfs_debug("Failed to initialize filesystem");
-        return -1;
+    //initialize filesystem for physical filesystems only (require device)
+    bool use_physical_fs = (dev != NULL);
+    filesystem_t* fs = NULL;
+    if (use_physical_fs) {
+        //create a filesystem structure
+        fs = (filesystem_t*)kmalloc(sizeof(filesystem_t));
+        if (!fs) {
+            kfree(mount);
+            vfs_debug("Failed to allocate filesystem structure");
+            return -1;
+        }
+        if (fs_init(fs, dev) != 0) {
+            kfree(fs);
+            kfree(mount);
+            vfs_debug("Failed to initialize filesystem");
+            return -1;
+        }
     }
 
     //create root node for this filesystem
-    mount->root = vfs_create_node(mount_point, VFS_FILE_TYPE_DIRECTORY, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    //virtual filesystems (no backing device) are read-only by default
+    uint32_t root_flags = use_physical_fs ? (VFS_FLAG_READ | VFS_FLAG_WRITE) : VFS_FLAG_READ;
+    mount->root = vfs_create_node(mount_point, VFS_FILE_TYPE_DIRECTORY, root_flags);
     if (!mount->root) {
-        kfree(fs);
+        if (fs) kfree(fs);
         kfree(mount);
         vfs_debug("Failed to create root node");
         return -1;
@@ -284,11 +307,19 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
     //set up the node with filesystem operations
     mount->root->ops = fs_type_entry->ops;
     mount->root->device = dev;
-    mount->root->private_data = fs;
+    mount->root->private_data = use_physical_fs ? (void*)fs : NULL;
     mount->root->mount = mount;
+    //store device for physical FS NULL for virtual
+    mount->mount_device = use_physical_fs ? dev : NULL;
+    //keep a copy at the mount level so we can free it on unmount even if
+    //root->private_data is later replaced by FS-specific directory data
+    mount->private_data = use_physical_fs ? (void*)fs : NULL;
+    //store fs type name
+    memset(mount->fs_name, 0, sizeof(mount->fs_name));
+    strncpy(mount->fs_name, fs_type, sizeof(mount->fs_name) - 1);
 
     //add to mount list
-    mount->next = mount_list;
+    mount->next = mount_list;   
     mount_list = mount;
 
     vfs_debug("Filesystem mounted successfully");
@@ -312,11 +343,13 @@ int vfs_unmount(const char* mount_point) {
             }
 
             //clean up
+            void* saved_fs = current->private_data;
+            void* saved_root_priv = current->root ? current->root->private_data : NULL;
             if (current->root) {
                 vfs_destroy_node(current->root);
             }
-            if (current->private_data) {
-                kfree(current->private_data);
+            if (saved_fs && saved_fs != saved_root_priv) {
+                kfree(saved_fs);
             }
             kfree(current);
 
@@ -329,8 +362,13 @@ int vfs_unmount(const char* mount_point) {
     return -1;
 }
 
-//resolve a path to a VFS node
+//resolve a path to a VFS node (public API)
 vfs_node_t* vfs_resolve_path(const char* path) {
+    return vfs_resolve_path_internal(path, 0);
+}
+
+//internal resolver with symlink following
+static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth) {
     if (!path) {
         return NULL;
     }
@@ -342,28 +380,35 @@ vfs_node_t* vfs_resolve_path(const char* path) {
         return NULL;
     }
 
-    //find the filesystem mounted at the root
-    vfs_mount_t* root_mount = vfs_find_mount("/");
+    //find the best mount for this path (longest prefix)
+    vfs_mount_t* m = vfs_find_mount(path);
     vfs_node_t* current_node = NULL;
-    if (!root_mount) {
-        // Fallback to the generic root node (e.g., initramfs installed via vfs_set_root_ops)
+    const char* p = NULL;
+    if (!m) {
+        //fallback to generic root node (e.x via vfs_set_root_ops)
         if (!vfs_root) return NULL;
         current_node = vfs_root;
         current_node->ref_count++;
+        p = path + 1; //skip leading '/'
     } else {
-        //start traversal from the actual mounted filesystem root
-        current_node = root_mount->root;
+        //start from mounted filesystem root
+        current_node = m->root;
         current_node->ref_count++;
+        size_t ml = strlen(m->mount_point);
+        if (ml <= 1) {
+            p = path + 1; //root mount
+        } else {
+            p = path + ml;
+            while (*p == '/') p++; //skip any extra separators
+        }
     }
 
-    //if path is just "/" it's done
-    if (strcmp(path, "/") == 0) {
+    //if path equals the mount point exactly return its root node
+    if (*p == '\0') {
         return current_node;
     }
 
     //traverse the path component by component
-    const char* p = path + 1; //skip leading slash
-
     while (*p) {
         //find the next component
         const char* end = p;
@@ -389,6 +434,51 @@ vfs_node_t* vfs_resolve_path(const char* path) {
             if (current_node->ops->finddir(current_node, component, &child) == 0) {
                 //found it release the parent and continue with the child
                 vfs_close(current_node); //vfs_close just decrements ref_count
+                //handle symlink
+                if (child && child->type == VFS_FILE_TYPE_SYMLINK) {
+                    if (depth > 8) {
+                        vfs_close(child);
+                        vfs_debug("Symlink recursion limit reached");
+                        return NULL;
+                    }
+                    if (child->ops && child->ops->readlink) {
+                        char target[512];
+                        int rl = child->ops->readlink(child, target, sizeof(target));
+                        if (rl < 0) {
+                            vfs_close(child);
+                            return NULL;
+                        }
+                        target[sizeof(target)-1] = '\0';
+                        //compose new path: target [+ '/' + rest]
+                        const char* rest = end;
+                        while (*rest == '/') rest++;
+                        char newpath[1024];
+                        newpath[0] = '\0';
+                        if (target[0] == '/') {
+                            strncpy(newpath, target, sizeof(newpath) - 1);
+                            newpath[sizeof(newpath)-1] = '\0';
+                        } else {
+                            //prefix up to component start (path .. p)
+                            size_t prefix_len = (size_t)(p - path);
+                            if (prefix_len >= sizeof(newpath)) prefix_len = sizeof(newpath) - 1;
+                            memcpy(newpath, path, prefix_len);
+                            newpath[prefix_len] = '\0';
+                            //ensure trailing slash
+                            size_t nl = strlen(newpath);
+                            if (nl == 0 || newpath[nl-1] != '/') {
+                                if (nl + 1 < sizeof(newpath)) { newpath[nl++] = '/'; newpath[nl] = '\0'; }
+                            }
+                            strncat(newpath, target, sizeof(newpath) - strlen(newpath) - 1);
+                        }
+                        if (*rest) {
+                            size_t nl = strlen(newpath);
+                            if (nl > 0 && newpath[nl-1] != '/') strncat(newpath, "/", sizeof(newpath) - nl - 1);
+                            strncat(newpath, rest, sizeof(newpath) - strlen(newpath) - 1);
+                        }
+                        vfs_close(child);
+                        return vfs_resolve_path_internal(newpath, depth + 1);
+                    }
+                }
                 current_node = child;
             } else {
                 //not found
@@ -409,6 +499,44 @@ vfs_node_t* vfs_resolve_path(const char* path) {
     }
 
     return current_node;
+}
+
+int vfs_symlink(const char* target, const char* linkpath) {
+    if (!target || !linkpath) return -1;
+    //get parent directory
+    char* parent_path = vfs_get_parent_path(linkpath);
+    if (!parent_path) return -1;
+    char* linkname = vfs_get_basename(linkpath);
+    if (!linkname) { 
+        kfree(parent_path); 
+        return -1; 
+    }
+    vfs_node_t* parent = vfs_open(parent_path, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    if (!parent) { 
+        kfree(parent_path); 
+        kfree(linkname); 
+        return -1; 
+    }
+    int r = -1;
+    if (parent->ops && parent->ops->symlink) {
+        r = parent->ops->symlink(parent, linkname, target);
+    }
+    vfs_close(parent);
+    kfree(parent_path);
+    kfree(linkname);
+    return r;
+}
+
+int vfs_readlink(const char* path, char* buf, uint32_t bufsize) {
+    if (!path || !buf || bufsize == 0) return -1;
+    vfs_node_t* node = vfs_resolve_path(path);
+    if (!node) return -1;
+    int r = -1;
+    if (node->type == VFS_FILE_TYPE_SYMLINK && node->ops && node->ops->readlink) {
+        r = node->ops->readlink(node, buf, bufsize);
+    }
+    vfs_close(node);
+    return r;
 }
 
 //open a file or directory
@@ -758,4 +886,9 @@ int vfs_get_size(vfs_node_t* node) {
     }
 
     return node->size;
+}
+
+//expose mounts for read-only iteration (like ProcFS)
+const vfs_mount_t* vfs_get_mounts(void) {
+    return mount_list;
 }

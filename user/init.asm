@@ -1,5 +1,6 @@
 [bits 32]
-[org 0x1000000]
+global _start
+section .text
 
 %define SYS_EXIT   1
 %define SYS_EXECVE 11

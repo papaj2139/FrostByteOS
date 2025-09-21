@@ -11,22 +11,61 @@
 #include "drivers/tty.h"
 #include "process.h"
 #include "drivers/timer.h"
+#include "drivers/rtc.h"
+#include "device_manager.h"
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
 #include "debug.h"
+#include "kernel/elf.h"
+#include "kernel/cga.h"
+#include "kernel/panic.h"
 
-//forward declarations
-void print(char* msg, unsigned char colour);
-void kpanic_msg(const char* reason);
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define MAP_ANON    0x1
+#define MAP_FIXED   0x10
+#define MMAP_SCAN_START 0x04000000u   //avoid low 8MB identity region
+#define MMAP_SCAN_END   0x7F000000u   //keep under 2GiB to avoid sign issues
+#define USER_HEAP_BASE 0x03000000u
+
 
 //external assembly handler
 extern void syscall_handler_asm(void);
+
+//compute UNIX epoch seconds from RTC time (naive and UTC assumption)
+static int is_leap(unsigned y) { 
+    return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0); 
+}
+static const int mdays_norm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
 
 //mark entry/exit of syscalls for scheduler to restore correct context
 void syscall_mark_enter(void) {
     process_t* cur = process_get_current();
     if (cur) cur->in_kernel = true;
 }
+
+
+//find a free virtual region of 'length' bytes in the current process directory
+static uint32_t mmap_find_free_region(page_directory_t dir, uint32_t length, uint32_t hint_start) {
+    (void)dir; //vmm_get_physical_addr uses the currently active directory
+    if (length == 0) return 0;
+    uint32_t start = hint_start ? hint_start : MMAP_SCAN_START;
+    if (start < USER_VIRTUAL_START) start = USER_VIRTUAL_START;
+    if (start & (PAGE_SIZE - 1)) start = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint32_t end_limit = MMAP_SCAN_END;
+    if (end_limit > USER_VIRTUAL_END) end_limit = USER_VIRTUAL_END;
+    //simple first-fit scan
+    for (uint32_t base = start; base + length <= end_limit; base += PAGE_SIZE) {
+        bool ok = true;
+        for (uint32_t off = 0; off < length; off += PAGE_SIZE) {
+            if (vmm_get_physical_addr(base + off) != 0) { ok = false; break; }
+        }
+        if (ok) return base;
+    }
+    return 0;
+}
+
 void syscall_mark_exit(void) {
     process_t* cur = process_get_current();
     if (cur) cur->in_kernel = false;
@@ -41,7 +80,7 @@ void syscall_init(void) {
 }
 
 //capture user-mode return frame at syscall entry so fork() can clone the exact return point
-void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint32_t useresp, uint32_t ss) {
+void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint32_t useresp, uint32_t ss, uint32_t ebp) {
     process_t* cur = process_get_current();
     if (!cur) return;
     cur->context.eip = eip;
@@ -49,6 +88,7 @@ void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint
     cur->context.eflags = eflags;
     cur->context.esp = useresp;
     cur->context.ss = ss;
+    cur->context.ebp = ebp;
 }
 
 //clone user space from src->dst directories (user part only)
@@ -111,14 +151,60 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_sleep(arg1);
         case SYS_FORK:
             return sys_fork();
-        case SYS_EXECVE:
-            return sys_execve((const char*)arg1, (char* const*)arg2, (char* const*)arg3);
+        case SYS_EXECVE: {
+            const char* p = (const char*)arg1;
+            char* const* avp = (char* const*)arg2;
+            char* const* evp = (char* const*)arg3;
+            serial_write_string("[SYS_EXECVE] path ptr=0x");
+            serial_printf("%x", (uint32_t)p);
+            serial_write_string(" path=\"");
+            if (p) serial_write_string(p); else serial_write_string("(null)");
+            serial_write_string("\"\n");
+            serial_write_string("[SYS_EXECVE] argv ptr=0x");
+            serial_printf("%x", (uint32_t)avp);
+            serial_write_string(" envp ptr=0x");
+            serial_printf("%x", (uint32_t)evp);
+            serial_write_string("\n");
+            if (avp) {
+                serial_write_string("[SYS_EXECVE] argv0 ptr=0x");
+                serial_printf("%x", (uint32_t)avp[0]);
+                serial_write_string("\n");
+                if (avp[0]) {
+                    serial_write_string("[SYS_EXECVE] argv0=\"");
+                    serial_write_string(avp[0]);
+                    serial_write_string("\"\n");
+                }
+            }
+            return sys_execve(p, avp, evp);
+        }
         case SYS_WAIT:
             return sys_wait((int32_t*)arg1);
         case SYS_YIELD:
             return sys_yield();
         case SYS_IOCTL:
             return sys_ioctl((int32_t)arg1, arg2, (void*)arg3);
+        case SYS_BRK:
+            return sys_brk(arg1);
+        case SYS_SBRK:
+            return sys_sbrk((int32_t)arg1);
+        case SYS_UNLINK:
+            return sys_unlink((const char*)arg1);
+        case SYS_MKDIR:
+            return sys_mkdir((const char*)arg1, (int32_t)arg2);
+        case SYS_RMDIR:
+            return sys_rmdir((const char*)arg1);
+        case SYS_MOUNT:
+            return sys_mount((const char*)arg1, (const char*)arg2, (const char*)arg3);
+        case SYS_UMOUNT:
+            return sys_umount((const char*)arg1);
+        case SYS_READDIR_FD:
+            return sys_readdir_fd((int32_t)arg1, arg2, (char*)arg3, arg4, (uint32_t*)arg5);
+        case SYS_MMAP:
+            return sys_mmap(arg1, arg2, arg3, arg4);
+        case SYS_MUNMAP:
+            return sys_munmap(arg1, arg2);
+        case SYS_TIME:
+            return sys_time();
         default:
             print("Unknown syscall\n", 0x0F);
             return -1; //ENOSYS = Function not implemented
@@ -148,11 +234,16 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     #endif
     
     if (fd == 1 || fd == 2) {
-        #if LOG_SYSCALL
-        serial_write_string("[SYSCALL] Writing to TTY\n");
-        #endif
-        int written = tty_write(buf, count);
-        return (written < 0) ? written : (int32_t)count;
+        //route stdout/stderr to controlling TTY device
+        process_t* curp = process_get_current();
+        device_t* dev = (curp) ? curp->tty : NULL;
+        if (dev) {
+            int wr = device_write(dev, 0, buf, count);
+            return (wr < 0) ? wr : (int32_t)count;
+        } else {
+            int written = tty_write(buf, count);
+            return (written < 0) ? written : (int32_t)count;
+        }
     }
     
     vfs_file_t* file = fd_get(fd);
@@ -183,7 +274,56 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
         //read from controlling TTY using the current process TTY mode
         process_t* cur = process_get_current();
         uint32_t mode = (cur) ? cur->tty_mode : (TTY_MODE_CANON | TTY_MODE_ECHO);
-        return tty_read_mode(buf, count, mode);
+        device_t* dev = (cur) ? cur->tty : NULL;
+        if (!dev || strcmp(dev->name, "tty0") == 0) {
+            //text console keyboard path
+            return tty_read_mode(buf, count, mode);
+        } else {
+            //serial or other device: implement a minimal line/raw reader via device manager
+            uint32_t pos = 0;
+            char ch;
+            if (mode & TTY_MODE_CANON) {
+                for (;;) {
+                    int r;
+                    //block for first byte
+                    do { 
+                        r = device_read(dev, 0, &ch, 1); 
+                    } while (r <= 0);
+                    if (ch == '\r') ch = '\n';
+                    buf[pos++] = ch;
+                    if (mode & TTY_MODE_ECHO) device_write(dev, 0, &ch, 1);
+                    if (ch == '\n' || pos >= count) return (int32_t)pos;
+                    //drain immediately available without blocking too long
+                    while (pos < count) {
+                        char t;
+                        int rr = device_read(dev, 0, &t, 1);
+                        if (rr <= 0) break;
+                        if (t == '\r') t = '\n';
+                        buf[pos++] = t;
+                        if (mode & TTY_MODE_ECHO) device_write(dev, 0, &t, 1);
+                        if (t == '\n') return (int32_t)pos;
+                    }
+                }
+            } else {
+                //raw mode: block for first byte then return immediately if no more
+                int r;
+                do { 
+                    r = device_read(dev, 0, &ch, 1); 
+                } while (r <= 0);
+                if (ch == '\r') ch = '\n';
+                buf[pos++] = ch;
+                if (mode & TTY_MODE_ECHO) device_write(dev, 0, &ch, 1);
+                while (pos < count) {
+                    char t;
+                    int rr = device_read(dev, 0, &t, 1);
+                    if (rr <= 0) break;
+                    if (t == '\r') t = '\n';
+                    buf[pos++] = t;
+                    if (mode & TTY_MODE_ECHO) device_write(dev, 0, &t, 1);
+                }
+                return (int32_t)pos;
+            }
+        }
     }
     
     vfs_file_t* file = fd_get(fd);
@@ -238,9 +378,9 @@ int32_t sys_getpid(void) {
 }
 
 int32_t sys_sleep(uint32_t seconds) {
-    uint64_t now = timer_get_ticks();
     uint32_t ticks = seconds * 100;
     #if LOG_PROC
+    uint64_t now = timer_get_ticks();
     serial_write_string("[SLEEP] seconds=\n");
     serial_printf("%d", (int)seconds);
     serial_write_string(" ticks=\n");
@@ -304,7 +444,7 @@ int32_t sys_fork(void) {
     //and EAX=0 in the child per POSIX semantics
     child->context.eip = parent->context.eip;      //return point in user space
     child->context.esp = parent->context.esp;      //user stack pointer at syscall entry
-    child->context.ebp = parent->context.esp;      //best-effort (we don't capture exact EBP)
+    child->context.ebp = parent->context.ebp;      //preserve proper frame pointer for local vars
     child->context.cs  = 0x1B;                     //user code segment
     child->context.ss  = 0x23;                     //user stack segment
     child->context.ds = child->context.es = child->context.fs = child->context.gs = 0x23;
@@ -314,6 +454,13 @@ int32_t sys_fork(void) {
     //inherit TTY mode and controlling TTY
     child->tty = parent->tty;
     child->tty_mode = parent->tty_mode;
+
+    //inherit cmdline for /proc/<pid>/cmdline until execve updates it
+    child->cmdline[0] = '\0';
+    if (parent->cmdline[0]) {
+        strncpy(child->cmdline, parent->cmdline, sizeof(child->cmdline) - 1);
+        child->cmdline[sizeof(child->cmdline) - 1] = '\0';
+    }
 
     //ensure parent saved user context reflects fork return value as well
     parent->context.eax = (uint32_t)child->pid;
@@ -329,255 +476,85 @@ int32_t sys_fork(void) {
 }
 
 int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[]) {
-    (void)argv; (void)envp; //not yet used by flat loader
     if (!pathname) return -1;
 
-    //open the target program from VFS
-    vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ);
-    if (!node) {
-        #if LOG_PROC
-        serial_write_string("[EXEC] File not found\n");
-        #endif
-        return -1;
-    }
-
-    int fsize = vfs_get_size(node);
-    #if LOG_PROC
-    serial_write_string("[EXEC] opened file, size=\n");
-    serial_printf("%d", fsize);
-    serial_write_string("\n");
-    #endif
-    if (fsize <= 0) {
-        vfs_close(node);
-        #if LOG_PROC
-        serial_write_string("[EXEC] Invalid file size\n");
-        #endif
-        return -1;
-    }
-    if (fsize > 4096) fsize = 4096; //single-page flat loader for now
-
-    const uint32_t entry_va = 0x01000000;      //program entry VA
-    const uint32_t temp_kmap = 0x00800000;     //temp kernel VA for copying
-    const uint32_t ustack_top = 0x02000000;    //user stack top
-    process_t* cur = process_get_current();
-
-    //allocate a new physical page for code
-    uint32_t new_code_phys = pmm_alloc_page();
-    if (!new_code_phys) {
-        vfs_close(node);
-        #if LOG_PROC
-        serial_write_string("[EXEC] pmm_alloc_page failed for code\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] code phys=0x\n");
-    serial_printf("%x", new_code_phys);
-    serial_write_string("\n");
-    #endif
-
-    //perform temporary mapping and file copy under the kernel directory
-    //disable interrupts to prevent preemption while CR3 is set to kernel dir
-    uint32_t eflags_save;
-    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-    vmm_switch_directory(vmm_get_kernel_directory());
-    if (vmm_map_page(temp_kmap, new_code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        vfs_close(node);
-        pmm_free_page(new_code_phys);
-        #if LOG_PROC
-        serial_write_string("[EXEC] map temp page failed\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] temp map ok at 0x00800000\n");
-    #endif
-
-    //zero and copy program into page
-    memset((void*)temp_kmap, 0, 4096);
-    uint32_t offset = 0;
-    while (offset < (uint32_t)fsize) {
-        int r = vfs_read(node, offset, (uint32_t)(fsize - offset), (char*)((uint8_t*)temp_kmap + offset));
-        #if LOG_PROC
-        serial_write_string("[EXEC] read chunk r=\n");
-        serial_printf("%d", r);
-        serial_write_string(" off=\n");
-        serial_printf("%d", (int)offset);
-        serial_write_string("\n");
-        #endif
-        if (r <= 0) break;
-        offset += (uint32_t)r;
-    }
-    vfs_close(node);
-    vmm_unmap_page_nofree(temp_kmap);
-    //switch back to the current process directory for installing user mappings
-    if (cur && cur->page_directory) {
-        vmm_switch_directory(cur->page_directory);
-    }
-    //restore IF if it was set
-    if (eflags_save & 0x200) __asm__ volatile ("sti");
-    #if LOG_PROC
-    serial_write_string("[EXEC] copied bytes=\n");
-    serial_printf("%d", (int)offset);
-    serial_write_string("\n");
-    #endif
-
-    //replace mapping at entry_va with new code page in the process directory only
-    uint32_t old_code_phys = vmm_get_physical_addr(entry_va) & ~0xFFF; //assumes current_directory is cur's dir
-    if (!cur || !cur->page_directory ||
-        vmm_map_page_in_directory(cur->page_directory, entry_va, new_code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        pmm_free_page(new_code_phys);
-        #if LOG_PROC
-        serial_write_string("[EXEC] map code in proc dir failed\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] mapped code at entry_va=0x\n");
-    serial_printf("%x", entry_va);
-    serial_write_string(" phys=0x\n");
-    serial_printf("%x", new_code_phys);
-    serial_write_string("\n");
-    #endif
-
-    //free old code phys if it existed and differs
-    if (old_code_phys && old_code_phys != new_code_phys) {
-        pmm_free_page(old_code_phys);
-    }
-
-    //create a fresh user stack page and map it
-    uint32_t new_stack_phys = pmm_alloc_page();
-    if (!new_stack_phys) {
-        #if LOG_PROC
-        serial_write_string("[EXEC] alloc user stack failed\n");
-        #endif
-        return -1;
-    }
-    uint32_t ustack_va = ustack_top - 0x1000;
-    uint32_t old_stack_phys = vmm_get_physical_addr(ustack_va) & ~0xFFF;
-    //map the user stack only into the process directory
-    if (vmm_map_page_in_directory(cur->page_directory, ustack_va, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        pmm_free_page(new_stack_phys);
-        #if LOG_PROC
-        serial_write_string("[EXEC] map user stack (proc dir) failed\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] mapped stack va=0x\n");
-    serial_printf("%x", ustack_va);
-    serial_write_string(" phys=0x\n");
-    serial_printf("%x", new_stack_phys);
-    serial_write_string("\n");
-    #endif
-    if (old_stack_phys && old_stack_phys != new_stack_phys) {
-        pmm_free_page(old_stack_phys);
-    }
-
-    //build user stack with argc argv[] envp[] and strings
-    uint32_t sp = ustack_top; //stack grows down
-
-    //count argc and envc
-    int argc = 0;
-    if (argv) {
-        while (argv[argc]) argc++;
-    }
-    int envc = 0;
-    if (envp) {
-        while (envp[envc]) envc++;
-    }
-
-    //calculate total size for strings
-    uint32_t strings_size = 0;
-    for (int i = 0; i < argc; i++) {
-        strings_size += (uint32_t)strlen(argv[i]) + 1;
-    }
-    for (int i = 0; i < envc; i++) {
-        strings_size += (uint32_t)strlen(envp[i]) + 1;
-    }
-
-    //space for vectors: argc + argv pointers + NULL + envp pointers + NULL
-    uint32_t vector_words = 1 + (uint32_t)argc + 1 + (uint32_t)envc + 1;
-    uint32_t vector_bytes = vector_words * 4;
-
-    //ensure it fits in one page (naive check)
-    if (strings_size + vector_bytes + 64 > 4096) {
-        #if LOG_PROC
-        serial_write_string("[EXEC] argv/envp too large for one-page stack\n");
-        #endif
-        return -1;
-    }
-
-    //copy strings to stack and record user pointers
-    uint32_t* argv_user = NULL;
-    uint32_t* envp_user = NULL;
-    if (argc > 0) argv_user = (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)argc);
-    if (envc > 0) envp_user = (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)envc);
-
-    //copy envp strings
-    for (int i = envc - 1; i >= 0; i--) {
-        const char* s = envp[i];
-        uint32_t len = (uint32_t)strlen(s) + 1;
-        sp -= len;
-        memcpy((void*)sp, s, len);
-        envp_user[i] = sp;
-    }
-    //copy argv strings
-    for (int i = argc - 1; i >= 0; i--) {
-        const char* s = argv[i];
-        uint32_t len = (uint32_t)strlen(s) + 1;
-        sp -= len;
-        memcpy((void*)sp, s, len);
-        argv_user[i] = sp;
-    }
-
-    //aign stack to 16 bytes
-    sp &= ~0xF;
-
-    //push envp NULL
-    sp -= 4; *(uint32_t*)sp = 0;
-    //push envp pointers in reverse so they appear in ascending order in memory
-    for (int i = envc - 1; i >= 0; i--) {
-        sp -= 4; *(uint32_t*)sp = envp_user[i];
-    }
-    //push argv NULL
-    sp -= 4; *(uint32_t*)sp = 0;
-    //push argv pointers in reverse
-    for (int i = argc - 1; i >= 0; i--) {
-        sp -= 4; *(uint32_t*)sp = argv_user[i];
-    }
-    //push argc
-    sp -= 4; *(uint32_t*)sp = (uint32_t)argc;
-
-    if (argv_user) kfree(argv_user);
-    if (envp_user) kfree(envp_user);
-
-    //reset process context and TTY defaults
-    if (cur) {
-        strncpy(cur->name, pathname, PROCESS_NAME_MAX - 1);
-        cur->name[PROCESS_NAME_MAX - 1] = '\0';
-        cur->context.eip = entry_va;
-        cur->context.esp = sp;
-        cur->context.ebp = sp;
-        cur->user_eip = entry_va;
-        cur->tty_mode = TTY_MODE_CANON | TTY_MODE_ECHO;
-    }
-
-    #if LOG_PROC
-    serial_write_string("[EXEC] Success, jumping to user EIP=0x\n");
-    serial_printf("%x", entry_va);
-    serial_write_string(" ESP=0x\n");
-    serial_printf("%x", sp);
-    serial_write_string("\n");
-    #endif
-    //ensure CR3 is set to the current process directory before jumping
-    vmm_switch_directory(cur->page_directory);
-    //clear in-kernel flag since we are not returning through the syscall exit path
-    syscall_mark_exit();
-    //jump directly to user mode at the new entry; execve() does not return on success
-    switch_to_user_mode(entry_va, sp);
-    //not reached
+    int er = elf_execve(pathname, argv, envp);
+    if (er == 0) return 0;   //not returned
+    //any failure (including not an ELF) equals error
     return -1;
+}
+
+
+static inline uint32_t page_align_up(uint32_t addr) {
+    return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+}
+
+int32_t sys_brk(uint32_t new_end) {
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory) return -1;
+
+    //initialize heap base on first use
+    if (cur->heap_start == 0 && cur->heap_end == 0) {
+        cur->heap_start = USER_HEAP_BASE;
+        cur->heap_end = USER_HEAP_BASE;
+    }
+
+    uint32_t old_end = cur->heap_end;
+    if (new_end == 0) {
+        //glibc sometimes calls brk(0) to query break return current end as success (0) is ambiguous
+        //we follow linux-like semantics so return 0 on success user queries via sbrk(0)
+        return 0;
+    }
+
+    //prevent setting break below start
+    if (new_end < cur->heap_start) new_end = cur->heap_start;
+
+    uint32_t old_top = page_align_up(old_end);
+    uint32_t new_top = page_align_up(new_end);
+
+    //switch to this process directory for unmap operations
+    vmm_switch_directory(cur->page_directory);
+
+    if (new_top > old_top) {
+        //grow: map new pages
+        for (uint32_t va = old_top; va < new_top; va += PAGE_SIZE) {
+            uint32_t phys = pmm_alloc_page();
+            if (!phys) return -1;
+            if (vmm_map_page_in_directory(cur->page_directory, va, phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+                return -1;
+            }
+            //zero page via temp map
+            const uint32_t TMP = 0x00800000;
+            if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+                memset((void*)TMP, 0, PAGE_SIZE);
+                vmm_unmap_page_nofree(TMP);
+            }
+        }
+    } else if (new_top < old_top) {
+        //shrink: unmap pages beyond new_top (vmm_unmap_page frees the frame)
+        for (uint32_t va = new_top; va < old_top; va += PAGE_SIZE) {
+            if (vmm_get_physical_addr(va)) {
+                vmm_unmap_page(va);
+            }
+        }
+    }
+
+    cur->heap_end = new_end;
+    return 0;
+}
+
+int32_t sys_sbrk(int32_t increment) {
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory) return -1;
+    if (cur->heap_start == 0 && cur->heap_end == 0) {
+        cur->heap_start = USER_HEAP_BASE;
+        cur->heap_end = USER_HEAP_BASE;
+    }
+    uint32_t old_end = cur->heap_end;
+    uint32_t new_end = (increment >= 0) ? (cur->heap_end + (uint32_t)increment)
+                                        : (cur->heap_end - (uint32_t)(-increment));
+    if (sys_brk(new_end) != 0) return -1;
+    return (int32_t)old_end;
 }
 
 int32_t sys_wait(int32_t* status) {
@@ -650,3 +627,159 @@ int32_t sys_ioctl(int32_t fd, uint32_t cmd, void* arg) {
     return file->node->ops->ioctl(file->node, cmd, arg);
 }
 
+
+int32_t sys_unlink(const char* path) {
+    if (!path) return -1;
+    return vfs_unlink(path);
+}
+
+int32_t sys_mkdir(const char* path, int32_t mode) {
+    (void)mode; //modes not supported yet
+    if (!path) return -1;
+    return vfs_mkdir(path, 0);
+}
+
+int32_t sys_rmdir(const char* path) {
+    if (!path) return -1;
+    return vfs_rmdir(path);
+}
+
+int32_t sys_readdir_fd(int32_t fd, uint32_t index, char* name_buf, uint32_t buf_size, uint32_t* out_type) {
+    vfs_file_t* file = fd_get(fd);
+    if (!file || !file->node) return -1;
+    vfs_node_t* node = file->node;
+    if (node->type != VFS_FILE_TYPE_DIRECTORY) return -1;
+    vfs_node_t* child = NULL;
+    int r = vfs_readdir(node, index, &child);
+    if (r != 0 || !child) return -1;
+    //copy name and type out
+    if (name_buf && buf_size > 0) {
+        size_t nlen = strlen(child->name);
+        if (nlen + 1 > buf_size) nlen = buf_size - 1;
+        memcpy(name_buf, child->name, nlen);
+        name_buf[nlen] = '\0';
+    }
+    if (out_type) *out_type = child->type;
+    vfs_close(child);
+    return 0;
+}
+
+
+int32_t sys_mount(const char* device, const char* mount_point, const char* fs_type) {
+    if (!device || !mount_point || !fs_type) return -1;
+    int r = vfs_mount(device, mount_point, fs_type);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_umount(const char* mount_point) {
+    if (!mount_point) return -1;
+    int r = vfs_unmount(mount_point);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot, uint32_t flags) {
+#if LOG_SYSCALL
+    serial_write_string("[MMAP] req addr=0x"); serial_printf("%x", addr);
+    serial_write_string(" len=0x"); serial_printf("%x", length);
+    serial_write_string(" prot=0x"); serial_printf("%x", prot);
+    serial_write_string(" flags=0x"); serial_printf("%x", flags);
+    serial_write_string("\n");
+#endif
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory || length == 0) return -1;
+    //align length up to page size
+    uint32_t len = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    //operate under this process address space
+    vmm_switch_directory(cur->page_directory);
+
+    uint32_t start = 0;
+    if (flags & MAP_FIXED) {
+        //require the specified region to be free
+        start = addr & ~(PAGE_SIZE - 1);
+        if (start < USER_VIRTUAL_START || start + len > USER_VIRTUAL_END) return -1;
+        for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+            if (vmm_get_physical_addr(start + off) != 0) return -1;
+        }
+    } else {
+        uint32_t hint = addr ? (addr & ~(PAGE_SIZE - 1)) : 0;
+        start = mmap_find_free_region(cur->page_directory, len, hint);
+        if (!start) return -1;
+    }
+
+    uint32_t page_flags = PAGE_PRESENT | PAGE_USER | ((prot & PROT_WRITE) ? PAGE_WRITABLE : 0);
+    //map and zero each page
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        uint32_t phys = pmm_alloc_page();
+        if (!phys) {
+            //rollback
+            for (uint32_t roff = 0; roff < off; roff += PAGE_SIZE) {
+                if (vmm_get_physical_addr(start + roff)) vmm_unmap_page(start + roff);
+            }
+            return -1;
+        }
+        if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, page_flags) != 0) {
+            //free this phys and rollback
+            //no mapping was installed for this page just free phys
+            pmm_free_page(phys);
+            for (uint32_t roff = 0; roff < off; roff += PAGE_SIZE) {
+                if (vmm_get_physical_addr(start + roff)) vmm_unmap_page(start + roff);
+            }
+            return -1;
+        }
+        //zero page via temp map
+        const uint32_t TMP = 0x00800000;
+        if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+            memset((void*)TMP, 0, PAGE_SIZE);
+            vmm_unmap_page_nofree(TMP);
+        }
+    }
+#if LOG_SYSCALL
+    serial_write_string("[MMAP] ok start=0x"); serial_printf("%x", (uint32_t)start);
+    serial_write_string(" len=0x"); serial_printf("%x", len);
+    serial_write_string("\n");
+#endif
+    //return start address as int32
+    return (int32_t)start;
+}
+
+int32_t sys_munmap(uint32_t addr, uint32_t length) {
+#if LOG_SYSCALL
+    serial_write_string("[MUNMAP] addr=0x"); serial_printf("%x", addr);
+    serial_write_string(" len=0x"); serial_printf("%x", length);
+    serial_write_string("\n");
+#endif
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory || length == 0) return -1;
+    uint32_t start = addr & ~(PAGE_SIZE - 1);
+    uint32_t len = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (start < USER_VIRTUAL_START || start + len > USER_VIRTUAL_END) return -1;
+    vmm_switch_directory(cur->page_directory);
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        if (vmm_get_physical_addr(start + off)) {
+            vmm_unmap_page(start + off);
+        }
+    }
+    return 0;
+}
+
+int32_t sys_time(void) {
+    rtc_time_t t;
+    if (!rtc_read(&t)) return -1;
+    unsigned y = t.year;
+    unsigned m = t.month;
+    unsigned d = t.day;
+    unsigned hh = t.hour;
+    unsigned mm = t.minute;
+    unsigned ss = t.second;
+    if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return -1;
+    uint64_t days = 0;
+    for (unsigned yr = 1970; yr < y; ++yr) days += is_leap(yr) ? 366 : 365;
+    for (unsigned i = 1; i < m; ++i) {
+        days += mdays_norm[i-1];
+        if (i == 2 && is_leap(y)) days += 1;
+    }
+    days += (d - 1);
+    uint64_t secs = days * 86400ull + hh * 3600ull + mm * 60ull + ss;
+    return (int32_t)secs;
+}

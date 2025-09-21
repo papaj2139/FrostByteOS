@@ -1,5 +1,6 @@
 [bits 32]
-[org 0x1000000]
+global _start
+section .text
 
 %define SYS_EXIT    1
 %define SYS_FORK    2
@@ -8,11 +9,36 @@
 %define SYS_GETPID  20
 %define SYS_SLEEP   162
 %define SYS_EXECVE  11
+%define SYS_BRK     45
+%define SYS_SBRK    69
 
 _start:
     ;print banner
     mov ecx, msg_start
     call print_string
+
+    ;heap test via sbrk: grow by 4096 and write a message
+    mov eax, SYS_SBRK
+    mov ebx, 4096
+    int 0x80                 ;EAX = old break (base of new region)
+    mov esi, eax             ;save pointer
+    ;copy heap_msg -> [esi]
+    mov edi, esi
+    mov ecx, heap_msg
+.heapcpy:
+    mov al, [ecx]
+    mov [edi], al
+    inc ecx
+    inc edi
+    test al, al
+    jne .heapcpy
+    ;print from allocated heap region
+    mov ecx, esi
+    call print_string
+    ;shrink back by 4096
+    mov eax, SYS_SBRK
+    mov ebx, -4096
+    int 0x80
 
     ;fork
     mov eax, SYS_FORK
@@ -164,3 +190,4 @@ msg_child   db 'child: pid ', 0
 msg_forkerr db 'forktest: fork failed', 0x0A, 0
 newline     db 0x0A, 0
 path_sh     db '/bin/sh', 0
+heap_msg    db 'sbrk: heap OK', 0x0A, 0

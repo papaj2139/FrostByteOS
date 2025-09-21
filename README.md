@@ -35,12 +35,30 @@ if you'd like to use i386-elf-gcc
 make CC=i386-elf-gcc
 ```
 
+# Requirements to run
+- a VM or physical machine with BIOS or alternatively UEFI with CSM
+- for real hardware like any PC made since ~1998 should work:
+- 6MB of ram minimum
+- An x86 or amd64 CPU
+- PS/2 keyboard and (optional) mouse
+- VGA-capable GPU
+- (optional) an IDE hard drive
+
+
 # Notes
-- The OS uses a primitive initramfs; during compilation the Makefile assembles 'init.asm' and 'userapp.asm' (the shell) and puts the binary code into header files which the initramfs puts into files at runtime so the kernel can execute them
 - The execution path by default is /bin/init -> /bin/forktest` (to change it to just execute /bin/sh directly change the filename in init.asm, altho forktest does exec /bin/sh anyway)
 - /bin/init just calls exec /bin/sh will expand later
 - Fork() syscall is the WORST thing in this codebase; in general the process manager IS SO unstable its unimaginable
+- Currently only supports BIOS and x86, amd64 and UEFI support will be added in the future.
+- Uses GRUB, will probably create a custom bootloader in the future.
+- Uses ELF32 for binaries
 
+# TODO
+- Add UEFI support
+- Add SATA support
+- Add USB support
+- Premptive multitasking (rn cooperative)
+- Improve scheduler
 
 # Credits
 Special thanks to:

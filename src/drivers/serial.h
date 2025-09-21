@@ -26,6 +26,9 @@ void serial_write_char(char c);
 void serial_write_string(const char* str);
 void serial_printf(const char* format, ...);
 
+//register a serial dvice with device manager returns 0 on success
+int serial_register_device(void);
+
 //macros
 #define DEBUG_PRINT(str) serial_write_string("[DEBUG] " str "\n")
 #define DEBUG_PRINTF(fmt, ...) serial_printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)

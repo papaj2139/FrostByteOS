@@ -1,5 +1,6 @@
 
 #include "fd.h"
+#include "fs/vfs.h"
 #include <stddef.h>
 
 static vfs_file_t open_files[MAX_OPEN_FILES];
@@ -34,9 +35,8 @@ void fd_close(int32_t fd) {
     if (fd >= 3 && fd < MAX_OPEN_FILES && open_files[fd].node != NULL) {
         open_files[fd].ref_count--;
         if (open_files[fd].ref_count == 0) {
-            if (open_files[fd].node->ops->close) {
-                open_files[fd].node->ops->close(open_files[fd].node);
-            }
+            // Delegate to VFS close so refcounts and FS-specific semantics are handled centrally
+            vfs_close(open_files[fd].node);
             open_files[fd].node = NULL;
         }
     }

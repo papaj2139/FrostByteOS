@@ -1,8 +1,8 @@
 section .multiboot
 align 4
     dd 0x1BADB002              ; magic
-    dd 0x01                    ; flags: request memory info (i think)
-    dd -(0x1BADB002 + 0x01)    ; checksum
+    dd 0x03                    ; flags: align modules (bit0) | request mem info (bit1)
+    dd -(0x1BADB002 + 0x03)    ; checksum
 
 section .text
 global start

@@ -16,16 +16,17 @@ syscall_handler_asm:
     pushad
     ;mark that we're now executing in kernel for this process (safe GPRs preserved)
     call syscall_mark_enter
-    ;capture the user return frame (EIP, CS, EFLAGS, USERESP, SS)
+    ;capture the user return frame (EIP, CS, EFLAGS, USERESP, SS, EBP)
     ;at entry (before push ebp): [ESP+0]=EIP, [ESP+4]=CS, [ESP+8]=EFLAGS, [ESP+12]=USERESP, [ESP+16]=SS
     ;after push ebp those are at [EBP+4..+20]
+    push dword [ebp + 0]    ;user EBP saved by our push ebp
     push dword [ebp + 20]   ;SS
     push dword [ebp + 16]   ;USERESP
     push dword [ebp + 12]   ;EFLAGS
     push dword [ebp + 8]    ;CS
     push dword [ebp + 4]    ;EIP
     call syscall_capture_user_frame
-    add esp, 20
+    add esp, 24
     ;restore original user register values
     popad
     ;now save caller-saved registers for dispatcher call

@@ -80,6 +80,9 @@ int fat16_close_file(fat16_file_t* file);
 int fat16_list_directory(fat16_fs_t* fs);
 int fat16_create_file(fat16_fs_t* fs, const char* filename);
 uint16_t fat16_get_next_cluster(fat16_fs_t* fs, uint16_t cluster);
+int fat16_create_dir_root(fat16_fs_t* fs, const char* name);
+int fat16_remove_dir_root(fat16_fs_t* fs, const char* name);
+int fat16_delete_file_root(fat16_fs_t* fs, const char* filename);
 
 //util functions
 void fat16_to_83_name(const char* name, char* fat_name);

@@ -21,10 +21,18 @@
 #include "fs/fat16.h"
 #include "fs/vfs.h"
 #include "fs/initramfs.h"
+#include "fs/initramfs_cpio.h"
+#include "fs/procfs.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "process.h"
+#include "kernel/cga.h"
+#include "kernel/panic.h"
+#include "kernel/kreboot.h"
+#include "kernel/kshutdown.h"
+#include "kernel/elf.h"
+#include "kernel/multiboot.h"
 #include <stdbool.h>
 
 
@@ -39,122 +47,26 @@
 */
 
 
-#define VID_MEM ((unsigned char*)0xb8000)
-#define SCREEN_WIDTH 80
-#define SCREEN_HEIGHT 25
 #define WATCHDOG_TIMEOUT 500
-#define KEYBOARD_DATA_PORT 0x60
-#define KEYBOARD_STATUS_PORT 0x64
-
-//ACPI variables
-#define RSDP_SIG "RSD PTR "
-#define ACPI_SIG_RSDT "RSDT"
-#define ACPI_SIG_XSDT "XSDT"
-#define ACPI_SIG_FADT "FACP"
-#define ACPI_SIG_DSDT "DSDT"
-#define SLP_EN (1 << 13)
-#define SCI_EN (1 << 0)
 
 
 //global filesystem instance for shell commands
 static fat16_fs_t g_fat16_fs;
 static bool g_fs_initialized = false;
 
-
-//structs and typedefs
-
-typedef struct __attribute__((packed)) {
-    char signature[8];
-    uint8_t checksum;
-    char oemid[6];
-    uint8_t revision;
-    uint32_t rsdt_address;
-    uint32_t length;
-    uint64_t xsdt_address;
-    uint8_t extended_checksum;
-    uint8_t reserved[3];
-} rsdp_descriptor_t;
-
-typedef struct __attribute__((packed)) {
-    char signature[4];
-    uint32_t length;
-    uint8_t revision;
-    uint8_t checksum;
-    char oemid[6];
-    char oemtableid[8];
-    uint32_t oemrevision;
-    uint32_t creatorid;
-    uint32_t creatorrev;
-} acpi_table_header_t;
-
-typedef struct __attribute__((packed)) {
-    acpi_table_header_t header;
-    uint32_t firmware_ctrl;
-    uint32_t dsdt;
-    uint8_t reserved1;
-    uint8_t preferred_pm_profile;
-    uint16_t sci_int;
-    uint32_t smi_cmd;
-    uint8_t acpi_enable;
-    uint8_t acpi_disable;
-    uint8_t s4bios_req;
-    uint8_t pstate_cnt;
-    uint32_t pm1a_evt_blk;
-    uint32_t pm1b_evt_blk;
-    uint32_t pm1a_cnt_blk;
-    uint32_t pm1b_cnt_blk;
-    uint32_t pm2_cnt_blk;
-    uint32_t pm_tmr_blk;
-    uint32_t gpe0_blk;
-    uint32_t gpe1_blk;
-    uint8_t pm1_evt_len;
-    uint8_t pm1_cnt_len;
-    uint8_t pm2_cnt_len;
-    uint8_t pm_tmr_len;
-    uint8_t gpe0_blk_len;
-    uint8_t gpe1_blk_len;
-    uint8_t gpe1_base;
-    uint8_t cst_cnt;
-    uint16_t p_lvl2_lat;
-    uint16_t p_lvl3_lat;
-    uint16_t flush_size;
-    uint16_t flush_stride;
-    uint8_t duty_offset;
-    uint8_t duty_width;
-    uint8_t day_alrm;
-    uint8_t mon_alrm;
-    uint8_t century;
-    uint16_t iapc_boot_arch;
-    uint8_t reserved2;
-    uint32_t flags;
-} fadt_t;
-
 typedef void (*cmd_fn)(const char *args);
 struct cmd_entry { const char *name; cmd_fn fn; };
 
 //global variables
 volatile int currentTick = 0;
-static uint8_t cursor_x = 0;
-static uint8_t cursor_y = 0;
 static uint32_t total_memory_mb = 0;
-static const char* g_panic_reason = 0; //optional reason to display on panic
 char *bsodVer = "classic";
 
-
+extern char kernel_start, kernel_end;
 
 //function declarations
-void kpanic(void);
-void kshutdown(void);
-void kreboot(void);
-void move_cursor(uint16_t row, uint16_t col);
-void kclear(void);
-void print(char* msg, unsigned char colour);
 void cmd_meminfo(const char *args);
 void cmd_console_colour(const char* args);
-static void update_cursor(void);
-static void scroll_if_needed(void);
-static int putchar_term(char c, unsigned char colour);
-void enable_cursor(uint8_t start, uint8_t end);
 static void hex_dump(const uint8_t* data, size_t size, unsigned char colour);
 
 
@@ -162,7 +74,7 @@ void watchdogTick(void) {
     currentTick++;
 }
 
-//spawn a user program from VFS path by loading it to 0x01000000 and creating a user process
+//spawn a user program from VFS path
 //returns 1 on success 0 on failure
 static int spawn_user_from_vfs(const char* path) {
     if (!path || !*path) return 0;
@@ -170,102 +82,26 @@ static int spawn_user_from_vfs(const char* path) {
     serial_write_string(path);
     serial_write_string("\n");
 
-    vfs_node_t* node = vfs_open(path, VFS_FLAG_READ);
-    if (!node) {
-        serial_write_string("[VFS] File not found\n");
-        return 0;
-    }
-
-    int fsize = vfs_get_size(node);
-    if (fsize <= 0) {
-        vfs_close(node);
-        serial_write_string("[VFS] Invalid file size\n");
-        return 0;
-    }
-
-    if (fsize > 4096) fsize = 4096; //ssingle page loader
-
-    //allocate a physical page and map it at a kernel temp address to copy
-    const uint32_t entry_va = 0x01000000;
-    const uint32_t temp_kmap = 0x00800000;
-    uint32_t code_phys = pmm_alloc_page();
-    if (!code_phys) {
-        vfs_close(node);
-        serial_write_string("[VFS] pmm_alloc_page failed\n");
-        return 0;
-    }
-    if (vmm_map_page(temp_kmap, code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        vfs_close(node);
-        pmm_free_page(code_phys);
-        serial_write_string("[VFS] map temp page failed\n");
-        return 0;
-    }
-
-    memset((void*)temp_kmap, 0, 4096);
-    //read file into the mapped page
-    uint32_t offset = 0;
-    while (offset < (uint32_t)fsize) {
-        int r = vfs_read(node, offset, (uint32_t)(fsize - offset), (char*)((uint8_t*)temp_kmap + offset));
-        if (r <= 0) break;
-        offset += (uint32_t)r;
-    }
-    vfs_close(node);
-    vmm_unmap_page_nofree(temp_kmap);
-
-    //create the process
-    process_t* proc = process_create("/bin/sh", (void*)entry_va, true);
+    //create a fresh user process
+    process_t* proc = process_create(path, (void*)0, true);
     if (!proc) {
-        pmm_free_page(code_phys);
         serial_write_string("[VFS] process_create failed\n");
         return 0;
     }
 
-    //map code into the process address space only
-    if (vmm_map_page_in_directory(proc->page_directory, entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        process_destroy(proc);
-        pmm_free_page(code_phys);
-        serial_write_string("[VFS] map in proc failed\n");
-        return 0;
+    //try ELF loader first
+    char* elf_argv[2] = { (char*)path, NULL };
+    char* elf_envp[1] = { NULL };
+    int er = elf_load_into_process(path, proc, elf_argv, elf_envp);
+    if (er == 0) {
+        //success let scheduler run it
+        process_yield();
+        return 1;
     }
-
-    //create and map a user stack at 0x02000000
-    uint32_t ustack_phys = pmm_alloc_page();
-    if (!ustack_phys) {
-        serial_write_string("[VFS] alloc user stack failed\n");
-        process_destroy(proc);
-        return 0;
-    }
-    if (vmm_map_page_in_directory(proc->page_directory, 0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        serial_write_string("[VFS] map user stack in proc failed\n");
-        pmm_free_page(ustack_phys);
-        process_destroy(proc);
-        return 0;
-    }
-    proc->context.esp = 0x02000000 - 16;
-
-    //debugdump context and mappings (use known physical pages)
-    {
-        char out[192];
-        ksnprintf(out, sizeof(out),
-                  "Boot: Spawned %s PID %u entry=0x%08x code_phys=0x%08x stack_top=0x%08x stack_phys=0x%08x\n",
-                  path, proc->pid, entry_va, (uint32_t)code_phys, (uint32_t)(0x02000000 - 16), (uint32_t)ustack_phys);
-        serial_write_string(out);
-        ksnprintf(out, sizeof(out),
-                  "Ctx: CS=0x%04x SS=0x%04x DS=0x%04x EFLAGS=0x%08x EIP=0x%08x ESP=0x%08x\n",
-                  (unsigned)proc->context.cs, (unsigned)proc->context.ss, (unsigned)proc->context.ds,
-                  (unsigned)proc->context.eflags, (unsigned)proc->context.eip, (unsigned)proc->context.esp);
-        serial_write_string(out);
-    }
-
-    process_yield();
-    return 1;
-}
-
-
-//panic with a custom message stores reason and invokes kpanic screen
-void kpanic_msg(const char* reason){
-    g_panic_reason = reason;
-    kpanic();
+    //error or not an ELF
+    serial_write_string("[ELF] not an ELF executable or load error\n");
+    process_destroy(proc);
+    return 0;
 }
 
 void petWatchdog(void) {
@@ -354,24 +190,13 @@ static void cmd_help(const char *args) {
     print("  echo <text> - Display text\n", 0x0F);
     print("  desktop     - Start the desktop environment\n", 0x0F);
     print("  iceedit     - ICE (Interpreted Compiled Executable) Editor\n", 0x0F);
-    print("  loadapp     - Load and execute application from disk (sector 50)\n", 0x0F);
+    
     print("  readsector <dev> <sector> - Read a sector from a device\n", 0x0F);
     print("  reboot      - Reboot the system\n", 0x0F);
     print("  shutdown    - Shut down the system\n", 0x0F);
     print("  bsodVer <classic|modern> - Set BSOD style (modern=emoticon, classic=fatal exception)\n", 0x0F);
     print("  induce(kernel.panic()) - Trigger kernel panic (debug)\n", 0x0F);
     print("\n", 0x0F);
-}
-
-static uint16_t get_line_length(uint16_t row){
-    if(row >= SCREEN_HEIGHT) return 0;
-    uint16_t len = SCREEN_WIDTH;
-    while(len > 0){
-        char c = VID_MEM[(row * SCREEN_WIDTH + (len - 1)) * 2];
-        if(c != ' ') break;
-        len--;
-    }
-    return len;
 }
 
 void cmd_iceedit(const char *args){
@@ -390,7 +215,7 @@ void cmd_iceedit(const char *args){
     //place cursor below header
     cursor_x = 0;
     cursor_y = 4;
-    update_cursor();
+    move_cursor(cursor_y, cursor_x);
 
     //clear any pending keyboard input from the shell before starting editor
     kbd_flush();
@@ -439,7 +264,7 @@ void cmd_iceedit(const char *args){
                     cursor_x = nx;
                 }
             }
-            update_cursor();
+            move_cursor(cursor_y, cursor_x);
             continue;
         }
 
@@ -474,107 +299,6 @@ void cmd_kpset(const char *args){
     bsodVer[strlen(args)] = '\0';
 }
 
-static void cmd_loadapp(const char *args) {
-    (void)args;
-    serial_write_string("\nLoading app from disk sector 50...\n");
-
-    //allocate buffer for one page (8 sectors)
-    static uint8_t buffer[4096];
-
-    serial_write_string("Loading user application...\n");
-    device_t* ata_dev = device_find_by_name("ata0");
-    if (!ata_dev) {
-        serial_write_string("No ATA device found!\n");
-        return;
-    }
-
-    int bytes_read = device_read(ata_dev, 50 * 512, buffer, 4096); //read 8 sectors (4KB) from LBA 50
-
-    if (bytes_read <= 0) {
-        serial_write_string("Failed to read from ATA drive\n");
-        return;
-    }
-
-    //prepare a user-space entry address and a backing physical page for the program
-    const uint32_t entry_va = 0x01000000; //16MB in user space
-    const uint32_t temp_kmap = 0x00800000; //temporary kernel mapping address for copying (8MB)
-
-    //allocate a physical page to hold the program code
-    uint32_t code_phys = pmm_alloc_page();
-    if (!code_phys) {
-        serial_write_string("Failed to allocate physical page for program code\n");
-        return;
-    }
-
-    //temporarily map the physical page into the kernel so we can copy the program into it
-    if (vmm_map_page(temp_kmap, code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        serial_write_string("Failed to temporarily map program page into kernel\n");
-        pmm_free_page(code_phys);
-        return;
-    }
-
-    //clear the page and copy the loaded image (up to 4KB)
-    memset((void*)temp_kmap, 0, 4096);
-    memcpy((void*)temp_kmap, buffer, (bytes_read > 4096) ? 4096 : (size_t)bytes_read);
-
-    //unmap the temporary kernel mapping (the data remains in the physical page)
-    vmm_unmap_page_nofree(temp_kmap);
-
-    //create a new user process with the chosen entry point
-    process_t* proc = process_create("userapp", (void*)entry_va, true);
-    if (!proc) {
-        serial_write_string("Failed to create process\n");
-        pmm_free_page(code_phys);
-        return;
-    }
-
-    //map the program page into the new process address space at entry_va (writable for .data/.bss)
-    if (vmm_map_page_in_directory(proc->page_directory, entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        serial_write_string("Failed to map program into process address space\n");
-        process_destroy(proc);
-        pmm_free_page(code_phys);
-        return;
-    }
-
-    //map the program page into the current (kernel) directory
-    if (vmm_map_page(entry_va, code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        serial_write_string("Failed to map program into kernel address space\n");
-        process_destroy(proc);
-        pmm_free_page(code_phys);
-        return;
-    }
-
-    //create and map a user stack at 0x02000000
-    uint32_t ustack_phys = pmm_alloc_page();
-    if (!ustack_phys) {
-        serial_write_string("Failed to allocate user stack page\n");
-        process_destroy(proc);
-        return;
-    }
-    //map into kernel directory (we run with kernel CR3 for now)
-    if (vmm_map_page(0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        serial_write_string("Failed to map user stack in kernel directory\n");
-        pmm_free_page(ustack_phys);
-        process_destroy(proc);
-        return;
-    }
-    //map into the process directory for future per-process CR3 switching
-    if (vmm_map_page_in_directory(proc->page_directory, 0x02000000 - 0x1000, ustack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        serial_write_string("Failed to map user stack in process directory\n");
-        pmm_free_page(ustack_phys);
-        process_destroy(proc);
-        return;
-    }
-    //set the initial user ESP near the top of the stack
-    proc->context.esp = 0x02000000 - 16;
-
-    char out[64];
-    ksnprintf(out, sizeof(out), "Boot: Spawned user shell PID %u entry=0x%08x\n", proc->pid, entry_va);
-    serial_write_string(out);
-
-    //yield to scheduler so the shell runs now
-    process_yield();
-}
 
 static void cmd_devices(const char *args) {
     (void)args;
@@ -945,7 +669,6 @@ static struct cmd_entry commands[] = {
     {"desktop", cmd_desktop},
     {"minifs", cmd_minifs},
     {"shutdown", cmd_shutdown},
-    {"loadapp", cmd_loadapp},
     {"devices", cmd_devices},
     {"devtest", cmd_devtest},
     {"reboot", cmd_reboot},
@@ -963,118 +686,6 @@ static struct cmd_entry commands[] = {
     {NULL, NULL}
 };
 
-void kclear(void){
-    unsigned int j = 0;
-
-    while(j < SCREEN_WIDTH * SCREEN_HEIGHT){
-        VID_MEM[j * 2] = ' ';
-        VID_MEM[j * 2 + 1] = 0x0F;
-        j++;
-    }
-    cursor_x = 0;
-    cursor_y = 0;
-    update_cursor();
-}
-
-void print(char* msg, unsigned char colour){
-    int i = 0;
-    while(msg[i] != '\0'){
-        char c = msg[i++];
-        if (c == '\n') {
-            cursor_x = 0;
-            cursor_y++;
-        } else if (c == '\b') {
-            if (cursor_x > 0) {
-                cursor_x--;
-                VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = ' ';
-                VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
-            } else if (cursor_y > 0) {
-                cursor_y--;
-                cursor_x = SCREEN_WIDTH - 1;
-                VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = ' ';
-                VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
-            }
-        } else {
-            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = c;
-            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
-            cursor_x++;
-            if (cursor_x >= SCREEN_WIDTH) {
-                cursor_x = 0;
-                cursor_y++;
-            }
-        }
-        scroll_if_needed();
-    }
-    update_cursor();
-}
-
-
-static void print_at(const char* str, unsigned char attr, unsigned int x, unsigned int y) {
-    unsigned int i = 0;
-    unsigned int pos = (y * SCREEN_WIDTH + x) * 2;
-    while (str[i]) {
-        VID_MEM[pos] = str[i];
-        VID_MEM[pos + 1] = attr;
-        i++;
-        pos += 2;
-    }
-}
-
-void kpanic(void) {
-
-    __asm__ volatile ("cli");
-
-    // Fill background with blue, white text
-    for (unsigned int j = 0; j < SCREEN_WIDTH * SCREEN_HEIGHT; j++) {
-        VID_MEM[j * 2] = ' ';
-        VID_MEM[j * 2 + 1] = 0x1F; // White on blue
-    }
-
-    if(strcmp(bsodVer, "modern") == 0){
-        print_at(":(", 0x1F, 0, 0);
-        print_at("Your pc ran into a problem and needs to restart.", 0x1F, 0, 1);
-        print_at("Please wait while we gather information about this (0%)", 0x1F, 0, 2);
-        if (g_panic_reason && g_panic_reason[0]) {
-            print_at("Reason:", 0x1F, 0, 3);
-            print_at((char*)g_panic_reason, 0x1F, 8, 3);
-        } else {
-            print_at("Reason: (unspecified)", 0x1F, 0, 3);
-        }
-    } else{
-        print_at(" FrostByte ", 0x71, 35, 4); // Gray background, black text
-
-        if (g_panic_reason && g_panic_reason[0]) {
-            print_at("A fatal error has occurred:", 0x1F, 2, 6);
-            print_at((char*)g_panic_reason, 0x1F, 2, 7);
-        } else {
-            print_at("A fatal exception has occurred.", 0x1F, 2, 6);
-            print_at("The current application will be terminated.", 0x1F, 2, 7);
-        }
-        print_at("* Press any key to terminate the current application.", 0x1F, 2, 8);
-        print_at("* Press CTRL+ALT+DEL to restart your computer. You will", 0x1F, 2, 9);
-        print_at("  lose any unsaved information in all applications.", 0x1F, 2, 10);
-
-        print_at("  Press enter to reboot. ", 0x1F, 25, 15);
-        move_cursor(26, 15);
-    }
-
-    while (inb(0x64) & 1) {
-        (void)inb(0x60);
-    }
-
-    ERROR_SOUND();
-
-    // Wait for Enter key manually (polling, no echo)
-    for (;;) {
-        if (inb(0x64) & 1) { // If output buffer full
-            uint8_t scancode = inb(0x60);
-            if (scancode == 0x1C) { // Enter key make code
-                kreboot();
-            }
-        }
-    }
-}
-
 
 void cmd_meminfo(const char *args) {
     (void)args; //suppress unused parameter warning
@@ -1084,370 +695,6 @@ void cmd_meminfo(const char *args) {
 }
 
 
-
-static int putchar_term(char c, unsigned char colour) {
-    if (c == '\n') {
-        cursor_x = 0;
-        cursor_y++;
-    } else if (c == '\b') {
-        if (cursor_x > 0) {
-            cursor_x--;
-            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = ' ';
-            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
-        } else if (cursor_y > 0) {
-            cursor_y--;
-            cursor_x = SCREEN_WIDTH - 1;
-            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = ' ';
-            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
-        } else {
-            return 0;
-        }
-    } else {
-        VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = c;
-        VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
-        cursor_x++;
-        if (cursor_x >= SCREEN_WIDTH) {
-            cursor_x = 0;
-            cursor_y++;
-        }
-    }
-    scroll_if_needed();
-    update_cursor();
-    return 1;
-}
-
-static void update_cursor(void){
-    unsigned short pos = cursor_y * SCREEN_WIDTH + cursor_x;
-    outb(0x3D4, 0x0F);
-    outb(0x3D5, (uint8_t)(pos & 0xFF));
-    outb(0x3D4, 0x0E);
-    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
-}
-
-static void scroll_if_needed(void){
-    if (cursor_y >= SCREEN_HEIGHT) {
-        for (int y = 1; y < SCREEN_HEIGHT; ++y) {
-            for (int x = 0; x < SCREEN_WIDTH; ++x) {
-                VID_MEM[((y - 1) * SCREEN_WIDTH + x) * 2] = VID_MEM[(y * SCREEN_WIDTH + x) * 2];
-                VID_MEM[((y - 1) * SCREEN_WIDTH + x) * 2 + 1] = VID_MEM[(y * SCREEN_WIDTH + x) * 2 + 1];
-            }
-        }
-        int last = (SCREEN_HEIGHT - 1) * SCREEN_WIDTH;
-        for (int x = 0; x < SCREEN_WIDTH; ++x) {
-            VID_MEM[(last + x) * 2] = ' ';
-            VID_MEM[(last + x) * 2 + 1] = 0x0F;
-        }
-        cursor_y = SCREEN_HEIGHT - 1;
-    }
-}
-
-static int acpi_checksum(void *ptr, size_t len) {
-    uint8_t sum = 0;
-    uint8_t *p = (uint8_t*)ptr;
-    for (size_t i = 0; i < len; i++) {
-        sum += p[i];
-    }
-    return sum == 0;
-}
-
-static rsdp_descriptor_t* find_rsdp(void) {
-    //check EBDA first and suppress warning for low memory access
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Warray-bounds"
-    uint16_t ebda_seg = *(uint16_t*)0x40E;
-    #pragma GCC diagnostic pop
-    
-    uint32_t ebda = ((uint32_t)ebda_seg) << 4;
-    if (ebda >= 0x80000 && ebda < 0xA0000) {
-        for (uint32_t addr = ebda; addr < ebda + 1024; addr += 16) {
-            if (memcmp((void*)addr, RSDP_SIG, 8) == 0) {
-                rsdp_descriptor_t *rsdp = (rsdp_descriptor_t*)addr;
-                if (acpi_checksum(rsdp, 20)) {
-                    return rsdp;
-                }
-            }
-        }
-    }
-    
-    //check BIOS area
-    for (uint32_t addr = 0xE0000; addr < 0x100000; addr += 16) {
-        if (memcmp((void*)addr, RSDP_SIG, 8) == 0) {
-            rsdp_descriptor_t *rsdp = (rsdp_descriptor_t*)addr;
-            if (acpi_checksum(rsdp, 20)) {
-                return rsdp;
-            }
-        }
-    }
-    
-    return NULL;
-}
-
-static acpi_table_header_t* find_acpi_table(acpi_table_header_t *rsdt, const char *signature) {
-    if (!rsdt) return NULL;
-    
-    bool is_xsdt = (memcmp(rsdt->signature, ACPI_SIG_XSDT, 4) == 0);
-    uint32_t entry_size = is_xsdt ? 8 : 4;
-    uint32_t entries = (rsdt->length - sizeof(acpi_table_header_t)) / entry_size;
-    
-    uint8_t *table_data = (uint8_t*)rsdt + sizeof(acpi_table_header_t);
-    
-    for (uint32_t i = 0; i < entries; i++) {
-        uint32_t table_addr;
-        if (is_xsdt) {
-            uint64_t addr64 = *(uint64_t*)(table_data + i * 8);
-            if (addr64 > 0xFFFFFFFF) continue; //skip 64-bit addresses
-            table_addr = (uint32_t)addr64;
-        } else {
-            table_addr = *(uint32_t*)(table_data + i * 4);
-        }
-        
-        //map the table header to check signature
-        uint32_t page_addr = table_addr & ~(PAGE_SIZE - 1);
-        uint32_t offset = table_addr & (PAGE_SIZE - 1);
-        uint32_t temp_virt = 0x400000; //use a temporary virtual address
-        
-        if (vmm_map_page(temp_virt, page_addr, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-            continue; //skip if mapping fails
-        }
-        
-        acpi_table_header_t *table = (acpi_table_header_t*)(temp_virt + offset);
-        bool match = (memcmp(table->signature, signature, 4) == 0);
-        
-        vmm_unmap_page_nofree(temp_virt);
-        
-        if (match) {
-            return (acpi_table_header_t*)table_addr; //return physical address
-        }
-    }
-    
-    return NULL;
-}
-
-static uint16_t find_s5_sleep_type(acpi_table_header_t *dsdt) {
-    if (!dsdt) return 5; //default fallback
-    
-    uint8_t *data = (uint8_t*)dsdt;
-    uint32_t length = dsdt->length;
-    
-    //search for "_S5_" followed by a package
-    for (uint32_t i = 0; i < length - 10; i++) {
-        if (data[i] == '_' && data[i+1] == 'S' && data[i+2] == '5' && data[i+3] == '_') {
-            //look for package op (0x12) nearby
-            for (uint32_t j = i + 4; j < i + 20 && j < length - 5; j++) {
-                if (data[j] == 0x12) { //package op
-                    //skip package length encoding
-                    uint32_t k = j + 1;
-                    if (data[k] & 0xC0) k += (data[k] >> 6) & 3; //multi-byte length
-                    k++; //skip element count
-                    
-                    //look for first integer value
-                    if (k < length) {
-                        if (data[k] == 0x0A && k + 1 < length) { //byte const
-                            uint8_t val = data[k + 1];
-                            if (val > 0 && val < 8) return val;
-                        } else if (data[k] == 0x01) { //one
-                            return 1;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    
-    return 5; //default S5 sleep type
-}
-
-void kshutdown(void) {
-    DEBUG_PRINT("Initiating shutdown...");
-    
-    //find RSDP
-    rsdp_descriptor_t *rsdp = find_rsdp();
-    if (!rsdp) {
-        DEBUG_PRINT("RSDP not found, using fallback");
-        goto fallback_shutdown;
-    }
-    DEBUG_PRINT("RSDP found");
-    
-    //get RSDT/XSDT
-    uint32_t rsdt_phys = 0;
-    if (rsdp->revision >= 2 && rsdp->xsdt_address && (rsdp->xsdt_address >> 32) == 0) {
-        rsdt_phys = (uint32_t)rsdp->xsdt_address;
-    } else if (rsdp->rsdt_address) {
-        rsdt_phys = rsdp->rsdt_address;
-    }
-    
-    if (!rsdt_phys) {
-        DEBUG_PRINT("RSDT/XSDT not found");
-        goto fallback_shutdown;
-    }
-    DEBUG_PRINT("RSDT/XSDT address found");
-    
-    //map RSDT/XSDT
-    uint32_t rsdt_page = rsdt_phys & ~(PAGE_SIZE - 1);
-    uint32_t rsdt_offset = rsdt_phys & (PAGE_SIZE - 1);
-    uint32_t rsdt_virt = 0x500000;
-    
-    if (vmm_map_page(rsdt_virt, rsdt_page, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        DEBUG_PRINT("Failed to map RSDT/XSDT");
-        goto fallback_shutdown;
-    }
-    DEBUG_PRINT("RSDT/XSDT mapped");
-    
-    acpi_table_header_t *rsdt = (acpi_table_header_t*)(rsdt_virt + rsdt_offset);
-    
-    //find FADT
-    uint32_t fadt_phys = (uint32_t)find_acpi_table(rsdt, ACPI_SIG_FADT);
-    if (!fadt_phys) {
-        DEBUG_PRINT("FADT not found");
-        vmm_unmap_page_nofree(rsdt_virt);
-        goto fallback_shutdown;
-    }
-    DEBUG_PRINT("FADT found");
-    
-    //map FADT
-    uint32_t fadt_page = fadt_phys & ~(PAGE_SIZE - 1);
-    uint32_t fadt_offset = fadt_phys & (PAGE_SIZE - 1);
-    uint32_t fadt_virt = 0x600000;
-    
-    if (vmm_map_page(fadt_virt, fadt_page, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        DEBUG_PRINT("Failed to map FADT");
-        vmm_unmap_page_nofree(rsdt_virt);
-        goto fallback_shutdown;
-    }
-    
-    fadt_t *fadt = (fadt_t*)(fadt_virt + fadt_offset);
-    
-    //get PM1a control register
-    uint32_t pm1a_cnt = fadt->pm1a_cnt_blk;
-    if (!pm1a_cnt) {
-        DEBUG_PRINT("PM1a control register not found");
-        vmm_unmap_page_nofree(fadt_virt);
-        vmm_unmap_page_nofree(rsdt_virt);
-        goto fallback_shutdown;
-    }
-    serial_printf("PM1a control register: 0x%x\n", pm1a_cnt);
-    
-    //map and parse DSDT for S5 sleep type
-    uint32_t dsdt_phys = fadt->dsdt;
-    uint16_t slp_typ = 5; //default
-    
-    if (dsdt_phys) {
-        uint32_t dsdt_page = dsdt_phys & ~(PAGE_SIZE - 1);
-        uint32_t dsdt_offset = dsdt_phys & (PAGE_SIZE - 1);
-        uint32_t dsdt_virt = 0x700000;
-        
-        if (vmm_map_page(dsdt_virt, dsdt_page, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
-            acpi_table_header_t *dsdt = (acpi_table_header_t*)(dsdt_virt + dsdt_offset);
-            slp_typ = find_s5_sleep_type(dsdt);
-            vmm_unmap_page_nofree(dsdt_virt);
-        }
-    }
-    serial_printf("S5 sleep type: %d\n", slp_typ);
-    
-    //enable ACPI if needed
-    if (fadt->smi_cmd && fadt->acpi_enable) {
-        serial_printf("Enabling ACPI via SMI_CMD=0x%x\n", fadt->smi_cmd);
-        uint16_t pm1a_sts = inw(pm1a_cnt);
-        if (!(pm1a_sts & SCI_EN)) {
-            outb(fadt->smi_cmd, fadt->acpi_enable);
-            //wait for ACPI to be enabled
-            for (int i = 0; i < 100; i++) {
-                if (inw(pm1a_cnt) & SCI_EN) break;
-                for (volatile int j = 0; j < 10000; j++);
-            }
-        }
-    }
-    
-    //perform shutdown
-    uint16_t pm1a_val = inw(pm1a_cnt);
-    serial_printf("PM1a original value: 0x%x\n", pm1a_val);
-    pm1a_val &= ~(7 << 10); //clear SLP_TYP
-    pm1a_val |= (slp_typ << 10) | SLP_EN;
-    serial_printf("PM1a shutdown value: 0x%x\n", pm1a_val);
-    
-    //disable interrupts for atomic shutdown
-    asm volatile("cli");
-    
-    //write PM1b first if it exists
-    if (fadt->pm1b_cnt_blk) {
-        uint16_t pm1b_val = inw(fadt->pm1b_cnt_blk);
-        pm1b_val &= ~(7 << 10);
-        pm1b_val |= (slp_typ << 10) | SLP_EN;
-        outw(fadt->pm1b_cnt_blk, pm1b_val);
-    }
-    
-    //write PM1a last to trigger shutdown
-    outw(pm1a_cnt, pm1a_val);
-    
-    //try alternative QEMU ACPI approach if PM1a is at 0x604
-    if (pm1a_cnt == 0x604) {
-        serial_printf("Trying QEMU ACPI shutdown with 0x2000\n");
-        outw(0x604, 0x2000);  // QEMU's expected shutdown value
-    }
-    
-    //give it a moment
-    for (volatile int i = 0; i < 1000; i++);
-    
-    //cleanup mappings
-    vmm_unmap_page_nofree(fadt_virt);
-    vmm_unmap_page_nofree(rsdt_virt);
-    
-    serial_printf("ACPI shutdown initiated\n");
-    
-    //if we reach here ACPI shutdown didn't work so halt forever
-    for (;;) {
-        asm volatile("hlt");
-    }
-    
-fallback_shutdown:
-    DEBUG_PRINT("ACPI shutdown failed, trying fallback methods");
-    //try QEMU/Bochs specific ports
-    outw(0x604, 0x2000);  //QEMU
-    outw(0xB004, 0x2000); //bochs
-    outb(0xF4, 0x00);     //QEMU isa-debug-exit
-    
-    //if all else fails just halt
-    for (;;) {
-        asm volatile("hlt");
-    }
-}
-
-//works in qemu idk how about real hardware
-//TODO: should change this to reboot using ACPI
-void kreboot(void){
-    __asm__ volatile("cli");
-    //port 0xCF9 (reset control register)
-    outb(0xCF9, 0x02); //set reset bit
-    for (volatile unsigned int i = 0; i < 100000; ++i) { }
-    outb(0xCF9, 0x06); //full reset
-}
-
-static inline void write_char_at(uint16_t row, uint16_t col, char c, uint8_t attr){
-    if (row >= SCREEN_HEIGHT) return;
-    if (col >= SCREEN_WIDTH) {
-        row += col / SCREEN_WIDTH;
-        col = col % SCREEN_WIDTH;
-        if (row >= SCREEN_HEIGHT) return;
-    }
-    volatile uint16_t *vm = (volatile uint16_t*)0xB8000;
-    vm[row * SCREEN_WIDTH + col] = ((uint16_t)attr << 8) | (uint8_t)c;
-}
-
-void enable_cursor(uint8_t start, uint8_t end){
-    outb(0x3D4,0x0A);
-    outb(0x3D5,(inb(0x3D5)&0xC0)|start);
-    outb(0x3D4,0x0B);
-    outb(0x3D5,(inb(0x3D5)&0xE0)|end);
-}
-
-void move_cursor(uint16_t row, uint16_t col){
-    uint16_t pos = row * SCREEN_WIDTH + col;
-    outb(0x3D4,0x0F);
-    outb(0x3D5,(uint8_t)(pos & 0xFF));
-    outb(0x3D4,0x0E);
-    outb(0x3D5,(uint8_t)((pos >> 8) & 0xFF));
-}
 
 
 //get keyboard input through device manager
@@ -1551,8 +798,6 @@ void cmd_console_colour(const char* args){
 }
 
 
-
-
 void commandLoop(void){
     char buffer[128];
     while(1){
@@ -1586,18 +831,17 @@ void commandLoop(void){
 }
 
 
-void put_char_at(char c, uint8_t attr, int x, int y) {
-    int offset = (y * SCREEN_WIDTH + x) * 2;
-    VID_MEM[offset] = c;
-    VID_MEM[offset + 1] = attr;
-}
-
 void kmain(uint32_t magic, uint32_t addr) {
     (void)magic; // unused
-    uint32_t mem_lower = *((uint32_t*)(addr + 4));
-    uint32_t mem_upper = *((uint32_t*)(addr + 8));
+    multiboot_info_t* mbi = (multiboot_info_t*)addr;
+    uint32_t mem_lower = (mbi && (mbi->flags & MBI_FLAG_MEM)) ? mbi->mem_lower : 0;
+    uint32_t mem_upper = (mbi && (mbi->flags & MBI_FLAG_MEM)) ? mbi->mem_upper : 0;
 
     total_memory_mb = (mem_lower + mem_upper) / 1024 + 1;
+
+    //expose kernel cmdline via procfs for init to read
+    const char* boot_cmdline = (mbi && mbi->cmdline) ? (const char*)mbi->cmdline : "";
+    procfs_set_cmdline(boot_cmdline);
 
     kclear();
     print("Loading into FrostByte...", 0x0F);
@@ -1612,7 +856,13 @@ void kmain(uint32_t magic, uint32_t addr) {
     DEBUG_PRINT("TSS initialized");
 
     DEBUG_PRINT("Initializing memory management...");
-    pmm_init(mem_lower, mem_upper);
+    if (mbi) {
+        pmm_init_multiboot((const struct multiboot_info*)mbi,
+                           (uint32_t)&kernel_start,
+                           (uint32_t)&kernel_end);
+    } else {
+        pmm_init(mem_lower, mem_upper);
+    }
     DEBUG_PRINT("Physical memory manager initialized");
 
     vmm_init();
@@ -1624,6 +874,10 @@ void kmain(uint32_t magic, uint32_t addr) {
     //initialize device manager
     device_manager_init();
     DEBUG_PRINT("Device manager initialized");
+
+    //initialize serial and RTC devices
+    (void)serial_register_device();
+    (void)rtc_register_device();
 
     //initialize and register ATA driver
     ata_init();
@@ -1675,43 +929,52 @@ void kmain(uint32_t magic, uint32_t addr) {
     if (vfs_init() == 0) {
         DEBUG_PRINT("VFS initialized successfully");
 
-        //fegister filesystems with VFS
+        //register filesystems with VFS
         if (fs_vfs_init() == 0) {
             DEBUG_PRINT("Filesystems registered with VFS");
-            //rn assume that you want to mount the root filesystem on the first ATA device later parse params from multiboot
-            //find ATA device and mount the root filesystem
-            device_t* ata_dev = device_find_by_type(DEVICE_TYPE_STORAGE);
-            if (ata_dev) {
-                //mount the root filesystem with FAT16
-                if (vfs_mount("ata0", "/", "fat16") == 0) {
-                    DEBUG_PRINT("Root filesystem mounted successfully");
-                    //manually initialize global fs object
-                    if (fat16_init(&g_fat16_fs, ata_dev) == 0) {
-                        g_fs_initialized = true;
-                        DEBUG_PRINT("Global FAT16 FS object initialized for commands");
-                    } else {
-                        DEBUG_PRINT("Failed to init global FAT16 FS object");
+            //install initramfs as root prefer multiboot cpio module if present
+            initramfs_init();
+            if (mbi && (mbi->flags & MBI_FLAG_MODS) && mbi->mods_count > 0) {
+                multiboot_module_t* mods = (multiboot_module_t*)(uintptr_t)mbi->mods_addr;
+                for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                    const char* mstr = (const char*)(uintptr_t)mods[i].string;
+                    if (!mstr || strstr(mstr, "initramfs") || strstr(mstr, ".cpio")) {
+                        const uint8_t* mstart = (const uint8_t*)(uintptr_t)mods[i].mod_start; //identity-mapped low memory
+                        const uint8_t* mend   = (const uint8_t*)(uintptr_t)mods[i].mod_end;
+                        if (initramfs_load_cpio(mstart, mend) == 0) {
+                            serial_write_string("[init] loaded initramfs module: ");
+                            if (mstr) serial_write_string(mstr);
+                            serial_write_string("\n");
+                            break;
+                        }
                     }
-                } else {
-                    DEBUG_PRINT("Failed to mount root filesystem");
-                    //install initramfs as root
-                    initramfs_init();
-                    initramfs_populate_builtin();
-                    initramfs_install_as_root();
                 }
-            } else {
-                DEBUG_PRINT("No storage device found");
-                //install initramfs as root (no disk available)
-                initramfs_init();
-                initramfs_populate_builtin();
-                initramfs_install_as_root();
             }
+            initramfs_install_as_root();
+            //mount devfs and procfs
+            vfs_mount("none", "/dev", "devfs");
+            vfs_mount("none", "/proc", "procfs");
         } else {
             DEBUG_PRINT("Failed to register filesystems with VFS");
-            //install initramfs as root since no FS registered
+            //install initramfs as root since no FS registered still try module
             initramfs_init();
-            initramfs_populate_builtin();
+            if (mbi && (mbi->flags & MBI_FLAG_MODS) && mbi->mods_count > 0) {
+                multiboot_module_t* mods = (multiboot_module_t*)(uintptr_t)mbi->mods_addr;
+                for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                    const char* mstr = (const char*)(uintptr_t)mods[i].string;
+                    if (!mstr || strstr(mstr, "initramfs") || strstr(mstr, ".cpio")) {
+                        const uint8_t* mstart = (const uint8_t*)(uintptr_t)mods[i].mod_start; //identity-mapped low memory
+                        const uint8_t* mend   = (const uint8_t*)(uintptr_t)mods[i].mod_end;
+                        if (initramfs_load_cpio(mstart, mend) == 0) { 
+                            break; 
+                        }
+                    }
+                }
+            }
             initramfs_install_as_root();
+            //mount devfs and procfs even in this path
+            vfs_mount("none", "/dev", "devfs");
+            vfs_mount("none", "/proc", "procfs");
         }
     } else {
         DEBUG_PRINT("Failed to initialize VFS");
@@ -1740,21 +1003,16 @@ void kmain(uint32_t magic, uint32_t addr) {
     }
     kclear();
     SUCCESS_SOUND();
-    //try to spawn /bin/init from current root FS (FAT16 or initramfs)
+    //try to spawn /bin/init from current root FS
     if (!spawn_user_from_vfs("/bin/init")) {
-        //ff not found on current root (e.g., FAT16 without /bin/sh) switch to initramfs
-        vfs_unmount("/");
-        initramfs_init();
-        initramfs_populate_builtin();
-        initramfs_install_as_root();
-        if (!spawn_user_from_vfs("/bin/init")) {
-            //try /bin/sh next  in cas /bin/init missing
-            if (!spawn_user_from_vfs("/bin/sh")) {
-            //final fallbackboot into user-space shell loaded from disk sector 50
-            cmd_loadapp(NULL);
-            }
-        }
+        //theres no fallback so panic
+        print("\nFATAL: /bin/init not found in initramfs.\n", 0x4F);
+        kpanic();
     }
+    commandLoop();
     //idle scheduler will run user processes
-    for (;;) { __asm__ volatile ("hlt"); }
+    for (;;) { 
+        __asm__ volatile ("hlt"); 
+    }
 }
+extern char kernel_start, kernel_end;

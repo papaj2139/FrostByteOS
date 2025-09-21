@@ -10,6 +10,9 @@
 
 extern void print(char* msg, unsigned char colour);
 
+//forward declaration for chain free helper used by delete ops
+static int fat16_free_chain(fat16_fs_t* fs, uint16_t start);
+
 static void fat16_debug(const char* msg) {
     serial_write_string("[FAT16] ");
     serial_write_string(msg);
@@ -598,6 +601,41 @@ static int fat16_update_dir_entry_on_disk(fat16_fs_t* fs, const fat16_dir_entry_
     return -1;
 }
 
+int fat16_delete_file_root(fat16_fs_t* fs, const char* filename) {
+    if (!fs || !filename) return -1;
+    //convert to 8.3
+    char fat_name[11];
+    fat16_to_83_name(filename, fat_name);
+
+    uint32_t root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+    uint8_t buffer[512];
+    uint32_t entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+    for (uint32_t sector = 0; sector < root_dir_sectors; sector++) {
+        uint32_t offset = (fs->root_dir_start + sector) * 512;
+        if (device_read(fs->device, offset, buffer, 512) != 512) return -1;
+        fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+        for (uint32_t i = 0; i < entries_per_sector; i++) {
+            if (entries[i].filename[0] == 0x00) return -1; //not found
+            if (entries[i].filename[0] == 0xE5) continue;
+            if (memcmp(entries[i].filename, fat_name, 8) == 0 &&
+                memcmp(entries[i].extension, fat_name + 8, 3) == 0) {
+                //ensure it's not a directory
+                if (entries[i].attributes & FAT16_ATTR_DIRECTORY) return -1;
+                uint16_t first_cluster = entries[i].first_cluster;
+                //mark deleted
+                entries[i].filename[0] = 0xE5;
+                if (device_write(fs->device, offset, buffer, 512) != 512) return -1;
+                //free cluster chain
+                if (first_cluster >= 2) {
+                    if (fat16_free_chain(fs, first_cluster) != 0) return -1;
+                }
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
 int fat16_write_file(fat16_file_t* file, const void* buffer, uint32_t size) {
     if (!file || !file->is_open || !buffer || size == 0) {
         return -1;
@@ -606,7 +644,7 @@ int fat16_write_file(fat16_file_t* file, const void* buffer, uint32_t size) {
     fat16_debug("Writing to file");
 
     fat16_fs_t* fs = file->fs;
-    uint32_t bytes_per_sector = fs->boot_sector.bytes_per_sector; // expect 512
+    uint32_t bytes_per_sector = fs->boot_sector.bytes_per_sector; //expect 512
     uint32_t sectors_per_cluster = fs->boot_sector.sectors_per_cluster;
     uint32_t cluster_size = sectors_per_cluster * bytes_per_sector;
 
@@ -804,4 +842,177 @@ int fat16_close_file(fat16_file_t* file) {
 
     file->is_open = 0;
     return 0;
+}
+
+//free a cluster chain starting at 'start' (inclusive)
+static int fat16_free_chain(fat16_fs_t* fs, uint16_t start) {
+    uint16_t cluster = start;
+    while (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+        uint16_t next = fat16_get_next_cluster(fs, cluster);
+        if (fat16_set_cluster_value(fs, cluster, FAT16_FREE_CLUSTER) != 0) return -1;
+        if (next >= FAT16_END_OF_CHAIN) break;
+        cluster = next;
+    }
+    return 0;
+}
+
+//create a subdirectory in the root directory
+int fat16_create_dir_root(fat16_fs_t* fs, const char* name) {
+    if (!fs || !name) return -1;
+
+    //disallow names "." and ".."
+    if ((name[0] == '.' && name[1] == '\0') ||
+        (name[0] == '.' && name[1] == '.' && name[2] == '\0')) {
+        return -1;
+    }
+
+    //check if entry already exists
+    fat16_dir_entry_t existing;
+    if (fat16_find_file(fs, name, &existing) == 0) {
+        return -1; //EEXIST
+    }
+
+    //convert to 8.3
+    char fat_name[11];
+    fat16_to_83_name(name, fat_name);
+
+    //find empty directory entry in root
+    uint32_t root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+    uint8_t buffer[512];
+    uint32_t entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+    int dir_entry_sector = -1;
+    int dir_entry_index = -1;
+    for (uint32_t sector = 0; sector < root_dir_sectors; sector++) {
+        uint32_t offset = (fs->root_dir_start + sector) * 512;
+        if (device_read(fs->device, offset, buffer, 512) != 512) return -1;
+        fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+        for (uint32_t i = 0; i < entries_per_sector; i++) {
+            if (entries[i].filename[0] == 0x00 || entries[i].filename[0] == 0xE5) {
+                dir_entry_sector = fs->root_dir_start + sector;
+                dir_entry_index = (int)i;
+                goto found_slot;
+            }
+        }
+    }
+found_slot:
+    if (dir_entry_sector == -1) return -1; //no space in root
+
+    //allocate one cluster for directory
+    uint16_t new_cluster = fat16_find_free_cluster(fs);
+    if (new_cluster == 0) return -1;
+    if (fat16_set_cluster_value(fs, new_cluster, 0xFFFF) != 0) return -1; //EOC
+
+    //initialize directory cluster: write '.' and '..' entries, zero the rest
+    //build a 512-byte sector with the two entries
+    memset(buffer, 0, sizeof(buffer));
+    fat16_dir_entry_t* d0 = (fat16_dir_entry_t*)buffer;
+    fat16_dir_entry_t* d1 = d0 + 1;
+    //'.' entry
+    memset(d0, 0, sizeof(*d0));
+    memset(d0->filename, ' ', 8);
+    memset(d0->extension, ' ', 3);
+    d0->filename[0] = '.';
+    d0->attributes = FAT16_ATTR_DIRECTORY;
+    d0->first_cluster = new_cluster;
+    d0->file_size = 0;
+    //'..' entry
+    memset(d1, 0, sizeof(*d1));
+    memset(d1->filename, ' ', 8);
+    memset(d1->extension, ' ', 3);
+    d1->filename[0] = '.';
+    d1->filename[1] = '.';
+    d1->attributes = FAT16_ATTR_DIRECTORY;
+    d1->first_cluster = 0; //parent is root for a subdir of root
+    d1->file_size = 0;
+
+    uint32_t sectors_per_cluster = fs->boot_sector.sectors_per_cluster;
+    uint32_t base_lba = fs->data_start + (new_cluster - 2) * sectors_per_cluster;
+    //write first sector
+    if (device_write(fs->device, base_lba * 512, buffer, 512) != 512) return -1;
+    //zero remaining sectors (if any)
+    if (sectors_per_cluster > 1) {
+        memset(buffer, 0, sizeof(buffer));
+        for (uint32_t s = 1; s < sectors_per_cluster; s++) {
+            if (device_write(fs->device, (base_lba + s) * 512, buffer, 512) != 512) return -1;
+        }
+    }
+
+    //create directory entry in root
+    if (device_read(fs->device, dir_entry_sector * 512, buffer, 512) != 512) return -1;
+    fat16_dir_entry_t* new_entry = &((fat16_dir_entry_t*)buffer)[dir_entry_index];
+    memcpy(new_entry->filename, fat_name, 8);
+    memcpy(new_entry->extension, fat_name + 8, 3);
+    new_entry->attributes = FAT16_ATTR_DIRECTORY;
+    new_entry->reserved[0] = 0;
+    new_entry->time = 0;
+    new_entry->date = 0;
+    new_entry->first_cluster = new_cluster;
+    new_entry->file_size = 0;
+    if (device_write(fs->device, dir_entry_sector * 512, buffer, 512) != 512) {
+        //rollback FAT allocation
+        fat16_set_cluster_value(fs, new_cluster, FAT16_FREE_CLUSTER);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int fat16_dir_is_empty(fat16_fs_t* fs, uint16_t first_cluster) {
+    if (first_cluster < 2) return -1;
+    uint32_t sectors_per_cluster = fs->boot_sector.sectors_per_cluster;
+    uint32_t base_lba = fs->data_start + (first_cluster - 2) * sectors_per_cluster;
+    uint8_t buffer[512];
+    //only check first cluster for entries other than '.' and '..'
+    for (uint32_t s = 0; s < sectors_per_cluster; s++) {
+        if (device_read(fs->device, (base_lba + s) * 512, buffer, 512) != 512) return -1;
+        fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+        uint32_t per_sec = 512 / sizeof(fat16_dir_entry_t);
+        for (uint32_t i = 0; i < per_sec; i++) {
+            if (entries[i].filename[0] == 0x00) return 1; //no more entries
+            if (entries[i].filename[0] == 0xE5) continue; //deleted
+            //skip '.' and '..'
+            if ((entries[i].filename[0] == '.' && entries[i].filename[1] == ' ') ||
+                (entries[i].filename[0] == '.' && entries[i].filename[1] == '.')) {
+                continue;
+            }
+            //any other entry => not empty
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int fat16_remove_dir_root(fat16_fs_t* fs, const char* name) {
+    if (!fs || !name) return -1;
+    //find entry in root
+    char fat_name[11];
+    fat16_to_83_name(name, fat_name);
+    uint32_t root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+    uint8_t buffer[512];
+    uint32_t entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+    for (uint32_t sector = 0; sector < root_dir_sectors; sector++) {
+        uint32_t offset = (fs->root_dir_start + sector) * 512;
+        if (device_read(fs->device, offset, buffer, 512) != 512) return -1;
+        fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+        for (uint32_t i = 0; i < entries_per_sector; i++) {
+            if (entries[i].filename[0] == 0x00) return -1; //not found
+            if (entries[i].filename[0] == 0xE5) continue;
+            if (memcmp(entries[i].filename, fat_name, 8) == 0 &&
+                memcmp(entries[i].extension, fat_name + 8, 3) == 0) {
+                //must be directory
+                if (!(entries[i].attributes & FAT16_ATTR_DIRECTORY)) return -1;
+                uint16_t first_cluster = entries[i].first_cluster;
+                //ensure empty
+                int empty = fat16_dir_is_empty(fs, first_cluster);
+                if (empty != 1) return -1;
+                //delete entry
+                entries[i].filename[0] = 0xE5; //mark deleted
+                if (device_write(fs->device, offset, buffer, 512) != 512) return -1;
+                //free cluster chain
+                if (first_cluster >= 2) fat16_free_chain(fs, first_cluster);
+                return 0;
+            }
+        }
+    }
+    return -1;
 }
