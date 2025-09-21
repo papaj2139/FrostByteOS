@@ -4,6 +4,8 @@
 #include "../drivers/serial.h"
 #include <string.h>
 #include "../kernel/cga.h"
+#include "../process.h"
+#include "../kernel/signal.h"
 
 static device_t g_tty_dev;
 static uint32_t g_tty_mode = (TTY_MODE_CANON | TTY_MODE_ECHO);
@@ -23,6 +25,15 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
             }
             char c = (char)(ev & 0xFF);
             if (c == '\r') c = '\n';
+            if (c == 3) { //ctrl-C (ETX)
+                if (mode & TTY_MODE_ECHO) {
+                    char cc[] = "^C\n";
+                    print(cc, 0x0F);
+                }
+                process_t* curp = process_get_current();
+                signal_raise(curp, SIGINT);
+                return 0; //interrupt the read
+            }
 
             if (c == '\b') {
                 if (pos > 0) {
@@ -59,6 +70,15 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
             }
             char c = (char)(ev & 0xFF);
             if (c == '\r') c = '\n';
+            if (c == 3) {
+                if (mode & TTY_MODE_ECHO) {
+                    char cc[] = "^C\n";
+                    print(cc, 0x0F);
+                }
+                process_t* curp = process_get_current();
+                signal_raise(curp, SIGINT);
+                return (int)pos;
+            }
             buf[pos++] = c;
             if (mode & TTY_MODE_ECHO) {
                 one[0] = c;
@@ -73,6 +93,15 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
             if ((e & 0xFF00u) == 0xE000u) continue;
             char c = (char)(e & 0xFF);
             if (c == '\r') c = '\n';
+            if (c == 3) {
+                if (mode & TTY_MODE_ECHO) {
+                    char cc[] = "^C\n";
+                    print(cc, 0x0F);
+                }
+                process_t* curp = process_get_current();
+                signal_raise(curp, SIGINT);
+                return (int)pos; //return what we have so far (possibly 0)
+            }
             buf[pos++] = c;
             if (mode & TTY_MODE_ECHO) {
                 one[0] = c;

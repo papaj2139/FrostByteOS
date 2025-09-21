@@ -6,8 +6,11 @@
 #include "../device_manager.h"
 #include <stdint.h>
 #include <string.h>
+#include "../kernel/signal.h"
+#include "../process.h"
 
 int shift_pressed = 0;
+static int ctrl_pressed = 0;
 
 //ing buffer for ASCII character
 static volatile char keybuf[64];
@@ -78,8 +81,21 @@ static char sc_to_ascii(uint8_t sc){
         shift_pressed = 0; 
         return 0; 
     }
-    if(sc > 0 && sc < 128) return shift_pressed ? scancode_map_shift[sc] : scancode_map[sc];
-    return 0;
+    if (sc == 0x1D) { //left Ctrl down
+        ctrl_pressed = 1; return 0;
+    }
+    if (sc == 0x9D) { //left Ctrl up
+        ctrl_pressed = 0; return 0;
+    }
+    char ch = 0;
+    if(sc > 0 && sc < 128) ch = shift_pressed ? scancode_map_shift[sc] : scancode_map[sc];
+    if (!ch) return 0;
+    if (ctrl_pressed) {
+        //map letters to control codes (A..Z -> 1..26)
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 1);
+        else if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 1);
+    }
+    return ch;
 }
 
 static void keyboard_irq_handler(void) {
@@ -98,12 +114,20 @@ static void keyboard_irq_handler(void) {
             if (repeat_active && repeat_is_ext && repeat_scancode == code) {
                 repeat_active = 0;
             }
+            //right ctrl release
+            if (code == 0x1D) {
+                ctrl_pressed = 0;
+            }
         } else {
             key_state[code] = 0;
             if (scancode == 0xAA || scancode == 0xB6) shift_pressed = 0; //shift up
             //stop repeating if this was the repeating normal key
             if (repeat_active && !repeat_is_ext && repeat_scancode == code) {
                 repeat_active = 0;
+            }
+            //left ctrl release
+            if (code == 0x1D) {
+                ctrl_pressed = 0;
             }
         }
         return;
@@ -124,18 +148,36 @@ static void keyboard_irq_handler(void) {
                 repeat_next_tick = timer_get_ticks() + KBD_REPEAT_DELAY_TICKS;
                 return;
             }
+            //right ctrl (E0 1D / E0 9D)
+            if (scancode == 0x1D) { 
+                ctrl_pressed = 1; 
+                return; 
+            }
+            if (scancode == 0x9D) { 
+                ctrl_pressed = 0; 
+                return; 
+            }
             //ignore other extended keys for now
             return;
         }
         if (scancode == 0x2A || scancode == 0x36) { 
-            shift_pressed = 1; return;
+            shift_pressed = 1; 
+            return;
          } //shift down
+        if (scancode == 0x1D) { 
+            ctrl_pressed = 1;
+            return; 
+            } //ctrl down
         if (key_state[scancode]) return; //ignore hardware auto-repeat while held software repeat will handle
         key_state[scancode] = 1;
         char ch = sc_to_ascii(scancode);
         if (ch) {
             keybuf_push(ch);
             evbuf_push((unsigned short)(unsigned char)ch);
+            if (ch == 3) {
+                process_t* cur = process_get_current();
+                if (cur) signal_raise(cur, SIGINT);
+            }
             //set up repeat for this normal key
             repeat_is_ext = 0;
             repeat_scancode = scancode;
@@ -163,8 +205,16 @@ char kb_poll(void) {
         }
         if (scancode & 0x80) {
             uint8_t code = (uint8_t)(scancode & 0x7F);
-            if (e0_pending) { ext_key_state[code] = 0; e0_pending = 0; }
-            else { key_state[code] = 0; if (scancode == 0xAA || scancode == 0xB6) shift_pressed = 0; }
+            if (e0_pending) { 
+                ext_key_state[code] = 0; 
+                e0_pending = 0; 
+                if (code == 0x1D) ctrl_pressed = 0; 
+            }
+            else { 
+                key_state[code] = 0; 
+                if (scancode == 0xAA || scancode == 0xB6) shift_pressed = 0; 
+                if (code == 0x1D) ctrl_pressed = 0; 
+            }
             return 0;
         } else {
             if (e0_pending) {
@@ -176,13 +226,35 @@ char kb_poll(void) {
                     evbuf_push(ev);
                     return 0;
                 }
+                if (scancode == 0x1D) { 
+                    ctrl_pressed = 1; 
+                    return 0; 
+                }
+                if (scancode == 0x9D) { 
+                    ctrl_pressed = 0; 
+                    return 0; 
+                }
                 return 0;
             }
-            if (scancode == 0x2A || scancode == 0x36) { shift_pressed = 1; return 0; }
+            if (scancode == 0x2A || scancode == 0x36) { 
+                shift_pressed = 1; 
+                return 0; 
+            }
+            if (scancode == 0x1D) { 
+                ctrl_pressed = 1; 
+                return 0; 
+            }
             if (key_state[scancode]) return 0; //ignore auto-repeat
             key_state[scancode] = 1;
             char ch = sc_to_ascii(scancode);
-            if (ch) { keybuf_push(ch); evbuf_push((unsigned short)(unsigned char)ch); }
+            if (ch) { 
+                keybuf_push(ch); 
+                evbuf_push((unsigned short)(unsigned char)ch);
+                if (ch == 3) {
+                    process_t* cur = process_get_current();
+                    if (cur) signal_raise(cur, SIGINT);
+                }
+            }
             return ch;
         }
     }
@@ -281,7 +353,10 @@ void kbd_flush(void) {
     key_head = key_tail = 0;
     ev_head = ev_tail = 0;
     e0_pending = 0;
-    for (int i = 0; i < 128; ++i) { key_state[i] = 0; ext_key_state[i] = 0; }
+    for (int i = 0; i < 128; ++i) { 
+        key_state[i] = 0; 
+        ext_key_state[i] = 0; 
+    }
     repeat_active = 0;
     repeat_is_ext = 0;
     repeat_scancode = 0;

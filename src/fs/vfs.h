@@ -40,6 +40,7 @@ struct vfs_operations {
     int (*ioctl)(vfs_node_t* node, uint32_t request, void* arg);
     int (*readlink)(vfs_node_t* node, char* buf, uint32_t bufsize);
     int (*symlink)(vfs_node_t* parent, const char* name, const char* target);
+    int (*link)(vfs_node_t* parent, const char* name, vfs_node_t* src); //hard link
 };
 
 //VFS node structure
@@ -89,6 +90,7 @@ int vfs_mkdir(const char* path, uint32_t flags);
 int vfs_rmdir(const char* path);
 int vfs_symlink(const char* target, const char* linkpath);
 int vfs_readlink(const char* path, char* buf, uint32_t bufsize);
+int vfs_link(const char* oldpath, const char* newpath);
 int vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out);
 int vfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out);
 int vfs_get_size(vfs_node_t* node);

@@ -20,6 +20,7 @@
 #include "kernel/elf.h"
 #include "kernel/cga.h"
 #include "kernel/panic.h"
+#include "kernel/signal.h"
 
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
@@ -312,6 +313,10 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_gettimeofday((void*)arg1, (void*)arg2);
         case SYS_NANOSLEEP:
             return sys_nanosleep((const void*)arg1, (void*)arg2);
+        case SYS_LINK:
+            return sys_link((const char*)arg1, (const char*)arg2);
+        case SYS_KILL:
+            return sys_kill(arg1, arg2);
         case SYS_CHDIR:
             return sys_chdir((const char*)arg1);
         case SYS_GETCWD:
@@ -350,9 +355,11 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
         device_t* dev = (curp) ? curp->tty : NULL;
         if (dev) {
             int wr = device_write(dev, 0, buf, count);
+            signal_check_current();
             return (wr < 0) ? wr : (int32_t)count;
         } else {
             int written = tty_write(buf, count);
+            signal_check_current();
             return (written < 0) ? written : (int32_t)count;
         }
     }
@@ -377,6 +384,7 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     serial_printf("%d", bytes_written);
     serial_write_string("\n");
     #endif
+    signal_check_current();
     return bytes_written;
 }
 
@@ -388,9 +396,14 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
         device_t* dev = (cur) ? cur->tty : NULL;
         if (!dev || strcmp(dev->name, "tty0") == 0) {
             //text console keyboard path
-            return tty_read_mode(buf, count, mode);
+            int r = tty_read_mode(buf, count, mode);
+            //ff ctrl-c interrupted input r may be 0 don't terminate the shell in that case
+            if (r > 0) {
+                signal_check_current();
+            }
+            return r;
         } else {
-            //serial or other device: implement a minimal line/raw reader via device manager
+            //serial or other device: implement a line/raw reader via device manager
             uint32_t pos = 0;
             char ch;
             if (mode & TTY_MODE_CANON) {
@@ -432,6 +445,7 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
                     buf[pos++] = t;
                     if (mode & TTY_MODE_ECHO) device_write(dev, 0, &t, 1);
                 }
+                signal_check_current();
                 return (int32_t)pos;
             }
         }
@@ -446,6 +460,7 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
     if (bytes_read >= 0) {
         file->offset += bytes_read;
     }
+    signal_check_current();
     return bytes_read;
 }
 
@@ -949,5 +964,23 @@ int32_t sys_nanosleep(const void* req_ts, void* rem_ts) {
     if (ticks == 0 && nsec > 0) ticks = 1;
     if (ticks > 0xFFFFFFFFu) ticks = 0xFFFFFFFFu;
     process_sleep((uint32_t)ticks);
+    return 0;
+}
+
+int32_t sys_link(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -1;
+    char src[VFS_MAX_PATH], dst[VFS_MAX_PATH];
+    if (normalize_user_path(oldpath, src, sizeof(src)) != 0) return -1;
+    if (normalize_user_path(newpath, dst, sizeof(dst)) != 0) return -1;
+    int r = vfs_link(src, dst);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_kill(uint32_t pid, uint32_t sig) {
+    process_t* p = process_get_by_pid(pid);
+    if (!p) return -1;
+    signal_raise(p, (int)sig);
+    //wake if sleeping
+    process_wake(p);
     return 0;
 }

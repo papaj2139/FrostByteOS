@@ -75,6 +75,14 @@ typedef struct process {
 
     //current working directory (absolute normalized path)
     char cwd[256];
+
+    //signals
+    uint32_t sig_pending;               //bitmask of pending signals (1..31)
+    uint32_t sig_blocked;               //bitmask of blocked signals
+    uint32_t sig_handlers[32];          //user pointers: 0=SIG_DFL 1=SIG_IGN else handler/trampoline
+    cpu_context_t sig_saved_ctx;        //saved user context during signal handler
+    uint32_t sig_delivering;            //signal currently being delivered
+    bool sig_in_handler;                //currently in a signal handler
 } process_t;
 
 //process manager functions

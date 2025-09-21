@@ -32,6 +32,7 @@ static void vfs_debug(const char* msg) {
 #endif
 }
 
+
 static void vfs_debug_path(const char* prefix, const char* path) {
     (void)prefix; (void)path;
 #if LOG_VFS
@@ -957,4 +958,33 @@ int vfs_get_size(vfs_node_t* node) {
 //expose mounts for read-only iteration (like ProcFS)
 const vfs_mount_t* vfs_get_mounts(void) {
     return mount_list;
+}
+
+int vfs_link(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -1;
+    //resolve source node
+    vfs_node_t* src = vfs_resolve_path(oldpath);
+    if (!src) return -1;
+    //get parent directory for newpath
+    char* parent_path = vfs_get_parent_path(newpath);
+    if (!parent_path) { vfs_close(src); return -1; }
+    char* basename = vfs_get_basename(newpath);
+    if (!basename) { kfree(parent_path); vfs_close(src); return -1; }
+
+    //open parent directory with write permission
+    vfs_node_t* parent = vfs_open(parent_path, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    if (!parent) {
+        kfree(parent_path); kfree(basename); vfs_close(src); return -1;
+    }
+
+    int r = -1;
+    if (parent->ops && parent->ops->link) {
+        r = parent->ops->link(parent, basename, src);
+    }
+
+    vfs_close(parent);
+    vfs_close(src);
+    kfree(parent_path);
+    kfree(basename);
+    return r;
 }

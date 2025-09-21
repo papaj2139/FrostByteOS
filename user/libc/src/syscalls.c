@@ -31,6 +31,8 @@
 #define SYS_CLOCK_GETTIME 173
 #define SYS_GETTIMEOFDAY  174
 #define SYS_NANOSLEEP     175
+#define SYS_LINK          176
+#define SYS_KILL          177
 
 typedef struct { 
     int tv_sec; 
@@ -199,4 +201,12 @@ int gettimeofday(void* tv_out, void* tz_ignored) {
 
 int nanosleep(const void* req_ts, void* rem_ts) {
     return syscall2(SYS_NANOSLEEP, (int)req_ts, (int)rem_ts);
+}
+
+int link(const char* oldpath, const char* newpath) {
+    return syscall2(SYS_LINK, (int)oldpath, (int)newpath);
+}
+
+int kill(int pid, int sig) {
+    return syscall2(SYS_KILL, pid, sig);
 }

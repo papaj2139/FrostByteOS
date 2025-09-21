@@ -4,11 +4,20 @@
 #include "../drivers/serial.h"
 #include <string.h>
 
+typedef struct irfs_blob {
+    uint8_t* data;
+    uint32_t size;
+    uint32_t refcnt;
+} irfs_blob_t;
+
 typedef struct initramfs_node {
     char name[64];
     uint32_t type; //VFS_FILE_TYPE_FILE or VFS_FILE_TYPE_DIRECTORY
+    //for symlink data/size hold target string
     uint32_t size;
-    uint8_t* data; //only for files
+    uint8_t* data;
+    //for regular files shared blob
+    irfs_blob_t* blob;
     struct initramfs_node* parent;
     struct initramfs_node* children; //singly-linked list of first child
     struct initramfs_node* next;     //next sibling
@@ -32,6 +41,8 @@ static int irfs_ioctl(vfs_node_t* node, uint32_t request, void* arg);
 static initramfs_node_t* irfs_ensure_dir_path(const char* path);
 static int irfs_readlink(vfs_node_t* node, char* buf, uint32_t bufsize);
 static int irfs_symlink(vfs_node_t* parent, const char* name, const char* target);
+static int irfs_link(vfs_node_t* parent, const char* name, vfs_node_t* src);
+static initramfs_node_t* irfs_node_from_vnode(vfs_node_t* vnode);
 
 static vfs_operations_t g_irfs_ops = {
     .open = irfs_open,
@@ -47,7 +58,8 @@ static vfs_operations_t g_irfs_ops = {
     .get_size = irfs_get_size,
     .ioctl = irfs_ioctl,
     .readlink = irfs_readlink,
-    .symlink = irfs_symlink
+    .symlink = irfs_symlink,
+    .link = irfs_link
 };
 
 static void irfs_debug(const char* m) {
@@ -73,6 +85,7 @@ static initramfs_node_t* irfs_create_node(const char* name, uint32_t type) {
     n->type = type;
     n->size = 0;
     n->data = NULL;
+    n->blob = NULL;
     n->parent = NULL;
     n->children = NULL;
     n->next = NULL;
@@ -131,16 +144,27 @@ static int irfs_add_file_at(initramfs_node_t* parent, const char* filename, cons
         n->next = parent->children;
         parent->children = n;
     }
-    //copy data
-    if (n->data) kfree(n->data);
-    n->data = NULL;
-    n->size = 0;
-    if (size) {
-        n->data = (uint8_t*)kmalloc(size);
-        if (!n->data) return -1;
-        memcpy(n->data, data, size);
-        n->size = size;
+    //replace blob data (drop previous blob if present)
+    if (n->blob) {
+        if (n->blob->refcnt > 1) {
+            n->blob->refcnt--;
+        } else {
+            if (n->blob->data) kfree(n->blob->data);
+            kfree(n->blob);
+        }
+        n->blob = NULL;
     }
+    irfs_blob_t* blob = (irfs_blob_t*)kmalloc(sizeof(irfs_blob_t));
+    if (!blob) return -1;
+    memset(blob, 0, sizeof(*blob));
+    if (size) {
+        blob->data = (uint8_t*)kmalloc(size);
+        if (!blob->data) { kfree(blob); return -1; }
+        memcpy(blob->data, data, size);
+        blob->size = size;
+    }
+    blob->refcnt = 1;
+    n->blob = blob;
     return 0;
 }
 
@@ -210,6 +234,25 @@ int initramfs_add_symlink(const char* path, const char* target) {
     return 0;
 }
 
+static int irfs_link(vfs_node_t* parent_vn, const char* name, vfs_node_t* src_vn) {
+    if (!parent_vn || !name || !src_vn) return -1;
+    initramfs_node_t* parent = irfs_node_from_vnode(parent_vn);
+    initramfs_node_t* src = irfs_node_from_vnode(src_vn);
+    if (!parent || !src) return -1;
+    if (parent->type != VFS_FILE_TYPE_DIRECTORY) return -1;
+    if (src->type != VFS_FILE_TYPE_FILE || !src->blob) return -1;
+    //fail if name exists
+    if (irfs_find_child(parent, name)) return -1;
+    initramfs_node_t* n = irfs_create_node(name, VFS_FILE_TYPE_FILE);
+    if (!n) return -1;
+    n->parent = parent;
+    n->next = parent->children;
+    parent->children = n;
+    n->blob = src->blob;
+    n->blob->refcnt++;
+    return 0;
+}
+
 void initramfs_install_as_root(void) {
     //define ops lazily below
     extern vfs_operations_t* initramfs_get_ops(void*);
@@ -234,7 +277,8 @@ static vfs_node_t* irfs_make_vnode(initramfs_node_t* n) {
     if (!vn) return NULL;
     vn->ops = &g_irfs_ops;
     vn->private_data = n;
-    vn->size = n->size;
+    if (n->type == VFS_FILE_TYPE_FILE) vn->size = n->blob ? n->blob->size : 0;
+    else if (n->type == VFS_FILE_TYPE_SYMLINK) vn->size = n->size; else vn->size = 0;
     vn->parent = NULL;
     return vn;
 }
@@ -257,9 +301,34 @@ static int irfs_create(vfs_node_t* parent, const char* name, uint32_t flags) {
     (void)parent; (void)name; (void)flags; return -1; //not supported
 }
 
-static int irfs_unlink(vfs_node_t* node) { 
-    (void)node; 
-    return -1; 
+static int irfs_unlink(vfs_node_t* vnode) { 
+    if (!vnode) return -1; 
+    initramfs_node_t* n = irfs_node_from_vnode(vnode);
+    if (!n) return -1;
+    if (n->type == VFS_FILE_TYPE_DIRECTORY) return -1;
+    //remove from parent children list
+    initramfs_node_t* parent = n->parent;
+    if (!parent) return -1;
+    initramfs_node_t** pp = &parent->children;
+    while (*pp && *pp != n) pp = &(*pp)->next;
+    if (*pp == n) { *pp = n->next; }
+    //drop file blob or symlink data
+    if (n->type == VFS_FILE_TYPE_FILE) {
+        if (n->blob) {
+            if (n->blob->refcnt > 1) n->blob->refcnt--; else {
+                if (n->blob->data) kfree(n->blob->data);
+                kfree(n->blob);
+            }
+            n->blob = NULL;
+        }
+    } else if (n->type == VFS_FILE_TYPE_SYMLINK) {
+        if (n->data) kfree(n->data);
+        n->data = NULL;
+        n->size = 0;
+    }
+    //free node
+    kfree(n);
+    return 0; 
 }
 
 static int irfs_mkdir(vfs_node_t* parent, const char* name, uint32_t flags) {
@@ -275,18 +344,20 @@ static int irfs_rmdir(vfs_node_t* node) {
 static int irfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer) {
     initramfs_node_t* n = irfs_node_from_vnode(node);
     if (!n) return -1;
-    if (n->type != VFS_FILE_TYPE_FILE) return -1;
-    if (offset >= n->size) return 0;
-    uint32_t tocopy = n->size - offset;
+    if (n->type != VFS_FILE_TYPE_FILE || !n->blob) return -1;
+    if (offset >= n->blob->size) return 0;
+    uint32_t tocopy = n->blob->size - offset;
     if (tocopy > size) tocopy = size;
-    memcpy(buffer, n->data + offset, tocopy);
+    memcpy(buffer, n->blob->data + offset, tocopy);
     return (int)tocopy;
 }
 
 static int irfs_get_size(vfs_node_t* node) {
     initramfs_node_t* n = irfs_node_from_vnode(node);
     if (!n) return -1;
-    return (int)n->size;
+    if (n->type == VFS_FILE_TYPE_FILE) return (int)(n->blob ? n->blob->size : 0);
+    if (n->type == VFS_FILE_TYPE_SYMLINK) return (int)n->size;
+    return 0;
 }
 
 static int irfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) {

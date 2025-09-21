@@ -33,6 +33,8 @@
 #define SYS_CLOCK_GETTIME 173
 #define SYS_GETTIMEOFDAY  174
 #define SYS_NANOSLEEP     175
+#define SYS_LINK          176
+#define SYS_KILL          177
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -78,5 +80,7 @@ int32_t sys_getcwd(char* buf, uint32_t bufsize);
 int32_t sys_clock_gettime(uint32_t clock_id, void* ts_out);
 int32_t sys_gettimeofday(void* tv_out, void* tz_ignored);
 int32_t sys_nanosleep(const void* req_ts, void* rem_ts);
+int32_t sys_link(const char* oldpath, const char* newpath);
+int32_t sys_kill(uint32_t pid, uint32_t sig);
 
 #endif

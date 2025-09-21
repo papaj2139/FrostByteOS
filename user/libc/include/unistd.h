@@ -55,6 +55,8 @@ char* getcwd(char* buf, size_t size);
 int clock_gettime(int clk_id, void* ts_out);      
 int gettimeofday(void* tv_out, void* tz_ignored); 
 int nanosleep(const void* req_ts, void* rem_ts);  
+int link(const char* oldpath, const char* newpath);
+int kill(int pid, int sig);
 
 #ifdef __cplusplus
 }
