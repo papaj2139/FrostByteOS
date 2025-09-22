@@ -1,7 +1,9 @@
 #include <unistd.h>
 #include <string.h>
 
-static void puts1(const char* s) { write(1, s, strlen(s)); }
+static void puts1(const char* s) { 
+    write(1, s, strlen(s)); 
+}
 
 int main(int argc, char** argv, char** envp) {
     (void)envp;
