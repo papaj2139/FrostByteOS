@@ -22,6 +22,10 @@ void signal_check(process_t* p) {
     if (pend & (1u << SIGKILL)) fatal_sig = SIGKILL;
     else if (pend & (1u << SIGTERM)) fatal_sig = SIGTERM;
     else if (pend & (1u << SIGINT)) fatal_sig = SIGINT;
+    else if (pend & (1u << SIGSEGV)) fatal_sig = SIGSEGV;
+    else if (pend & (1u << SIGILL))  fatal_sig = SIGILL;
+    else if (pend & (1u << SIGBUS))  fatal_sig = SIGBUS;
+    else if (pend & (1u << SIGFPE))  fatal_sig = SIGFPE;
 
     if (fatal_sig) {
         //clear and terminate the process

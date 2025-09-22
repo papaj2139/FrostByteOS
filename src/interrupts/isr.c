@@ -82,7 +82,19 @@ void isr_exception_dispatch_ext(int vector, unsigned int errcode,
     //if fault occurred in user mode (CS RPL=3) terminate the offending process instead of panicking
     if ((cs & 3) == 3) {
         int sig = SIGKILL;
-        if (vector == 14) sig = SIGSEGV; //page fault -> segmentation violation
+        switch (vector) {
+            case 0:  /*divide-by-zero*/                 sig = SIGFPE;  break;
+            case 6:  /*invalid opcode*/                 sig = SIGILL;  break;
+            case 10: /*invalid TSS*/                    sig = SIGSEGV; break;
+            case 11: /*segment not present*/            sig = SIGSEGV; break;
+            case 12: /*stack-segment fault*/            sig = SIGSEGV; break;
+            case 13: /*general protection fault*/       sig = SIGSEGV; break;
+            case 14: /*page gault*/                     sig = SIGSEGV; break;
+            case 16: /*x87 floating-point exception*/   sig = SIGFPE;  break;
+            case 17: /*alignment check*/                sig = SIGBUS;  break;
+            case 19: /*SIMD floating-point exception*/  sig = SIGFPE;  break;
+            default:                                      sig = SIGKILL; break;
+        }
         process_t* cur = process_get_current();
         if (cur) {
             signal_raise(cur, sig);

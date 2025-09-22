@@ -456,7 +456,16 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
             process_t* pr = process_get_by_pid(pid);
             const char* name = (pr && pr->name[0]) ? pr->name : "(unknown)";
             const char* st = pr ? proc_state_str(pr->state) : "(none)";
-            len += ksnprintf(tmp + len, sizeof(tmp) - len, "Name:\t%s\nPid:\t%u\nState:\t%s\n", name, pid, st);
+            uint32_t ppid = pr ? pr->ppid : 0;
+            const char* ttyn = (pr && pr->tty) ? pr->tty->name : "(none)";
+            const char* cwd = (pr && pr->cwd[0]) ? pr->cwd : "/";
+            uint32_t prio = pr ? pr->priority : 0;
+            const char* ik = (pr && pr->in_kernel) ? "yes" : "no";
+            uint32_t ueip = pr ? pr->context.eip : 0;
+            uint32_t uesp = pr ? pr->context.esp : 0;
+            len += ksnprintf(tmp + len, sizeof(tmp) - len,
+                             "Name:\t%s\nPid:\t%u\nPPid:\t%u\nState:\t%s\nTTY:\t%s\nCwd:\t%s\nPriority:\t%u\nInKernel:\t%s\nUserEIP:\t0x%x\nUserESP:\t0x%x\n",
+                             name, pid, ppid, st, ttyn, cwd, prio, ik, ueip, uesp);
             break;
         }
         case PROCFS_NODE_FILE_CMDLINE: {
