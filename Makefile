@@ -131,7 +131,6 @@ user/libc/syscalls.o: user/libc/src/syscalls.c
 user/libc/string.o: user/libc/src/string.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
-# apps
 user/init.o: user/init.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -192,6 +191,42 @@ user/write.o: user/write.c
 user/write.elf: user/write.o $(USER_LIBC_OBJS) user.ld
 	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/write.o -o $@
 
+user/kill.o: user/kill.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/kill.elf: user/kill.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/kill.o -o $@
+
+user/ln.o: user/ln.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/ln.elf: user/ln.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/ln.o -o $@
+
+user/ps.o: user/ps.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/ps.elf: user/ps.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/ps.o -o $@
+
+user/mkfat16.o: user/mkfat16.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/mkfat16.elf: user/mkfat16.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/mkfat16.o -o $@
+
+user/lsblk.o: user/lsblk.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/lsblk.elf: user/lsblk.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/lsblk.o -o $@
+
+user/partmk.o: user/partmk.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/partmk.elf: user/partmk.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/partmk.o -o $@
+
 fat16_vfs.o: src/fs/fat16_vfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -245,7 +280,7 @@ $(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
            acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o elf.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf
+initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf
 	rm -rf $(INITRAMFS_DIR) initramfs.cpio
 	mkdir -p $(INITRAMFS_DIR)/bin $(INITRAMFS_DIR)/etc $(INITRAMFS_DIR)/dev $(INITRAMFS_DIR)/proc $(INITRAMFS_DIR)/mnt $(INITRAMFS_DIR)/usr/bin
 	cp user/init.elf $(INITRAMFS_DIR)/bin/init
@@ -258,6 +293,12 @@ initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf use
 	cp user/touch.elf $(INITRAMFS_DIR)/bin/touch
 	cp user/mkdir.elf $(INITRAMFS_DIR)/bin/mkdir
 	cp user/write.elf $(INITRAMFS_DIR)/bin/write
+	cp user/kill.elf $(INITRAMFS_DIR)/bin/kill
+	cp user/ln.elf $(INITRAMFS_DIR)/bin/ln
+	cp user/ps.elf $(INITRAMFS_DIR)/bin/ps
+	cp user/mkfat16.elf $(INITRAMFS_DIR)/bin/mkfat16
+	cp user/lsblk.elf $(INITRAMFS_DIR)/bin/lsblk
+	cp user/partmk.elf $(INITRAMFS_DIR)/bin/partmk
 	echo "Welcome to FrostByte (cpio initramfs)" > $(INITRAMFS_DIR)/etc/motd
 	ln -sf /etc/motd $(INITRAMFS_DIR)/motd_link
 	ln -sf /bin/sh $(INITRAMFS_DIR)/usr/bin/sh
@@ -271,16 +312,21 @@ iso: $(KERNEL) initramfs.cpio
 	grub-mkrescue -o $(ISO_NAME) isodir
 
 run: iso disk.img
-	qemu-system-i386 -cdrom $(ISO_NAME)
+	qemu-system-i386 -cdrom $(ISO_NAME) -hda disk.img
 
 run-serial: iso disk.img
-	qemu-system-i386 -cdrom $(ISO_NAME) -serial stdio -boot d
+	qemu-system-i386 -cdrom $(ISO_NAME) -serial stdio -boot d -hda disk.img
 
 run-sound: iso disk.img
-	qemu-system-i386 -cdrom $(ISO_NAME) -audiodev alsa,id=snd0 -machine pcspk-audiodev=snd0
+	qemu-system-i386 -cdrom $(ISO_NAME) -audiodev alsa,id=snd0 -machine pcspk-audiodev=snd0 -hda disk.img
 
 disk.img:
-	dd if=/dev/zero of=disk.img bs=1M count=1
+	dd if=/dev/zero of=disk.img bs=1M count=64
+
+.PHONY: disk-reset
+disk-reset:
+	rm -f disk.img
+	dd if=/dev/zero of=disk.img bs=1M count=64
 
 clean:
 	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir $(INITRAMFS_DIR) initramfs.cpio

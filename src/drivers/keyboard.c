@@ -8,6 +8,7 @@
 #include <string.h>
 #include "../kernel/signal.h"
 #include "../process.h"
+#include "tty.h"
 
 int shift_pressed = 0;
 static int ctrl_pressed = 0;
@@ -175,14 +176,21 @@ static void keyboard_irq_handler(void) {
             keybuf_push(ch);
             evbuf_push((unsigned short)(unsigned char)ch);
             if (ch == 3) {
-                process_t* cur = process_get_current();
-                if (cur) signal_raise(cur, SIGINT);
+                if (!tty_is_reading()) {
+                    process_t* cur = process_get_current();
+                    if (cur) signal_raise(cur, SIGINT);
+                }
             }
             //set up repeat for this normal key
-            repeat_is_ext = 0;
-            repeat_scancode = scancode;
-            repeat_active = 1;
-            repeat_next_tick = timer_get_ticks() + KBD_REPEAT_DELAY_TICKS;
+            if ((unsigned char)ch >= 32) {
+                repeat_is_ext = 0;
+                repeat_scancode = scancode;
+                repeat_active = 1;
+                repeat_next_tick = timer_get_ticks() + KBD_REPEAT_DELAY_TICKS;
+            } else {
+                //no repeat for control chars (e.g., Ctrl-C)
+                repeat_active = 0;
+            }
         }
     }
 }
@@ -251,8 +259,10 @@ char kb_poll(void) {
                 keybuf_push(ch); 
                 evbuf_push((unsigned short)(unsigned char)ch);
                 if (ch == 3) {
-                    process_t* cur = process_get_current();
-                    if (cur) signal_raise(cur, SIGINT);
+                    if (!tty_is_reading()) {
+                        process_t* cur = process_get_current();
+                        if (cur) signal_raise(cur, SIGINT);
+                    }
                 }
             }
             return ch;

@@ -932,7 +932,7 @@ void kmain(uint32_t magic, uint32_t addr) {
         //register filesystems with VFS
         if (fs_vfs_init() == 0) {
             DEBUG_PRINT("Filesystems registered with VFS");
-            //install initramfs as root prefer multiboot cpio module if present
+            //install initramfs as root 
             initramfs_init();
             if (mbi && (mbi->flags & MBI_FLAG_MODS) && mbi->mods_count > 0) {
                 multiboot_module_t* mods = (multiboot_module_t*)(uintptr_t)mbi->mods_addr;
@@ -951,9 +951,6 @@ void kmain(uint32_t magic, uint32_t addr) {
                 }
             }
             initramfs_install_as_root();
-            //mount devfs and procfs
-            vfs_mount("none", "/dev", "devfs");
-            vfs_mount("none", "/proc", "procfs");
         } else {
             DEBUG_PRINT("Failed to register filesystems with VFS");
             //install initramfs as root since no FS registered still try module
@@ -972,9 +969,6 @@ void kmain(uint32_t magic, uint32_t addr) {
                 }
             }
             initramfs_install_as_root();
-            //mount devfs and procfs even in this path
-            vfs_mount("none", "/dev", "devfs");
-            vfs_mount("none", "/proc", "procfs");
         }
     } else {
         DEBUG_PRINT("Failed to initialize VFS");
@@ -1006,8 +1000,7 @@ void kmain(uint32_t magic, uint32_t addr) {
     //try to spawn /bin/init from current root FS
     if (!spawn_user_from_vfs("/bin/init")) {
         //theres no fallback so panic
-        print("\nFATAL: /bin/init not found in initramfs.\n", 0x4F);
-        kpanic();
+        kpanic_msg("/bin/init not found in initramfs");
     }
     commandLoop();
     //idle scheduler will run user processes

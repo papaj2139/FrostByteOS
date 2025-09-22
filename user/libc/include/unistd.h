@@ -57,6 +57,8 @@ int gettimeofday(void* tv_out, void* tz_ignored);
 int nanosleep(const void* req_ts, void* rem_ts);  
 int link(const char* oldpath, const char* newpath);
 int kill(int pid, int sig);
+int symlink(const char* target, const char* linkpath);
+int readlink(const char* path, char* buf, size_t size);
 
 #ifdef __cplusplus
 }

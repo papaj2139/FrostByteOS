@@ -11,10 +11,10 @@ SECTIONS
 {
     . = 1M;
 
-    /* export start of kernel image */
+    /*export start of kernel image*/
     kernel_start = .;
 
-    /* multiboot header must be in the first loadable segment */
+    /*multiboot header must be in the first loadable segment*/
     .multiboot :
     {
         *(.multiboot)
@@ -44,6 +44,6 @@ SECTIONS
         *(.bss*)
     } :data
 
-    /* export end of kernel image */
+    /*export end of kernel image*/
     kernel_end = .;
 }

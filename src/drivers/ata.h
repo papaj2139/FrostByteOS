@@ -54,6 +54,7 @@ typedef struct {
 //function declarations
 void ata_init(void);
 void ata_probe_and_register(void);
+void ata_rescan_partitions(void);
 
 //ATA requires a 400ns delay after drive selection
 static inline void sleep_400ns(uint16_t control_port) {

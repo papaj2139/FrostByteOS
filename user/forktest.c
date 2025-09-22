@@ -4,8 +4,9 @@
 static volatile char* g_mp = 0;
 
 static void print_hex(unsigned int v) {
-    char buf[11]; // 0x + 8 hex + \n
-    buf[0] = '0'; buf[1] = 'x';
+    char buf[11]; //0x + 8 hex + \n
+    buf[0] = '0'; 
+    buf[1] = 'x';
     const char* hexd = "0123456789ABCDEF";
     for (int i = 0; i < 8; i++) {
         unsigned int shift = (7 - i) * 4;
@@ -16,7 +17,9 @@ static void print_hex(unsigned int v) {
 }
 
 int main(int argc, char** argv, char** envp) {
-    (void)argc; (void)argv; (void)envp;
+    (void)argc; 
+    (void)argv; 
+    (void)envp;
 
     const char* start = "forktest: starting\n";
     write(1, start, strlen(start));

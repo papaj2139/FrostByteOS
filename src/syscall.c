@@ -153,7 +153,10 @@ static uint32_t mmap_find_free_region(page_directory_t dir, uint32_t length, uin
     for (uint32_t base = start; base + length <= end_limit; base += PAGE_SIZE) {
         bool ok = true;
         for (uint32_t off = 0; off < length; off += PAGE_SIZE) {
-            if (vmm_get_physical_addr(base + off) != 0) { ok = false; break; }
+            if (vmm_get_physical_addr(base + off) != 0) { 
+                ok = false; 
+                break; 
+            }
         }
         if (ok) return base;
     }
@@ -223,7 +226,7 @@ static int clone_user_space(page_directory_t src, page_directory_t dst) {
             memcpy((void*)TMP_DST, (void*)TMP_SRC, 4096);
             vmm_unmap_page_nofree(TMP_SRC);
             vmm_unmap_page_nofree(TMP_DST);
-            // map into dst directory at vaddr
+            //map into dst directory at vaddr
             if (vmm_map_page_in_directory(dst, vaddr, dst_phys, flags) != 0) return -1;
         }
     }
@@ -233,7 +236,7 @@ static int clone_user_space(page_directory_t src, page_directory_t dst) {
 //main syscall dispatcher called from assembly
 int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4, uint32_t arg5) {
     (void)arg4; //suppress unused parameter warning
-    (void)arg5; //suppress unused parameter warning
+    (void)arg5; 
     switch (syscall_num) {
         case SYS_EXIT:
             return sys_exit((int32_t)arg1);
@@ -317,6 +320,10 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_link((const char*)arg1, (const char*)arg2);
         case SYS_KILL:
             return sys_kill(arg1, arg2);
+        case SYS_SYMLINK:
+            return sys_symlink((const char*)arg1, (const char*)arg2);
+        case SYS_READLINK:
+            return sys_readlink((const char*)arg1, (char*)arg2, arg3);
         case SYS_CHDIR:
             return sys_chdir((const char*)arg1);
         case SYS_GETCWD:
@@ -355,11 +362,9 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
         device_t* dev = (curp) ? curp->tty : NULL;
         if (dev) {
             int wr = device_write(dev, 0, buf, count);
-            signal_check_current();
             return (wr < 0) ? wr : (int32_t)count;
         } else {
             int written = tty_write(buf, count);
-            signal_check_current();
             return (written < 0) ? written : (int32_t)count;
         }
     }
@@ -384,7 +389,6 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     serial_printf("%d", bytes_written);
     serial_write_string("\n");
     #endif
-    signal_check_current();
     return bytes_written;
 }
 
@@ -497,7 +501,13 @@ int32_t sys_creat(const char* pathname, int32_t mode) {
     if (result != 0) {
         return -1;
     }
-    return sys_open(pathname, 0); //open the file with default flags
+    int fd = sys_open(pathname, 0); //open the file with default flags
+    if (fd < 0) {
+        //failed to open after creating unlink to undo creation
+        vfs_unlink(abspath);
+        return -1;
+    }
+    return fd;
 }
 
 int32_t sys_getpid(void) {
@@ -980,7 +990,21 @@ int32_t sys_kill(uint32_t pid, uint32_t sig) {
     process_t* p = process_get_by_pid(pid);
     if (!p) return -1;
     signal_raise(p, (int)sig);
-    //wake if sleeping
     process_wake(p);
     return 0;
+}
+
+int32_t sys_symlink(const char* target, const char* linkpath) {
+    if (!target || !linkpath) return -1;
+    char lp[VFS_MAX_PATH];
+    if (normalize_user_path(linkpath, lp, sizeof(lp)) != 0) return -1;
+    int r = vfs_symlink(target, lp);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz) {
+    if (!path || !buf || bufsiz == 0) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    return vfs_readlink(ap, buf, bufsiz);
 }

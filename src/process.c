@@ -517,6 +517,25 @@ void process_yield(void) {
 void process_exit(int exit_code) {
     if (!current_process || current_process->pid == 0) return;  //cn't exit kernel
     
+    //reparent all children to init (PID 1) before zombifying
+    process_t* initp = process_get_by_pid(1);
+    process_t* child = current_process->children;
+    current_process->children = NULL;
+    while (child) {
+        process_t* next = child->sibling;
+        //detach from current process
+        child->parent = initp;
+        child->ppid = initp ? initp->pid : 0;
+        //prepend into init children list (if available)
+        if (initp) {
+            child->sibling = initp->children;
+            initp->children = child;
+        } else {
+            child->sibling = NULL;
+        }
+        child = next;
+    }
+
     current_process->exit_code = exit_code;
     current_process->state = PROC_ZOMBIE;
     

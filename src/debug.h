@@ -47,4 +47,8 @@
 #define LOG_FAT16 0
 #endif
 
+#ifndef LOG_ATA
+#define LOG_ATA 0
+#endif
+
 #endif

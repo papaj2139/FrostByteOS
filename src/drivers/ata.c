@@ -1,6 +1,7 @@
 #include "ata.h"
 #include "../io.h"
 #include "../device_manager.h"
+#include "../debug.h"
 #include "serial.h"
 #include <stdint.h>
 #include <string.h>
@@ -130,6 +131,27 @@ static void ata_register_partitions(device_t* base_dev, int drive_no) {
     }
 }
 
+void ata_rescan_partitions(void) {
+    //unregister existing partition devices
+    for (int i = 0; i < ata_part_count; i++) {
+        device_t* pd = &ata_part_devices[i];
+        if (pd->status == DEVICE_STATUS_READY) {
+            device_unregister(pd->device_id);
+            memset(pd, 0, sizeof(*pd));
+            memset(&ata_part_privs[i], 0, sizeof(ata_part_priv_t));
+        }
+    }
+    ata_part_count = 0;
+
+    //rescan partitions for existing drives
+    for (int i = 0; i < ata_drive_count; i++) {
+        device_t* dev = &ata_devices[i];
+        if (dev->status == DEVICE_STATUS_READY) {
+            ata_register_partitions(dev, i);
+        }
+    }
+}
+
 void ata_init(void) {
     //idk might ad something here laer
 }
@@ -137,54 +159,76 @@ void ata_init(void) {
 int ata_wait_bsy(ata_device_data_t* data) {
     int timeout = 100000;
     uint8_t status;
+    #if LOG_ATA
     ata_debug("Waiting for BSY to clear...");
+    #endif
     while (((status = inb(data->data_port + 7)) & ATA_STATUS_BSY) && timeout > 0) {
         timeout--;
     }
+    #if LOG_ATA
     ata_debug_hex("Final status after BSY wait", status);
+    #endif
     if (timeout <= 0) {
+        #if LOG_ATA
         ata_debug("BSY wait TIMEOUT!");
+        #endif
         return -1;
     }
+    #if LOG_ATA
     ata_debug("BSY cleared successfully");
+    #endif
     return 0;
 }
 
 int ata_wait_drq(ata_device_data_t* data) {
     int timeout = 100000;
     uint8_t status;
+    #if LOG_ATA
     ata_debug("Waiting for DRQ to be set...");
+    #endif
     while (!((status = inb(data->data_port + 7)) & ATA_STATUS_DRQ) && timeout > 0) {
         timeout--;
     }
+    #if LOG_ATA
     ata_debug_hex("Final status after DRQ wait", status);
+    #endif
     if (timeout <= 0) {
+        #if LOG_ATA
         ata_debug("DRQ wait TIMEOUT!");
+        #endif
         return -1;
     }
+    #if LOG_ATA
     ata_debug("DRQ set successfully");
+    #endif
     return 0;
 }
 
 static int ata_device_init(device_t* device) {
     ata_device_data_t* data = (ata_device_data_t*)device->private_data;
-
+    #if LOG_ATA
     ata_debug("Initializing ATA device...");
     ata_debug_hex("Data port", data->data_port);
     ata_debug_hex("Control port", data->control_port);
     ata_debug_hex("Drive select", data->drive_select);
-    
+    #endif
     outb(data->data_port + 6, data->drive_select); //select drive
+    #if LOG_ATA
     ata_debug("Drive selected");
+    #endif
     
     //wait for drive to be ready
     if (ata_wait_bsy(data) != 0) {
+        #if LOG_ATA
         ata_debug("Device init failed - BSY timeout");
+        #endif
         return -1; //no drive present or timeout
     }
 
     //send IDENTIFY command
+    #if LOG_ATA
     ata_debug("Sending IDENTIFY command");
+    #endif
     outb(data->data_port + 7, ATA_CMD_IDENTIFY);
 
     //check if drive responds
@@ -230,65 +274,91 @@ static int ata_device_init(device_t* device) {
 
 int ata_read_sectors(device_t* device, uint32_t lba, uint8_t sector_count, uint16_t* buffer) {
     ata_device_data_t* data = (ata_device_data_t*)device->private_data;
-
+    #if LOG_ATA
     ata_debug("Starting sector read...");
     ata_debug_hex("LBA", lba);
     ata_debug_hex("Sector count", sector_count);
     ata_debug_hex("Data port", data->data_port);
     ata_debug_hex("Drive select", data->drive_select);
+    #endif
 
     //select drive and wait 400ns
     uint8_t drive_head = data->drive_select | ((lba >> 24) & 0x0F);
+    #if LOG_ATA
     ata_debug_hex("Drive/head register", drive_head);
+    #endif
     outb(data->data_port + 6, drive_head);
     sleep_400ns(data->control_port);
+    #if LOG_ATA
     ata_debug("Drive selected, 400ns delay complete");
+    #endif
 
     //wait for drive to be ready
     if (ata_wait_bsy(data) != 0) {
+        #if LOG_ATA
         ata_debug("Read failed - BSY timeout before command");
+        #endif
         return -1;
     }
-
+    #if LOG_ATA
     ata_debug("Setting up read command registers...");
+    #endif
     outb(data->data_port + 2, sector_count);
     outb(data->data_port + 3, (uint8_t)lba);
     outb(data->data_port + 4, (uint8_t)(lba >> 8));
     outb(data->data_port + 5, (uint8_t)(lba >> 16));
+    #if LOG_ATA
     ata_debug("Sending READ SECTORS command");
+    #endif
     outb(data->data_port + 7, ATA_CMD_READ_SECTORS);
 
     for (int s = 0; s < sector_count; s++) {
+        #if LOG_ATA
         ata_debug_hex("Reading sector", s);
+        #endif
         if (ata_wait_bsy(data) != 0) {
+            #if LOG_ATA
             ata_debug("Read failed - BSY timeout during sector read");
+            #endif
             return -1; //wait for BSY to clear
         }
         if (ata_wait_drq(data) != 0) {
+            #if LOG_ATA
             ata_debug("Read failed - DRQ timeout during sector read");
+            #endif
             return -1;
         }
         uint8_t status = inb(data->data_port + 7);
         if (status & ATA_STATUS_ERR) {
+            #if LOG_ATA
             ata_debug_hex("Read failed - error status", status);
+            #endif
             return -1;
         }
 
+        #if LOG_ATA
         ata_debug("Reading 512 bytes from data port...");
+        #endif
         for (int i = 0; i < 256; i++) {
             buffer[s * 256 + i] = inw(data->data_port);
         }
+        #if LOG_ATA
         ata_debug("Sector read complete");
+        #endif
     }
+    #if LOG_ATA
     ata_debug("All sectors read successfully");
+    #endif
     return 0;
 }
 
 int ata_write_sectors(device_t* device, uint32_t lba, uint8_t sector_count, const uint16_t* buffer) {
     ata_device_data_t* data = (ata_device_data_t*)device->private_data;
+    #if LOG_ATA
     ata_debug("Starting sector write...");
     ata_debug_hex("LBA", lba);
     ata_debug_hex("Sector count", sector_count);
+    #endif
 
     //select drive and wait 400ns
     uint8_t drive_head = data->drive_select | ((lba >> 24) & 0x0F);
@@ -297,7 +367,9 @@ int ata_write_sectors(device_t* device, uint32_t lba, uint8_t sector_count, cons
 
     //wait for drive to be ready
     if (ata_wait_bsy(data) != 0) {
+        #if LOG_ATA
         ata_debug("Write failed - BSY timeout before command");
+        #endif
         return -1;
     }
 
@@ -308,50 +380,70 @@ int ata_write_sectors(device_t* device, uint32_t lba, uint8_t sector_count, cons
     outb(data->data_port + 7, ATA_CMD_WRITE_SECTORS);
 
     for (int s = 0; s < sector_count; s++) {
+        #if LOG_ATA
         ata_debug_hex("Writing sector", s);
+        #endif
         if (ata_wait_bsy(data) != 0) {
+            #if LOG_ATA
             ata_debug("Write failed - BSY timeout during sector write");
+            #endif
             return -1;
         }
         if (ata_wait_drq(data) != 0) {
+            #if LOG_ATA
             ata_debug("Write failed - DRQ timeout during sector write");
+            #endif
             return -1;
         }
         if (inb(data->data_port + 7) & ATA_STATUS_ERR) {
+            #if LOG_ATA
             ata_debug("Write failed - error status");
+            #endif
             return -1;
         }
-
+        #if LOG_ATA
         ata_debug("Writing 512 bytes to data port...");
+        #endif
         for (int i = 0; i < 256; i++) {
             outw(data->data_port, buffer[s * 256 + i]);
         }
         //after writing the data for a sector, the drive needs a cache flush
         outb(data->data_port + 7, ATA_CMD_CACHE_FLUSH);
         if (ata_wait_bsy(data) != 0) {
+            #if LOG_ATA
             ata_debug("Write failed - BSY timeout after cache flush");
+            #endif
             return -1;
         }
+        #if LOG_ATA
         ata_debug("Sector write complete");
+        #endif
     }
+    #if LOG_ATA
     ata_debug("All sectors written successfully");
+    #endif
     return 0;
 }
 
 int ata_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size) {
     uint32_t lba = offset / 512;
     uint8_t sector_count = (size + 511) / 512;
+    #if LOG_ATA
     ata_debug("Device read request:");
     ata_debug_hex("Offset", offset);
     ata_debug_hex("Size", size);
     ata_debug_hex("Calculated LBA", lba);
     ata_debug_hex("Calculated sector count", sector_count);
-    
+    #endif
     if (ata_read_sectors(device, lba, sector_count, (uint16_t*)buffer) != 0) {
+        #if LOG_ATA
         ata_debug("ata_read_sectors failed");
+        #endif
         return -1;
     }
+    #if LOG_ATA
     ata_debug_hex("Device read successful, returning bytes", size);
+    #endif
     return size; //return bytes read
 }
 

@@ -4,37 +4,39 @@
 #include <stdint.h>
 
 //syscall numbers
-#define SYS_EXIT    1
-#define SYS_WRITE   4
-#define SYS_READ    3
-#define SYS_OPEN    5
-#define SYS_CLOSE   6
-#define SYS_GETPID  20
-#define SYS_SLEEP   162
-#define SYS_CREAT   8
-#define SYS_FORK    2
-#define SYS_EXECVE  11     
-#define SYS_WAIT    7
-#define SYS_YIELD   158
-#define SYS_IOCTL   54
-#define SYS_BRK     45   //set program break
-#define SYS_SBRK    69   //adjust program break by increment
-#define SYS_MOUNT   165
-#define SYS_UMOUNT  166
-#define SYS_UNLINK  10
-#define SYS_MKDIR   39
-#define SYS_RMDIR   40
-#define SYS_READDIR_FD 167
-#define SYS_MMAP    168
-#define SYS_MUNMAP  169
-#define SYS_TIME    170
-#define SYS_CHDIR   171
-#define SYS_GETCWD  172
-#define SYS_CLOCK_GETTIME 173
-#define SYS_GETTIMEOFDAY  174
-#define SYS_NANOSLEEP     175
-#define SYS_LINK          176
-#define SYS_KILL          177
+#define SYS_EXIT           1000
+#define SYS_WRITE          1001
+#define SYS_READ           1002
+#define SYS_OPEN           1003
+#define SYS_CLOSE          1004
+#define SYS_GETPID         1005
+#define SYS_SLEEP          1006
+#define SYS_CREAT          1007
+#define SYS_FORK           1008
+#define SYS_EXECVE         1009
+#define SYS_WAIT           1010
+#define SYS_YIELD          1011
+#define SYS_IOCTL          1012
+#define SYS_BRK            1013
+#define SYS_SBRK           1014
+#define SYS_MOUNT          1015
+#define SYS_UMOUNT         1016
+#define SYS_UNLINK         1017
+#define SYS_MKDIR          1018
+#define SYS_RMDIR          1019
+#define SYS_READDIR_FD     1020
+#define SYS_MMAP           1021
+#define SYS_MUNMAP         1022
+#define SYS_TIME           1023
+#define SYS_CHDIR          1024
+#define SYS_GETCWD         1025
+#define SYS_CLOCK_GETTIME  1026
+#define SYS_GETTIMEOFDAY   1027
+#define SYS_NANOSLEEP      1028
+#define SYS_LINK           1029
+#define SYS_KILL           1030
+#define SYS_SYMLINK        1031
+#define SYS_READLINK       1032
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -82,5 +84,7 @@ int32_t sys_gettimeofday(void* tv_out, void* tz_ignored);
 int32_t sys_nanosleep(const void* req_ts, void* rem_ts);
 int32_t sys_link(const char* oldpath, const char* newpath);
 int32_t sys_kill(uint32_t pid, uint32_t sig);
+int32_t sys_symlink(const char* target, const char* linkpath);
+int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz);
 
 #endif

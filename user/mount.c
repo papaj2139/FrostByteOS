@@ -11,7 +11,7 @@ static void puts2(const char* a, const char* b) {
 
 int main(int argc, char** argv, char** envp) {
     (void)envp;
-    //recompute argc from argv to be robust
+    //recompute argc from argv
     int ac = 0; if (argv) { 
         while (argv[ac]) ac++; 
     }
@@ -36,7 +36,12 @@ int main(int argc, char** argv, char** envp) {
         puts1("mount <device> <mount_point> <fs>\n"); 
         return 1; 
     }
-    if (mount(argv[1], argv[2], argv[3]) == 0) {
+    const char* dev = argv[1];
+    //accept full path like /dev/ata0p1 by stripping the /dev/ prefix
+    if (dev[0] == '/' && dev[1] == 'd' && dev[2] == 'e' && dev[3] == 'v' && dev[4] == '/') {
+        dev += 5;
+    }
+    if (mount(dev, argv[2], argv[3]) == 0) {
         puts1("mounted\n");
         return 0;
     }

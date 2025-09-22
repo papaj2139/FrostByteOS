@@ -25,6 +25,7 @@ typedef enum {
     PROCFS_NODE_DIR_PID,
     PROCFS_NODE_FILE_STATUS,
     PROCFS_NODE_FILE_CMDLINE,
+    PROCFS_NODE_RESCAN,
 } procfs_node_kind_t;
 
 typedef struct {
@@ -83,12 +84,18 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
         char cmd[32];
         procfs_copy_trim_lower(cmd, sizeof(cmd), buffer, size);
         if (cmd[0] == '\0') return 0;
-        // allow 'tty0' or 'serial0'
+        //allow 'tty0' or 'serial0'
         device_t* dev = device_find_by_name(cmd);
         if (!dev) return -1;
         process_t* cur = process_get_current();
         if (!cur) return -1;
         cur->tty = dev;
+        return (int)size;
+    }
+    if (p->kind == PROCFS_NODE_RESCAN) {
+        //ATA rescan
+        extern void ata_rescan_partitions(void);
+        ata_rescan_partitions();
         return (int)size;
     }
     return -1;
@@ -104,7 +111,7 @@ static int procfs_close(vfs_node_t* node) {
 
 static vfs_node_t* procfs_make_node(const char* name, uint32_t type, procfs_node_kind_t kind, uint32_t pid, vfs_node_t* parent) {
     uint32_t flags = VFS_FLAG_READ;
-    if (kind == PROCFS_NODE_VGA_CTRL) flags = VFS_FLAG_WRITE; //control is write-only
+    if (kind == PROCFS_NODE_VGA_CTRL || kind == PROCFS_NODE_RESCAN) flags = VFS_FLAG_WRITE; //control is write-only
     if (kind == PROCFS_NODE_TTY) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read current write to switch
     vfs_node_t* n = vfs_create_node(name, type, flags);
     if (!n) return NULL;
@@ -153,20 +160,24 @@ static int procfs_readdir_root(uint32_t index, vfs_node_t* node, vfs_node_t** ou
         *out = procfs_make_node("vga", VFS_FILE_TYPE_FILE, PROCFS_NODE_VGA_CTRL, 0, node); 
         return *out ? 0 : -1; 
     }
-    if (index == 5) { 
+    if (index == 6) { 
         *out = procfs_make_node("uptime", VFS_FILE_TYPE_FILE, PROCFS_NODE_UPTIME, 0, node); 
         return *out ? 0 : -1; 
     }
-    if (index == 6) { 
+    if (index == 7) { 
         *out = procfs_make_node("tty", VFS_FILE_TYPE_FILE, PROCFS_NODE_TTY, 0, node); 
         return *out ? 0 : -1; 
     }
-    if (index == 7) { 
+    if (index == 8) { 
+        *out = procfs_make_node("rescan", VFS_FILE_TYPE_FILE, PROCFS_NODE_RESCAN, 0, node); 
+        return *out ? 0 : -1; 
+    }
+    if (index == 9) { 
         *out = procfs_make_node("self", VFS_FILE_TYPE_DIRECTORY, PROCFS_NODE_DIR_SELF, 0, node); 
         return *out ? 0 : -1; 
     }
-    //process directories start at index 8
-    uint32_t which = index - 8;
+    //process directories start at index 10
+    uint32_t which = index - 10;
     uint32_t seen = 0;
     for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
         process_t* pr = &process_table[i];
@@ -257,6 +268,10 @@ static int procfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) 
             *out = procfs_make_node("tty", VFS_FILE_TYPE_FILE, PROCFS_NODE_TTY, 0, node); 
             return *out ? 0 : -1; 
         }
+        if (strcmp(name, "rescan") == 0) { 
+            *out = procfs_make_node("rescan", VFS_FILE_TYPE_FILE, PROCFS_NODE_RESCAN, 0, node); 
+            return *out ? 0 : -1; 
+        }
         if (strcmp(name, "self") == 0) { 
             *out = procfs_make_node("self", VFS_FILE_TYPE_DIRECTORY, PROCFS_NODE_DIR_SELF, 0, node); 
             return *out ? 0 : -1; 
@@ -298,6 +313,10 @@ static int procfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) 
         }
         if (strcmp(name, "tty") == 0) { 
             *out = procfs_make_node("tty", VFS_FILE_TYPE_FILE, PROCFS_NODE_TTY, 0, node); 
+            return *out ? 0 : -1; 
+        }
+        if (strcmp(name, "rescan") == 0) { 
+            *out = procfs_make_node("rescan", VFS_FILE_TYPE_FILE, PROCFS_NODE_RESCAN, 0, node); 
             return *out ? 0 : -1; 
         }
         if (strcmp(name, "self") == 0) { 
@@ -400,7 +419,7 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
             break;
         }
         case PROCFS_NODE_FILE_STATUS: {
-            uint32_t pid = p->pid ? p->pid : (process_get_current() ? process_get_current()->pid : 0);
+            uint32_t pid = p->pid;
             process_t* pr = process_get_by_pid(pid);
             const char* name = (pr && pr->name[0]) ? pr->name : "(unknown)";
             const char* st = pr ? proc_state_str(pr->state) : "(none)";
@@ -408,7 +427,7 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
             break;
         }
         case PROCFS_NODE_FILE_CMDLINE: {
-            uint32_t pid = p->pid ? p->pid : (process_get_current() ? process_get_current()->pid : 0);
+            uint32_t pid = p->pid;
             process_t* pr = process_get_by_pid(pid);
             const char* cmd = "";
             if (pr) {
@@ -430,7 +449,8 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
         case PROCFS_NODE_TTY: {
             process_t* cur = process_get_current();
             const char* name = (cur && cur->tty) ? cur->tty->name : "(none)";
-            len += ksnprintf(tmp + len, sizeof(tmp) - len, "%s\n", name);            break;
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "%s\n", name);            
+            break;
         }
         default: return -1;
     }
@@ -441,7 +461,12 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
     return (int)to_copy;
 }
 
-static int procfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) { (void)node; (void)request; (void)arg; return -1; }
+static int procfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) { 
+    (void)node; 
+    (void)request; 
+    (void)arg; 
+    return -1; 
+}
 
 vfs_operations_t procfs_ops = {
     .open = procfs_open,

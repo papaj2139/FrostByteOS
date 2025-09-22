@@ -1,5 +1,5 @@
 # FrostByte
-FrostByte (sometimes refered to as "FrostByte OS" or "FBOS") is a hobbyist operating system made by [HarryDoesTech](https://yt.harrydoestech.com).
+FrostByte (sometimes refered to as "FrostByte OS" or "FBOS") is a hobbyist from-scratch operating system made by [HarryDoesTech](https://yt.harrydoestech.com).
 FrostByte is the sucessor of CakeOS.
 ## Issues
 If you encunter any issues please open an issue ticket or email **frostbyte.operatingsystem@gmail.com**
@@ -39,7 +39,7 @@ make CC=i386-elf-gcc
 - a VM or physical machine with BIOS or alternatively UEFI with CSM
 - for real hardware like any PC made since ~1998 should work:
 - 6MB of ram minimum
-- An x86 or amd64 CPU
+- An IA-32 or amd64 CPU
 - PS/2 keyboard and (optional) mouse
 - VGA-capable GPU
 - (optional) an IDE hard drive
@@ -59,6 +59,9 @@ make CC=i386-elf-gcc
 - Add USB support
 - Premptive multitasking (rn cooperative)
 - Improve scheduler
+- ATAPI support
+- SATA and AHCI support
+- PCI/PCIE detection
 
 # Credits
 Special thanks to:

@@ -9,11 +9,13 @@
 
 static device_t g_tty_dev;
 static uint32_t g_tty_mode = (TTY_MODE_CANON | TTY_MODE_ECHO);
+static volatile int g_tty_reading = 0;
 
 int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
     if (!buf || size == 0) return 0;
     uint32_t pos = 0;
     char one[2] = {0, 0};
+    g_tty_reading = 1;
 
     if (mode & TTY_MODE_CANON) {
         //canonical mode line buffering with backspace editing optional echo
@@ -30,9 +32,13 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
                     char cc[] = "^C\n";
                     print(cc, 0x0F);
                 }
-                process_t* curp = process_get_current();
-                signal_raise(curp, SIGINT);
-                return 0; //interrupt the read
+                g_tty_reading = 0;
+                return 0; //interrupt the read without signal (shell stays alive)
+            }
+            if (c == 4) { //Ctrl-D (EOT)
+                int r = (int)pos;
+                g_tty_reading = 0;
+                return r;
             }
 
             if (c == '\b') {
@@ -57,6 +63,7 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
             }
 
             if (c == '\n' || pos >= size) {
+                g_tty_reading = 0;
                 return (int)pos;
             }
         }
@@ -75,9 +82,13 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
                     char cc[] = "^C\n";
                     print(cc, 0x0F);
                 }
-                process_t* curp = process_get_current();
-                signal_raise(curp, SIGINT);
+                g_tty_reading = 0;
                 return (int)pos;
+            }
+            if (c == 4) { //ctrl-D
+                int r = (int)pos;
+                g_tty_reading = 0;
+                return r;
             }
             buf[pos++] = c;
             if (mode & TTY_MODE_ECHO) {
@@ -98,9 +109,13 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
                     char cc[] = "^C\n";
                     print(cc, 0x0F);
                 }
-                process_t* curp = process_get_current();
-                signal_raise(curp, SIGINT);
+                g_tty_reading = 0;
                 return (int)pos; //return what we have so far (possibly 0)
+            }
+            if (c == 4) { //ctrl-D
+                int r = (int)pos;
+                g_tty_reading = 0;
+                return r;
             }
             buf[pos++] = c;
             if (mode & TTY_MODE_ECHO) {
@@ -108,6 +123,7 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
                 print(one, 0x0F);
             }
         }
+        g_tty_reading = 0;
         return (int)pos;
     }
 }
@@ -135,6 +151,7 @@ int tty_write(const char* buf, uint32_t size) {
 //mode control
 void tty_set_mode(uint32_t mode) { g_tty_mode = mode; }
 uint32_t tty_get_mode(void) { return g_tty_mode; }
+int tty_is_reading(void) { return g_tty_reading; }
 
 int tty_ioctl(uint32_t cmd, void* arg) {
     switch (cmd) {
