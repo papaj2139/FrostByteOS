@@ -13,6 +13,7 @@ static page_directory_t current_directory = 0;
 
 extern void enable_paging(uint32_t directory_phys);
 extern void flush_tlb(void);
+extern void switch_cr3(uint32_t directory_phys);
 
 //map a physical page temporarily at a scratch VA (<8MB identity-mapped PDE/PT)
 //and zero it hen unmap the scratch VA this avoids relying on PHYSICAL_TO_VIRTUAL
@@ -195,9 +196,12 @@ int vmm_unmap_page(uint32_t virtual_addr) {
     }
 
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) return -1;
 
     if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        unmap_pt_temp(saved_entry);
         return -1; //page not mapped
     }
 
@@ -206,6 +210,7 @@ int vmm_unmap_page(uint32_t virtual_addr) {
 
     //clear page table entry
     page_table[pt_index] = 0;
+    unmap_pt_temp(saved_entry);
 
     //free physical page
     pmm_free_page(phys_addr);
@@ -228,14 +233,18 @@ int vmm_unmap_page_nofree(uint32_t virtual_addr) {
     }
 
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) return -1;
 
     if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        unmap_pt_temp(saved_entry);
         return -1; //page not mapped
     }
 
     //clear page table entry without freeing the physical frame
     page_table[pt_index] = 0;
+    unmap_pt_temp(saved_entry);
 
     //flush TLB
     flush_tlb();
@@ -255,14 +264,18 @@ uint32_t vmm_get_physical_addr(uint32_t virtual_addr) {
     }
 
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) return 0;
 
     if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        unmap_pt_temp(saved_entry);
         return 0; //not mapped
     }
 
     uint32_t phys_page = page_table[pt_index] & ~0xFFF;
     uint32_t offset = virtual_addr & 0xFFF;
+    unmap_pt_temp(saved_entry);
 
     return phys_page + offset;
 }
@@ -291,9 +304,11 @@ page_directory_t vmm_create_directory(void) {
 }
 
 void vmm_switch_directory(page_directory_t directory) {
+    if (!directory) return;
+    if (current_directory == directory) return; //avoid redundant TLB flush
     current_directory = directory;
     uint32_t dir_phys = VIRTUAL_TO_PHYSICAL((uint32_t)directory);
-    enable_paging(dir_phys);
+    switch_cr3(dir_phys);
 }
 
 
@@ -316,17 +331,18 @@ int vmm_map_page_in_directory(page_directory_t directory, uint32_t virtual_addr,
 
         directory[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
 
-        //clear the new page table
-        page_table_t pt = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
-        memset(pt, 0, PAGE_SIZE);
+        //clear the new page table using scratch mapping to avoid higher-half dependency
+        zero_phys_page_temp(pt_phys);
     }
 
-    //get page table
+    //get page table via scratch mapping (robust even if pt_phys is outside higher-half direct map)
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
-
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) return -1;
     //map the page
     page_table[pt_index] = (physical_addr & ~0xFFF) | flags;
+    unmap_pt_temp(saved_entry);
 
     return 0;
 }

@@ -3,6 +3,7 @@ section .text
 
 global enable_paging
 global flush_tlb
+global switch_cr3
 
 enable_paging:
     mov eax, [esp+4]    ;get page directory physical address
@@ -16,4 +17,10 @@ enable_paging:
 flush_tlb:
     mov eax, cr3
     mov cr3, eax        ;reload CR3 to flush TLB
+    ret
+
+;load a new CR3 (page directory physical address) without changing CR0.PG
+switch_cr3:
+    mov eax, [esp+4]
+    mov cr3, eax
     ret

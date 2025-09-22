@@ -499,7 +499,7 @@ void vga_present(const uint8_t* surface){
             void* d = dst8;
             unsigned n = dwords;
             __asm__ volatile (
-                "cld\n\trep movsd"
+                "cld\n\trep movsl"
                 : "+S"(s), "+D"(d), "+c"(n)
                 :
                 : "memory"

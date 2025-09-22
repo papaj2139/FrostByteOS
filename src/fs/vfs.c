@@ -32,6 +32,22 @@ static void vfs_debug(const char* msg) {
 #endif
 }
 
+//enumerate registered filesystem type names (read-only snapshot)
+int vfs_list_fs_types(char names[][32], uint32_t max, uint32_t* out_count) {
+    if (!names || max == 0) {
+        if (out_count) *out_count = 0;
+        return -1;
+    }
+    uint32_t cnt = 0;
+    for (vfs_fs_type_t* cur = registered_fs_types; cur && cnt < max; cur = cur->next) {
+        strncpy(names[cnt], cur->name, 31);
+        names[cnt][31] = '\0';
+        cnt++;
+    }
+    if (out_count) *out_count = cnt;
+    return 0;
+}
+
 
 static void vfs_debug_path(const char* prefix, const char* path) {
     (void)prefix; (void)path;

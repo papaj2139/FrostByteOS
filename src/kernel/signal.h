@@ -6,6 +6,7 @@
 
 //signal numbers
 #define SIGINT   2
+#define SIGSEGV  11
 #define SIGKILL  9
 #define SIGTERM  15
 #define SIGCHLD  17

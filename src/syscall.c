@@ -21,6 +21,7 @@
 #include "kernel/cga.h"
 #include "kernel/panic.h"
 #include "kernel/signal.h"
+#include "kernel/uaccess.h"
 
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
@@ -355,7 +356,10 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     serial_printf("%x", (uint32_t)buf);
     serial_write_string("\n");
     #endif
-    
+    //validate user buffer
+    if (!buf || count == 0) return 0;
+    if (!user_range_ok(buf, count, 0)) return -1;
+
     if (fd == 1 || fd == 2) {
         //route stdout/stderr to controlling TTY device
         process_t* curp = process_get_current();
@@ -393,6 +397,8 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
 }
 
 int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
+    if (!buf || count == 0) return 0;
+    if (!user_range_ok(buf, count, 1)) return -1;
     if (fd == 0) {
         //read from controlling TTY using the current process TTY mode
         process_t* cur = process_get_current();
@@ -749,10 +755,12 @@ int32_t sys_ioctl(int32_t fd, uint32_t cmd, void* arg) {
         if (!cur) return -1;
         if (cmd == TTY_IOCTL_SET_MODE) {
             if (!arg) return -1;
+            if (!user_range_ok(arg, sizeof(uint32_t), 0)) return -1;
             cur->tty_mode = *(uint32_t*)arg;
             return 0;
         } else if (cmd == TTY_IOCTL_GET_MODE) {
             if (!arg) return -1;
+            if (!user_range_ok(arg, sizeof(uint32_t), 1)) return -1;
             *(uint32_t*)arg = cur->tty_mode;
             return 0;
         }
@@ -792,6 +800,8 @@ int32_t sys_rmdir(const char* path) {
 int32_t sys_readdir_fd(int32_t fd, uint32_t index, char* name_buf, uint32_t buf_size, uint32_t* out_type) {
     vfs_file_t* file = fd_get(fd);
     if (!file || !file->node) return -1;
+    if (name_buf && buf_size > 0 && !user_range_ok(name_buf, buf_size, 1)) return -1;
+    if (out_type && !user_range_ok(out_type, sizeof(uint32_t), 1)) return -1;
     vfs_node_t* node = file->node;
     if (node->type != VFS_FILE_TYPE_DIRECTORY) return -1;
     vfs_node_t* child = NULL;
@@ -1004,6 +1014,7 @@ int32_t sys_symlink(const char* target, const char* linkpath) {
 
 int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz) {
     if (!path || !buf || bufsiz == 0) return -1;
+    if (!user_range_ok(buf, bufsiz, 1)) return -1;
     char ap[VFS_MAX_PATH];
     if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
     return vfs_readlink(ap, buf, bufsiz);

@@ -257,6 +257,9 @@ kshutdown.o: src/kernel/kshutdown.c
 signal.o: src/kernel/signal.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+uaccess.o: src/kernel/uaccess.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 acpi.o: src/arch/x86/acpi.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -277,7 +280,7 @@ $(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
            vga.o vga_dev.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
            syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o devfs.o procfs.o fd.o initramfs.o initramfs_cpio.o \
            pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o \
-           acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o elf.o
+           acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o uaccess.o elf.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf
@@ -329,4 +332,4 @@ disk-reset:
 	dd if=/dev/zero of=disk.img bs=1M count=64
 
 clean:
-	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir $(INITRAMFS_DIR) initramfs.cpio
+	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir $(INITRAMFS_DIR) initramfs.cpio user/*.o user/*.elf

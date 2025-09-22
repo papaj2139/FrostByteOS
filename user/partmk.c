@@ -34,6 +34,7 @@ static unsigned parse_u32(const char* s){
 
 int main(int argc, char** argv, char** envp) {
     (void)envp;
+    (void)argc;
     //recompute argc
     int ac=0; 
     if (argv){ 

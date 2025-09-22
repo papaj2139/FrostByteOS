@@ -25,7 +25,7 @@ int main(int argc, char** argv, char** envp) {
         //launch a shell session
         int cpid = fork();
         if (cpid == 0) {
-            char* sav[] = { "/bin/forkest", 0 };
+            char* sav[] = { "/bin/forkkest", 0 };
             char* sev[] = { 0 };
             execve("/bin/forktest", sav, sev);
             _exit(127);

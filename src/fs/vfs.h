@@ -105,6 +105,10 @@ int vfs_set_root_ops(vfs_operations_t* ops, void* private_data);
 //enumerate current mounts (read-only) returns head of internal list
 const vfs_mount_t* vfs_get_mounts(void);
 
+//enumerate registered filesystem type names (read-only snapshot)
+//fills up to 'max' entries of 32-byte strings in 'names' and returns 0 on success
+int vfs_list_fs_types(char names[][32], uint32_t max, uint32_t* out_count);
+
 //path manipulation functions
 char* vfs_get_parent_path(const char* path);
 char* vfs_get_basename(const char* path);

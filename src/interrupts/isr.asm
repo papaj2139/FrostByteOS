@@ -10,10 +10,23 @@ extern isr_exception_dispatch_ext
 global isr%1
 isr%1:
     pushad
-    push dword 0           ;no error code
-    push dword %1          ;vector number
-    call isr_exception_dispatch
-    add esp, 8             ;pop our args
+    ;for no-error-code exceptions the CPU-pushed frame is: [EIP][CS][EFLAGS][(USERESP)][(SS)]
+    ;after pushad (32 bytes) EIP is at [esp+32]
+    mov ecx, [esp + 32]   ;eip
+    mov edx, [esp + 36]   ;cs
+    mov ebx, [esp + 40]   ;eflags
+    mov esi, [esp + 44]   ;useresp (if CPL change)
+    mov edi, [esp + 48]   ;ss (if CPL change)
+    ;push args: ss, useresp, eflags, cs, eip, errcode=0, vector
+    push edi
+    push esi
+    push ebx
+    push edx
+    push ecx
+    push dword 0
+    push dword %1
+    call isr_exception_dispatch_ext
+    add esp, 28
     popad
     iretd
 %endmacro
@@ -22,12 +35,25 @@ isr%1:
 global isr%1
 isr%1:
     pushad
-    push dword [esp + 32]  ;original CPU-pushed error code
-    push dword %1          ;vector number
-    call isr_exception_dispatch
-    add esp, 8             ;pop our args
+    ;after pushad layout has the CPU pushed error code at [esp+32]
+    mov eax, [esp + 32]   ;errcode
+    mov ecx, [esp + 36]   ;eip
+    mov edx, [esp + 40]   ;cs
+    mov ebx, [esp + 44]   ;eflags
+    mov esi, [esp + 48]   ;useresp (if CPL change)
+    mov edi, [esp + 52]   ;ss (if CPL change)
+    ;push args: ss, useresp, eflags, cs, eip, errcode, vector
+    push edi
+    push esi
+    push ebx
+    push edx
+    push ecx
+    push eax
+    push dword %1
+    call isr_exception_dispatch_ext
+    add esp, 28
     popad
-    add esp, 4             ;discard original error code
+    add esp, 4             ;discard original CPU-pushed error code
     iretd
 %endmacro
 
@@ -52,7 +78,7 @@ isr14:
     pushad
     ;after pushad, the CPU-pushed frame is located above the 32-byte pushad area
     ;layout at that point (from lower to higher addresses):
-    ; [ ... pushad 32 bytes ... ] then: [ERR] [EIP] [CS] [EFLAGS] [USERESP?] [SS?]
+    ;[ ... pushad 32 bytes ... ] then: [ERR] [EIP] [CS] [EFLAGS] [USERESP?] [SS?]
     ;ERR is at [esp + 32]
     mov eax, [esp + 32]   ;errcode
     mov ecx, [esp + 36]   ;eip

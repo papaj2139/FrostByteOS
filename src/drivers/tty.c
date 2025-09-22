@@ -136,22 +136,57 @@ int tty_read(char* buf, uint32_t size) {
 int tty_write(const char* buf, uint32_t size) {
     if (!buf || size == 0) return 0;
     char tmp[256];
-    uint32_t written = 0;
-    while (written < size) {
-        uint32_t chunk = size - written;
-        if (chunk > 255) chunk = 255;
-        memcpy(tmp, buf + written, chunk);
-        tmp[chunk] = '\0';
-        print(tmp, 0x0F);
-        written += chunk;
+    uint32_t outp = 0;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        char c = buf[i];
+        if (c == '\n') {
+            //flush any pending printable chars
+            if (outp > 0) {
+                tmp[outp] = '\0';
+                print(tmp, 0x0F);
+                total += outp;
+                outp = 0;
+            }
+            //newline
+            print("\n", 0x0F);
+            total++;
+        } else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) {
+            //buffer printable ASCII
+            tmp[outp++] = c;
+            if (outp == sizeof(tmp) - 1) {
+                tmp[outp] = '\0';
+                print(tmp, 0x0F);
+                total += outp;
+                outp = 0;
+            }
+        } else {
+            //skip non-printable (including NUL) to avoid control garbage on screen
+            //still count as consumed
+            total++;
+        }
     }
-    return (int)written;
+    //flush any remaining buffered printable characters
+    if (outp > 0) {
+        tmp[outp] = '\0';
+        print(tmp, 0x0F);
+        total += outp;
+    }
+    return (int)total;
 }
 
 //mode control
-void tty_set_mode(uint32_t mode) { g_tty_mode = mode; }
-uint32_t tty_get_mode(void) { return g_tty_mode; }
-int tty_is_reading(void) { return g_tty_reading; }
+void tty_set_mode(uint32_t mode) { 
+    g_tty_mode = mode; 
+}
+
+uint32_t tty_get_mode(void) { 
+    return g_tty_mode; 
+}
+
+int tty_is_reading(void) { 
+    return g_tty_reading; 
+}
 
 int tty_ioctl(uint32_t cmd, void* arg) {
     switch (cmd) {

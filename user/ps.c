@@ -79,7 +79,8 @@ int main(int argc, char** argv, char** envp) {
                     const char* val = s + 6; while (*val == '\t' || *val == ' ') val++;
                     pstate = val;
                 }
-                if (!*e) break; s = e + 1;
+                if (!*e) break;
+                s = e + 1;
             }
         }
         //trim newlines in pname/pstate for print

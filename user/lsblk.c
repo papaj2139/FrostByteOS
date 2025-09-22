@@ -45,9 +45,9 @@ static int load_mounts(mnt_t* arr, int maxn) {
         //mount_point
         while (p < e && *p == ' ') p++;
         const char* mp = p; while (p < e && *p != ' ' && *p != '\t') p++;
-        //fs
+        //fs (skip token)
         while (p < e && (*p == ' ' || *p == '\t')) p++;
-        const char* fs = p; while (p < e && *p != ' ' && *p != '\t') p++;
+        while (p < e && *p != ' ' && *p != '\t') p++;
         //dev
         while (p < e && (*p == ' ' || *p == '\t')) p++;
         const char* dv = p; while (p < e && *p != ' ' && *p != '\t') p++;
@@ -63,7 +63,8 @@ static int load_mounts(mnt_t* arr, int maxn) {
             memcpy(arr[count].mnt, mp, ml); arr[count].mnt[ml] = '\0';
             count++;
         }
-        if (!*e) break; s = e + 1;
+        if (!*e) break;
+        s = e + 1;
     }
     return count;
 }
@@ -120,7 +121,8 @@ int main(int argc, char** argv, char** envp) {
                 putc1('\n');
             }
         }
-        if (!*e) break; s = e + 1;
+        if (!*e) break;
+        s = e + 1;
     }
     return 0;
 }

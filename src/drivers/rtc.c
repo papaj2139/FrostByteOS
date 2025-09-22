@@ -20,6 +20,7 @@ static int rtc_dev_init(struct device* d) {
 }
 static int rtc_dev_read(struct device* d, uint32_t off, void* buf, uint32_t sz) {
     (void)d;
+    (void)off;
     if (!buf || sz == 0) return 0;
     rtc_time_t t;
     if (!rtc_read(&t)) return -1;

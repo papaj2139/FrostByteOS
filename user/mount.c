@@ -11,6 +11,7 @@ static void puts2(const char* a, const char* b) {
 
 int main(int argc, char** argv, char** envp) {
     (void)envp;
+    (void)argc;
     //recompute argc from argv
     int ac = 0; if (argv) { 
         while (argv[ac]) ac++; 

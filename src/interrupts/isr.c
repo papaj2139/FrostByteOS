@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <string.h>
 #include "../drivers/serial.h"
+#include "../kernel/signal.h"
+#include "../process.h"
 
 //forward declared from kernel.c
 void kpanic_msg(const char* reason);
@@ -76,6 +78,19 @@ void isr_exception_dispatch_ext(int vector, unsigned int errcode,
                                 uint32_t eip, uint32_t cs,
                                 uint32_t eflags, uint32_t useresp, uint32_t ss) {
     const char* name = (vector >= 0 && vector < 32) ? exception_names[vector] : "Unknown Exception";
+
+    //if fault occurred in user mode (CS RPL=3) terminate the offending process instead of panicking
+    if ((cs & 3) == 3) {
+        int sig = SIGKILL;
+        if (vector == 14) sig = SIGSEGV; //page fault -> segmentation violation
+        process_t* cur = process_get_current();
+        if (cur) {
+            signal_raise(cur, sig);
+            //default action is terminate perform immediate exit to avoid re-iret into faulting EIP
+            process_exit(128 + sig); //not returned
+        }
+        //if no current process fallback to kernel panic formatting
+    }
 
     if (vector == 14) {
         uint32_t cr2 = 0;

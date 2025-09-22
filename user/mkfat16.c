@@ -122,6 +122,7 @@ static void compute_fat_layout(unsigned total_sectors,
 
 int main(int argc, char** argv, char** envp){
     (void)envp;
+    (void)argc;
     //argc recompute
     int ac=0; if (argv){ 
         while (argv[ac]) ac++; 
@@ -204,7 +205,8 @@ int main(int argc, char** argv, char** envp){
     }
 
     //write FAT #0 and FAT #1
-    unsigned fat_bytes = spf * SECTOR_SIZE;
+    unsigned fat_bytes = spf * SECTOR_SIZE; 
+    (void)fat_bytes;
     //first sector of each FAT set reserved entries
     unsigned char fat_sec[SECTOR_SIZE]; memset(fat_sec, 0, sizeof(fat_sec));
     //FAT[0] = 0xFFF8 FAT[1] = 0xFFFF (little-endian)

@@ -8,6 +8,9 @@
 #include "../gui/vga.h"
 #include "../drivers/vga_dev.h"
 #include "../drivers/timer.h"
+#include "../kernel/kshutdown.h"
+#include "../kernel/kreboot.h"
+#include "../interrupts/irq.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -21,11 +24,16 @@ typedef enum {
     PROCFS_NODE_VGA_CTRL,
     PROCFS_NODE_UPTIME,
     PROCFS_NODE_TTY,
+    PROCFS_NODE_POWER,
     PROCFS_NODE_DIR_SELF,
     PROCFS_NODE_DIR_PID,
     PROCFS_NODE_FILE_STATUS,
     PROCFS_NODE_FILE_CMDLINE,
     PROCFS_NODE_RESCAN,
+    PROCFS_NODE_CPUINFO,
+    PROCFS_NODE_VERSION,
+    PROCFS_NODE_FILESYSTEMS,
+    PROCFS_NODE_INTERRUPTS,
 } procfs_node_kind_t;
 
 typedef struct {
@@ -33,9 +41,42 @@ typedef struct {
     uint32_t pid; //for self/pid dirs and files
 } procfs_priv_t;
 
+//root directory static entries table (order defines readdir order)
+typedef struct {
+    const char* name;
+    procfs_node_kind_t kind;
+    uint32_t type; //VFS_FILE_TYPE_*
+} procfs_root_entry_t;
+
+static const procfs_root_entry_t g_procfs_root_entries[] = {
+    { "mounts",  PROCFS_NODE_MOUNTS,          VFS_FILE_TYPE_FILE },
+    { "meminfo", PROCFS_NODE_MEMINFO,         VFS_FILE_TYPE_FILE },
+    { "devices", PROCFS_NODE_DEVICES,         VFS_FILE_TYPE_FILE },
+    { "filesystems", PROCFS_NODE_FILESYSTEMS, VFS_FILE_TYPE_FILE },
+    { "cpuinfo", PROCFS_NODE_CPUINFO,         VFS_FILE_TYPE_FILE },
+    { "version", PROCFS_NODE_VERSION,         VFS_FILE_TYPE_FILE },
+    { "interrupts", PROCFS_NODE_INTERRUPTS,   VFS_FILE_TYPE_FILE },
+    { "cmdline", PROCFS_NODE_KERNEL_CMDLINE,  VFS_FILE_TYPE_FILE },
+    { "vga",     PROCFS_NODE_VGA_CTRL,        VFS_FILE_TYPE_FILE },
+    { "uptime",  PROCFS_NODE_UPTIME,          VFS_FILE_TYPE_FILE },
+    { "tty",     PROCFS_NODE_TTY,             VFS_FILE_TYPE_FILE },
+    { "power",   PROCFS_NODE_POWER,           VFS_FILE_TYPE_FILE },
+    { "rescan",  PROCFS_NODE_RESCAN,          VFS_FILE_TYPE_FILE },
+    { "self",    PROCFS_NODE_DIR_SELF,        VFS_FILE_TYPE_DIRECTORY },
+};
+
+static const uint32_t g_procfs_root_count = (uint32_t)(sizeof(g_procfs_root_entries) / sizeof(g_procfs_root_entries[0]));
+
 static int procfs_open(vfs_node_t* node, uint32_t flags) { 
     (void)node; (void)flags; 
     return 0; 
+}
+
+//cpuid helpe returns eax, ebx, ecx, edx for the given leaf/subleaf
+static void cpuid_ex(uint32_t leaf, uint32_t subleaf, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
+    uint32_t _a=0,_b=0,_c=0,_d=0;
+    __asm__ volatile ("cpuid" : "=a"(_a), "=b"(_b), "=c"(_c), "=d"(_d) : "a"(leaf), "c"(subleaf));
+    if (a) *a=_a; if (b) *b=_b; if (c) *c=_c; if (d) *d=_d;
 }
 
 //trim to token lowercase
@@ -60,6 +101,22 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
     if (!node || !buffer || size == 0) return -1;
     procfs_priv_t* p = (procfs_priv_t*)node->private_data;
     if (!p) return -1;
+    if (p->kind == PROCFS_NODE_POWER) {
+        char cmd[32];
+        procfs_copy_trim_lower(cmd, sizeof(cmd), buffer, size);
+        if (cmd[0] == '\0') return 0;
+        if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "shutdown") == 0 || strcmp(cmd, "off") == 0) {
+            kshutdown(); //does not return
+        } else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0) {
+            kreboot();   //does not return
+        } else if (strcmp(cmd, "halt") == 0) {
+            __asm__ volatile ("cli");
+            for(;;) { __asm__ volatile ("hlt"); }
+        } else {
+            return -1;
+        }
+        return (int)size; //not reached for poweroff/reboot/halt
+    }
     if (p->kind == PROCFS_NODE_VGA_CTRL) {
         char cmd[16];
         procfs_copy_trim_lower(cmd, sizeof(cmd), buffer, size);
@@ -112,6 +169,7 @@ static int procfs_close(vfs_node_t* node) {
 static vfs_node_t* procfs_make_node(const char* name, uint32_t type, procfs_node_kind_t kind, uint32_t pid, vfs_node_t* parent) {
     uint32_t flags = VFS_FLAG_READ;
     if (kind == PROCFS_NODE_VGA_CTRL || kind == PROCFS_NODE_RESCAN) flags = VFS_FLAG_WRITE; //control is write-only
+    if (kind == PROCFS_NODE_POWER) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read capabilities, write to control
     if (kind == PROCFS_NODE_TTY) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read current write to switch
     vfs_node_t* n = vfs_create_node(name, type, flags);
     if (!n) return NULL;
@@ -139,45 +197,14 @@ void procfs_set_cmdline(const char* cmdline) {
 }
 
 static int procfs_readdir_root(uint32_t index, vfs_node_t* node, vfs_node_t** out) {
-    //static entries first
-    if (index == 0) { 
-        *out = procfs_make_node("mounts", VFS_FILE_TYPE_FILE, PROCFS_NODE_MOUNTS, 0, node); 
-        return *out ? 0 : -1; 
+    //enumerate static entries first using the table
+    if (index < g_procfs_root_count) {
+        const procfs_root_entry_t* e = &g_procfs_root_entries[index];
+        *out = procfs_make_node(e->name, e->type, e->kind, 0, node);
+        return *out ? 0 : -1;
     }
-    if (index == 1) { 
-        *out = procfs_make_node("meminfo", VFS_FILE_TYPE_FILE, PROCFS_NODE_MEMINFO, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    if (index == 2) { 
-        *out = procfs_make_node("devices", VFS_FILE_TYPE_FILE, PROCFS_NODE_DEVICES, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    if (index == 3) { 
-        *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_KERNEL_CMDLINE, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    if (index == 4) { 
-        *out = procfs_make_node("vga", VFS_FILE_TYPE_FILE, PROCFS_NODE_VGA_CTRL, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    if (index == 5) { 
-        *out = procfs_make_node("uptime", VFS_FILE_TYPE_FILE, PROCFS_NODE_UPTIME, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    if (index == 6) { 
-        *out = procfs_make_node("tty", VFS_FILE_TYPE_FILE, PROCFS_NODE_TTY, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    if (index == 7) { 
-        *out = procfs_make_node("rescan", VFS_FILE_TYPE_FILE, PROCFS_NODE_RESCAN, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    if (index == 8) { 
-        *out = procfs_make_node("self", VFS_FILE_TYPE_DIRECTORY, PROCFS_NODE_DIR_SELF, 0, node); 
-        return *out ? 0 : -1; 
-    }
-    //process directories start at index 9
-    uint32_t which = index - 9;
+    //then enumerate numeric PID directories
+    uint32_t which = index - g_procfs_root_count;
     uint32_t seen = 0;
     for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
         process_t* pr = &process_table[i];
@@ -235,47 +262,24 @@ static int procfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
     }
 }
 
+//match a root entry name via the static table
+static int procfs_finddir_root_helper(vfs_node_t* node, const char* name, vfs_node_t** out) {
+    for (uint32_t i = 0; i < g_procfs_root_count; i++) {
+        const procfs_root_entry_t* e = &g_procfs_root_entries[i];
+        if (strcmp(name, e->name) == 0) {
+            *out = procfs_make_node(e->name, e->type, e->kind, 0, node);
+            return *out ? 0 : -1;
+        }
+    }
+    return -1;
+}
+
 static int procfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) {
     if (!node || !name || !out) return -1;
     procfs_priv_t* p = (procfs_priv_t*)node->private_data;
     if (!p) {
-        //treat as root
-        if (strcmp(name, "mounts") == 0) { 
-            *out = procfs_make_node("mounts", VFS_FILE_TYPE_FILE, PROCFS_NODE_MOUNTS, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "meminfo") == 0) { 
-            *out = procfs_make_node("meminfo", VFS_FILE_TYPE_FILE, PROCFS_NODE_MEMINFO, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "devices") == 0) { 
-            *out = procfs_make_node("devices", VFS_FILE_TYPE_FILE, PROCFS_NODE_DEVICES, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "cmdline") == 0) { 
-            *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_KERNEL_CMDLINE, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "vga") == 0) { 
-            *out = procfs_make_node("vga", VFS_FILE_TYPE_FILE, PROCFS_NODE_VGA_CTRL, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "uptime") == 0) { 
-            *out = procfs_make_node("uptime", VFS_FILE_TYPE_FILE, PROCFS_NODE_UPTIME, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "tty") == 0) { 
-            *out = procfs_make_node("tty", VFS_FILE_TYPE_FILE, PROCFS_NODE_TTY, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "rescan") == 0) { 
-            *out = procfs_make_node("rescan", VFS_FILE_TYPE_FILE, PROCFS_NODE_RESCAN, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "self") == 0) { 
-            *out = procfs_make_node("self", VFS_FILE_TYPE_DIRECTORY, PROCFS_NODE_DIR_SELF, 0, node); 
-            return *out ? 0 : -1; 
-        }
+        //treat as root using table
+        if (procfs_finddir_root_helper(node, name, out) == 0) return 0;
         uint32_t pid = 0; bool all_digits = true; for (const char* s = name; *s; s++) { if (*s < '0' || *s > '9') { all_digits = false; break; } pid = pid * 10 + (uint32_t)(*s - '0'); }
         if (all_digits) {
             process_t* pr = process_get_by_pid(pid);
@@ -287,42 +291,8 @@ static int procfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) 
         return -1;
     }
     if (p->kind == PROCFS_NODE_ROOT) {
-        if (strcmp(name, "mounts") == 0) { 
-            *out = procfs_make_node("mounts", VFS_FILE_TYPE_FILE, PROCFS_NODE_MOUNTS, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "meminfo") == 0) { 
-            *out = procfs_make_node("meminfo", VFS_FILE_TYPE_FILE, PROCFS_NODE_MEMINFO, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "devices") == 0) { 
-            *out = procfs_make_node("devices", VFS_FILE_TYPE_FILE, PROCFS_NODE_DEVICES, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "cmdline") == 0) { 
-            *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_KERNEL_CMDLINE, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "vga") == 0) { 
-            *out = procfs_make_node("vga", VFS_FILE_TYPE_FILE, PROCFS_NODE_VGA_CTRL, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "uptime") == 0) { 
-            *out = procfs_make_node("uptime", VFS_FILE_TYPE_FILE, PROCFS_NODE_UPTIME, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "tty") == 0) { 
-            *out = procfs_make_node("tty", VFS_FILE_TYPE_FILE, PROCFS_NODE_TTY, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "rescan") == 0) { 
-            *out = procfs_make_node("rescan", VFS_FILE_TYPE_FILE, PROCFS_NODE_RESCAN, 0, node); 
-            return *out ? 0 : -1; 
-        }
-        if (strcmp(name, "self") == 0) { 
-            *out = procfs_make_node("self", VFS_FILE_TYPE_DIRECTORY, PROCFS_NODE_DIR_SELF, 0, node); 
-            return *out ? 0 : -1; 
-        }
+        //treat as root using table
+        if (procfs_finddir_root_helper(node, name, out) == 0) return 0;
         //numeric pid?
         uint32_t pid = 0; bool all_digits = true; for (const char* s = name; *s; s++) { if (*s < '0' || *s > '9') { all_digits = false; break; } pid = pid * 10 + (uint32_t)(*s - '0'); }
         if (all_digits) {
@@ -353,6 +323,7 @@ static int procfs_get_size(vfs_node_t* node) {
     return 0; 
 }
 
+
 static const char* proc_state_str(proc_state_t s) {
     switch (s) {
         case PROC_UNUSED: return "UNUSED";
@@ -382,6 +353,68 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
                 len += used;
                 if (len >= sizeof(tmp)) break;
                 m = m->next;
+            }
+            break;
+        }
+        case PROCFS_NODE_FILESYSTEMS: {
+            char names[16][32]; uint32_t cnt = 0;
+            if (vfs_list_fs_types(names, 16, &cnt) == 0) {
+                for (uint32_t i = 0; i < cnt; i++) {
+                    len += ksnprintf(tmp + len, sizeof(tmp) - len, "%s\n", names[i]);
+                    if (len >= sizeof(tmp)) break;
+                }
+            }
+            break;
+        }
+        case PROCFS_NODE_CPUINFO: {
+            //basic vendor and brand
+            uint32_t a=0,b=0,c=0,d=0;
+            cpuid_ex(0, 0, &a, &b, &c, &d);
+            char vendor[13];
+            ((uint32_t*)vendor)[0] = b; //"GenuineIntel" or "AuthenticAMD"
+            ((uint32_t*)vendor)[1] = d;
+            ((uint32_t*)vendor)[2] = c;
+            vendor[12] = '\0';
+            uint32_t max_basic = a;
+
+            cpuid_ex(1, 0, &a, &b, &c, &d);
+            uint32_t stepping = a & 0xF;
+            uint32_t model = (a >> 4) & 0xF;
+            uint32_t family = (a >> 8) & 0xF;
+            uint32_t ext_model = (a >> 16) & 0xF;
+            uint32_t ext_family = (a >> 20) & 0xFF;
+            uint32_t eff_family = (family == 0xF) ? (family + ext_family) : family;
+            uint32_t eff_model = (family == 0x6 || family == 0xF) ? ((ext_model << 4) | model) : model;
+
+            char brand[49]; brand[0]='\0';
+            cpuid_ex(0x80000000u, 0, &a, &b, &c, &d);
+            if (a >= 0x80000004u) {
+                uint32_t* bp = (uint32_t*)brand;
+                cpuid_ex(0x80000002u, 0, &bp[0], &bp[1], &bp[2], &bp[3]);
+                cpuid_ex(0x80000003u, 0, &bp[4], &bp[5], &bp[6], &bp[7]);
+                cpuid_ex(0x80000004u, 0, &bp[8], &bp[9], &bp[10], &bp[11]);
+                brand[48] = '\0';
+            }
+            //format
+            if (brand[0]) {
+                len += ksnprintf(tmp + len, sizeof(tmp) - len, "model name\t: %s\n", brand);
+            }
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "vendor_id\t: %s\n", vendor);
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "cpu family\t: %u\n", eff_family);
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "model\t\t: %u\n", eff_model);
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "stepping\t: %u\n", stepping);
+            break;
+        }
+        case PROCFS_NODE_VERSION: {
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "FrostByteOS version 0.0.5 (%s %s)\n", __DATE__, __TIME__);
+            break;
+        }
+        case PROCFS_NODE_INTERRUPTS: {
+            uint32_t counts[16];
+            irq_get_all_counts(counts);
+            for (int i = 0; i < 16; i++) {
+                len += ksnprintf(tmp + len, sizeof(tmp) - len, "irq%02d: %u\n", i, counts[i]);
+                if (len >= sizeof(tmp)) break;
             }
             break;
         }
@@ -450,6 +483,11 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
             process_t* cur = process_get_current();
             const char* name = (cur && cur->tty) ? cur->tty->name : "(none)";
             len += ksnprintf(tmp + len, sizeof(tmp) - len, "%s\n", name);            
+            break;
+        }
+        case PROCFS_NODE_POWER: {
+            len += ksnprintf(tmp + len, sizeof(tmp) - len,
+                             "capabilities: poweroff reboot halt\nstate: on\n");
             break;
         }
         default: return -1;
