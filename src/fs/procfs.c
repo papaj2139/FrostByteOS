@@ -160,24 +160,24 @@ static int procfs_readdir_root(uint32_t index, vfs_node_t* node, vfs_node_t** ou
         *out = procfs_make_node("vga", VFS_FILE_TYPE_FILE, PROCFS_NODE_VGA_CTRL, 0, node); 
         return *out ? 0 : -1; 
     }
-    if (index == 6) { 
+    if (index == 5) { 
         *out = procfs_make_node("uptime", VFS_FILE_TYPE_FILE, PROCFS_NODE_UPTIME, 0, node); 
         return *out ? 0 : -1; 
     }
-    if (index == 7) { 
+    if (index == 6) { 
         *out = procfs_make_node("tty", VFS_FILE_TYPE_FILE, PROCFS_NODE_TTY, 0, node); 
         return *out ? 0 : -1; 
     }
-    if (index == 8) { 
+    if (index == 7) { 
         *out = procfs_make_node("rescan", VFS_FILE_TYPE_FILE, PROCFS_NODE_RESCAN, 0, node); 
         return *out ? 0 : -1; 
     }
-    if (index == 9) { 
+    if (index == 8) { 
         *out = procfs_make_node("self", VFS_FILE_TYPE_DIRECTORY, PROCFS_NODE_DIR_SELF, 0, node); 
         return *out ? 0 : -1; 
     }
-    //process directories start at index 10
-    uint32_t which = index - 10;
+    //process directories start at index 9
+    uint32_t which = index - 9;
     uint32_t seen = 0;
     for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
         process_t* pr = &process_table[i];
