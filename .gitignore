@@ -9,3 +9,4 @@ isodir/
 src/fs/*_blob.h
 *.cpio
 initramfs_root/
+*.elf
