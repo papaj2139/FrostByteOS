@@ -37,6 +37,7 @@
 #define SYS_KILL           1030
 #define SYS_SYMLINK        1031
 #define SYS_READLINK       1032
+#define SYS_WAITPID        1033
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -86,5 +87,6 @@ int32_t sys_link(const char* oldpath, const char* newpath);
 int32_t sys_kill(uint32_t pid, uint32_t sig);
 int32_t sys_symlink(const char* target, const char* linkpath);
 int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz);
+int32_t sys_waitpid(int32_t pid, int32_t* status, int32_t options);
 
 #endif

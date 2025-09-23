@@ -259,24 +259,32 @@ int elf_load_into_process(const char* pathname, struct process* proc,
         }
     }
 
-    //map new user stack
-    uint32_t new_stack_phys = pmm_alloc_page();
-    if (!new_stack_phys) { vfs_close(node); return -1; }
-    if (vmm_map_page_in_directory(dir, ustack_va, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        vfs_close(node); 
-        return -1; 
+    //map new user stack 4 pages
+    uint32_t new_stack_top_phys = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t phys = pmm_alloc_page();
+        if (!phys) { 
+            vfs_close(node); 
+            return -1; 
+        }
+        uint32_t va = ustack_top - (uint32_t)(i + 1) * 0x1000u;
+        if (vmm_map_page_in_directory(dir, va, phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+            vfs_close(node);
+            return -1;
+        }
+        if (i == 0) new_stack_top_phys = phys;
     }
 
     uint32_t new_esp = 0;
-    if (build_user_stack(dir, ustack_top, new_stack_phys, argv, envp, &new_esp) != 0) {
+    if (build_user_stack(dir, ustack_top, new_stack_top_phys, argv, envp, &new_esp) != 0) {
         vfs_close(node); 
         return -1; 
     }
 
     vfs_close(node);
 
-    //free old stack phys if present and different
-    if (old_stack_phys && old_stack_phys != new_stack_phys) {
+    //free old top stack phys if present and different (top page at ustack_top-0x1000)
+    if (old_stack_phys && old_stack_phys != new_stack_top_phys) {
         pmm_free_page(old_stack_phys);
     }
 
@@ -446,15 +454,21 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
         kenvp[envc] = NULL;
     }
 
-    //build a fresh user stack at 0x02000000
+    //build a fresh user stack at 0x02000000 mapping 4 pages
     const uint32_t ustack_top = 0x02000000;
-    uint32_t new_stack_phys = pmm_alloc_page();
-    if (!new_stack_phys) { vfs_close(node); return -1; }
-    if (vmm_map_page_in_directory(new_dir, ustack_top - 0x1000, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        vfs_close(node); return -1; }
+    uint32_t new_stack_top_phys = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t phys = pmm_alloc_page();
+        if (!phys) { vfs_close(node); return -1; }
+        uint32_t va = ustack_top - (uint32_t)(i + 1) * 0x1000u;
+        if (vmm_map_page_in_directory(new_dir, va, phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+            vfs_close(node); return -1;
+        }
+        if (i == 0) new_stack_top_phys = phys;
+    }
 
     uint32_t new_esp = 0;
-    if (build_user_stack(new_dir, ustack_top, new_stack_phys, (char* const*)kargv, (char* const*)kenvp, &new_esp) != 0) {
+    if (build_user_stack(new_dir, ustack_top, new_stack_top_phys, (char* const*)kargv, (char* const*)kenvp, &new_esp) != 0) {
         vfs_close(node); 
         return -1; 
     }
@@ -464,7 +478,7 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
         const uint32_t ustack_va = ustack_top - 0x1000;
         const uint32_t TMP = 0x00800000;
         uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-        if (vmm_map_page(TMP, new_stack_phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+        if (vmm_map_page(TMP, new_stack_top_phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
             uint32_t argc_dbg = *(uint32_t*)(TMP + (new_esp - ustack_va));
             uint32_t argv0_ptr = *(uint32_t*)(TMP + (new_esp - ustack_va + 4));
             serial_write_string("[ELF] stack argc=\n");

@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define SYS_EXIT           1000
 #define SYS_WRITE          1001
@@ -34,6 +35,7 @@
 #define SYS_KILL           1030
 #define SYS_SYMLINK        1031
 #define SYS_READLINK       1032
+#define SYS_WAITPID        1033
 
 typedef struct { 
     int tv_sec; 
@@ -110,6 +112,10 @@ int execve(const char* path, char* const argv[], char* const envp[]) {
 
 int wait(int* status) {
     return syscall1(SYS_WAIT, (int)status);
+}
+
+int waitpid(int pid, int* status, int options) {
+    return syscall3(SYS_WAITPID, pid, (int)status, options);
 }
 
 int yield(void) {

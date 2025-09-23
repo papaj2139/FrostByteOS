@@ -97,6 +97,21 @@ void isr_exception_dispatch_ext(int vector, unsigned int errcode,
         }
         process_t* cur = process_get_current();
         if (cur) {
+            //debug print before terminating
+            if (vector == 14) {
+                uint32_t cr2 = 0; __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+                serial_write_string("[EXCUSR] pid="); serial_printf("%d", (int)cur->pid);
+                serial_write_string(" v=14 PF CR2=0x"); serial_printf("%x", cr2);
+                serial_write_string(" EIP=0x"); serial_printf("%x", eip);
+                serial_write_string(" ESP=0x"); serial_printf("%x", useresp);
+                serial_write_string("\n");
+            } else {
+                serial_write_string("[EXCUSR] pid="); serial_printf("%d", (int)cur->pid);
+                serial_write_string(" vec="); serial_printf("%d", vector);
+                serial_write_string(" EIP=0x"); serial_printf("%x", eip);
+                serial_write_string(" ESP=0x"); serial_printf("%x", useresp);
+                serial_write_string("\n");
+            }
             signal_raise(cur, sig);
             //default action is terminate perform immediate exit to avoid re-iret into faulting EIP
             process_exit(128 + sig); //not returned

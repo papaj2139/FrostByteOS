@@ -40,7 +40,7 @@
 #endif
 
 #ifndef LOG_EXEC
-#define LOG_EXEC 0  
+#define LOG_EXEC 0
 #endif
 
 #ifndef LOG_FAT16

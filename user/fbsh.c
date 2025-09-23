@@ -1,8 +1,27 @@
 #include <unistd.h>
 #include <string.h>
 #include <tty.h>
+#include <sys/wait.h>
 
 static void print(const char* s) { write(1, s, strlen(s)); }
+
+static void print_dec(int v) {
+    char buf[16];
+    int i = 0;
+    if (v == 0) { buf[i++] = '0'; }
+    else {
+        int n = (v < 0) ? -v : v;
+        char tmp[16]; int t = 0;
+        while (n > 0 && t < (int)sizeof(tmp)) { 
+            tmp[t++] = '0' + (n % 10); 
+            n /= 10; 
+        }
+        if (v < 0 && i < (int)sizeof(buf)) buf[i++] = '-';
+        while (t > 0 && i < (int)sizeof(buf)) buf[i++] = tmp[--t];
+    }
+    buf[i] = '\0';
+    print(buf);
+}
 
 static void chomp(char* b, int n) {
     if (n <= 0) return;
@@ -97,6 +116,20 @@ static int run_command(char** prog_argv, char** envp)
     //parent wait
     int status = 0;
     wait(&status);
+    //decode and print child status
+    if (WIFEXITED(status)) {
+        print("[status] exit ");
+        print_dec(WEXITSTATUS(status));
+        print("\n");
+    } else if (WIFSIGNALED(status)) {
+        print("[status] signaled ");
+        print_dec(WTERMSIG(status));
+        print("\n");
+    } else {
+        print("[status] unknown ");
+        print_dec(status);
+        print("\n");
+    }
     return status;
 }
 

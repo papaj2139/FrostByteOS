@@ -285,6 +285,8 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
         }
         case SYS_WAIT:
             return sys_wait((int32_t*)arg1);
+        case SYS_WAITPID:
+            return sys_waitpid((int32_t)arg1, (int32_t*)arg2, (int32_t)arg3);
         case SYS_YIELD:
             return sys_yield();
         case SYS_IOCTL:
@@ -1018,4 +1020,56 @@ int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz) {
     char ap[VFS_MAX_PATH];
     if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
     return vfs_readlink(ap, buf, bufsiz);
+}
+
+int32_t sys_waitpid(int32_t pid, int32_t* status, int32_t options) {
+    process_t* parent = process_get_current();
+    if (!parent) return -1;
+
+    for (;;) {
+        bool have_children = false;
+        bool found_match = false;
+        //scan children for a zombie matching pid (or any if pid == -1)
+        process_t* child = parent->children;
+        #if LOG_PROC
+        serial_write_string("[WAITPID] parent="); serial_printf("%d", (int)parent->pid);
+        serial_write_string(" req="); serial_printf("%d", (int)pid);
+        serial_write_string(" opts="); serial_printf("%d", (int)options);
+        serial_write_string("\n");
+        #endif
+        while (child) {
+            have_children = true;
+            #if LOG_PROC
+            serial_write_string("[WAITPID] scan child="); serial_printf("%d", (int)child->pid);
+            serial_write_string(" state="); serial_printf("%d", (int)child->state);
+            serial_write_string("\n");
+            #endif
+            if (pid == -1 || (int32_t)child->pid == pid) {
+                found_match = true;
+                if (child->state == PROC_ZOMBIE) {
+                    int cpid = (int)child->pid;
+                    int ec = child->exit_code;
+                    if (status) *status = ec; //raw exit code per sys_wait
+                    process_destroy(child);
+                    return cpid;
+                }
+            }
+            child = child->sibling;
+        }
+        //if no children yet or no matching child yet optionally block unless WNOHANG
+        if (!have_children || !found_match) {
+            if (options & 1) { //WNOHANG
+                return 0;
+            }
+            parent->state = PROC_SLEEPING;
+            schedule();
+            continue;
+        }
+        //matching child exists but none zombie block unless WNOHANG
+        if (options & 1) { //WNOHANG
+            return 0;
+        }
+        parent->state = PROC_SLEEPING;
+        schedule();
+    }
 }

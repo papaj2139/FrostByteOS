@@ -227,6 +227,18 @@ user/partmk.o: user/partmk.c
 user/partmk.elf: user/partmk.o $(USER_LIBC_OBJS) user.ld
 	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/partmk.o -o $@
 
+user/crash.o: user/crash.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/crash.elf: user/crash.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/crash.o -o $@
+
+user/waitshow.o: user/waitshow.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/waitshow.elf: user/waitshow.o $(USER_LIBC_OBJS) user.ld
+	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/waitshow.o -o $@
+
 fat16_vfs.o: src/fs/fat16_vfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -283,7 +295,7 @@ $(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
            acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o uaccess.o elf.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf
+initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf
 	rm -rf $(INITRAMFS_DIR) initramfs.cpio
 	mkdir -p $(INITRAMFS_DIR)/bin $(INITRAMFS_DIR)/etc $(INITRAMFS_DIR)/dev $(INITRAMFS_DIR)/proc $(INITRAMFS_DIR)/mnt $(INITRAMFS_DIR)/usr/bin
 	cp user/init.elf $(INITRAMFS_DIR)/bin/init
@@ -302,6 +314,8 @@ initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf use
 	cp user/mkfat16.elf $(INITRAMFS_DIR)/bin/mkfat16
 	cp user/lsblk.elf $(INITRAMFS_DIR)/bin/lsblk
 	cp user/partmk.elf $(INITRAMFS_DIR)/bin/partmk
+	cp user/crash.elf $(INITRAMFS_DIR)/bin/crash
+	cp user/waitshow.elf $(INITRAMFS_DIR)/bin/waitshow
 	echo "Welcome to FrostByte (cpio initramfs)" > $(INITRAMFS_DIR)/etc/motd
 	ln -sf /etc/motd $(INITRAMFS_DIR)/motd_link
 	ln -sf /bin/sh $(INITRAMFS_DIR)/usr/bin/sh
