@@ -5,7 +5,7 @@ CFLAGS = -m32 -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Isrc/libc -Isrc -fno-
 ASM = nasm
 ASMFLAGS = -f elf32
 USER_CC = i686-elf-gcc
-USER_CFLAGS = -m32 -ffreestanding -Os -Wall -Wextra -fno-stack-protector -nostdlib -Iuser/libc/include
+USER_CFLAGS = -m32 -ffreestanding -Os -Wall -Wextra -fno-stack-protector -fno-omit-frame-pointer -nostdlib -Iuser/libc/include
 LDFLAGS = -m32 -nostdlib -T linker.ld
 USER_LIBC_OBJS = user/libc/crt0.o user/libc/syscalls.o user/libc/string.o
 INITRAMFS_DIR := initramfs_root

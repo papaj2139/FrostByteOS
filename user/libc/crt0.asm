@@ -6,10 +6,13 @@ extern _exit
 
 section .text
 _start:
-    ;stack layout on entry (from kernel):
+    ;stack layout on entry:
     ;[esp + 0] = argc
-    ;[esp + 4] = argv
-    ;[esp + 8] = envp
+    ;[esp + 4] = argv[0]
+    ;[esp + 8] = argv[1]
+    ;...
+    ;[esp + 4 + 4*argc] = NULL
+    ;[then envp vector...] followed by NULL
     mov eax, [esp]          ;argc
     lea ebx, [esp + 4]      ;argv = &argv[0]
     mov ecx, eax            ;ecx = argc

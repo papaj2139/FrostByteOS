@@ -39,14 +39,14 @@ static uint64_t g_boot_ticks = 0;     //timer ticks at the moment of boot captur
 static uint32_t g_hz_cached = 0;      //timer frequency (ticks per second)
 
 //32-bit user ABI for timespec/timeval structures
-typedef struct { 
-    uint32_t tv_sec; 
-    uint32_t tv_nsec; 
+typedef struct {
+    uint32_t tv_sec;
+    uint32_t tv_nsec;
 } timespec32_t;
 
-typedef struct { 
-    uint32_t tv_sec; 
-    uint32_t tv_usec; 
+typedef struct {
+    uint32_t tv_sec;
+    uint32_t tv_usec;
 } timeval32_t;
 
 //external assembly handler
@@ -67,8 +67,8 @@ static uint64_t udivmod_u64_u32(uint64_t n, uint32_t d, uint32_t* rem)
 }
 
 //compute UNIX epoch seconds from RTC time (naive and UTC assumption)
-static int is_leap(unsigned y) { 
-    return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0); 
+static int is_leap(unsigned y) {
+    return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
 }
 
 //forward declaration
@@ -154,9 +154,9 @@ static uint32_t mmap_find_free_region(page_directory_t dir, uint32_t length, uin
     for (uint32_t base = start; base + length <= end_limit; base += PAGE_SIZE) {
         bool ok = true;
         for (uint32_t off = 0; off < length; off += PAGE_SIZE) {
-            if (vmm_get_physical_addr(base + off) != 0) { 
-                ok = false; 
-                break; 
+            if (vmm_get_physical_addr(base + off) != 0) {
+                ok = false;
+                break;
             }
         }
         if (ok) return base;
@@ -185,8 +185,11 @@ void syscall_init(void) {
     fd_init();
 }
 
-//capture user-mode return frame at syscall entry so fork() can clone the exact return point
-void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint32_t useresp, uint32_t ss, uint32_t ebp) {
+//capture user-mode return frame and GPRs at syscall entry so fork() can clone precisely
+void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags,
+                                uint32_t useresp, uint32_t ss, uint32_t ebp,
+                                uint32_t eax, uint32_t ebx, uint32_t ecx,
+                                uint32_t edx, uint32_t esi, uint32_t edi) {
     process_t* cur = process_get_current();
     if (!cur) return;
     cur->context.eip = eip;
@@ -195,6 +198,13 @@ void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint
     cur->context.esp = useresp;
     cur->context.ss = ss;
     cur->context.ebp = ebp;
+    //save user GPRs as they were at syscall entry
+    cur->context.eax = eax;
+    cur->context.ebx = ebx;
+    cur->context.ecx = ecx;
+    cur->context.edx = edx;
+    cur->context.esi = esi;
+    cur->context.edi = edi;
 }
 
 //clone user space from src->dst directories (user part only)
@@ -237,7 +247,7 @@ static int clone_user_space(page_directory_t src, page_directory_t dst) {
 //main syscall dispatcher called from assembly
 int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4, uint32_t arg5) {
     (void)arg4; //suppress unused parameter warning
-    (void)arg5; 
+    (void)arg5;
     switch (syscall_num) {
         case SYS_EXIT:
             return sys_exit((int32_t)arg1);
@@ -374,7 +384,7 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
             return (written < 0) ? written : (int32_t)count;
         }
     }
-    
+
     vfs_file_t* file = fd_get(fd);
     if (!file) {
         #if LOG_SYSCALL
@@ -422,8 +432,8 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
                 for (;;) {
                     int r;
                     //block for first byte
-                    do { 
-                        r = device_read(dev, 0, &ch, 1); 
+                    do {
+                        r = device_read(dev, 0, &ch, 1);
                     } while (r <= 0);
                     if (ch == '\r') ch = '\n';
                     buf[pos++] = ch;
@@ -443,8 +453,8 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
             } else {
                 //raw mode: block for first byte then return immediately if no more
                 int r;
-                do { 
-                    r = device_read(dev, 0, &ch, 1); 
+                do {
+                    r = device_read(dev, 0, &ch, 1);
                 } while (r <= 0);
                 if (ch == '\r') ch = '\n';
                 buf[pos++] = ch;
@@ -462,7 +472,7 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
             }
         }
     }
-    
+
     vfs_file_t* file = fd_get(fd);
     if (!file) {
         return -1; //EBADF
@@ -482,7 +492,7 @@ int32_t sys_open(const char* pathname, int32_t flags) {
     if (flags == 0) {
         vfs_flags = VFS_FLAG_READ;  //O_RDONLY
     } else if (flags == 1) {
-        vfs_flags = VFS_FLAG_WRITE; //O_WRONLY  
+        vfs_flags = VFS_FLAG_WRITE; //O_WRONLY
     } else if (flags == 2) {
         vfs_flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //O_RDWR
     } else {
@@ -595,7 +605,13 @@ int32_t sys_fork(void) {
     child->context.ss  = 0x23;                     //user stack segment
     child->context.ds = child->context.es = child->context.fs = child->context.gs = 0x23;
     child->context.eflags = parent->context.eflags; //preserve IF and flags
-    child->context.eax = 0;                        //fork() returns 0 in child
+    //inherit parent general-purpose registers so callee-saved regs remain valid across fork
+    child->context.eax = 0;                        //fork returns 0 in child
+    child->context.ebx = parent->context.ebx;
+    child->context.ecx = parent->context.ecx;
+    child->context.edx = parent->context.edx;
+    child->context.esi = parent->context.esi;
+    child->context.edi = parent->context.edi;
 
     //inherit TTY mode and controlling TTY
     child->tty = parent->tty;

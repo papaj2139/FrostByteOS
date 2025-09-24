@@ -49,32 +49,32 @@ typedef struct {
 
 static inline int syscall3(int n, int a, int b, int c) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b), "d"(c) : "memory");
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b), "d"(c) : "memory", "cc");
     return ret;
 }
 static inline int syscall5(int n, int a, int b, int c, int d, int e) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e) : "memory");
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e) : "memory", "cc");
     return ret;
 }   
 static inline int syscall4(int n, int a, int b, int c, int d) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d) : "memory");
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d) : "memory", "cc");
     return ret;
 }
 static inline int syscall2(int n, int a, int b) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b) : "memory");
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a), "c"(b) : "memory", "cc");
     return ret;
 }
 static inline int syscall1(int n, int a) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a) : "memory");
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a) : "memory", "cc");
     return ret;
 }
 static inline int syscall0(int n) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n) : "memory");
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n) : "memory", "cc");
     return ret;
 }
 

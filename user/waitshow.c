@@ -29,9 +29,11 @@ int main(int argc, char** argv, char** envp) {
     if (pid < 0) { puts1("fork failed\n"); return 1; }
     if (pid == 0) {
         //child: exec argv[1] with argv[1..]
+
         //build argv vector with path resolution (/bin prefix if no slash)
         static char path[128];
-        const char* cmd = argv[1];
+        const char* cmd = (argc > 1) ? argv[1] : (const char*)0;
+        if (!cmd || !*cmd) { puts1("[waitshow-child] no command\n"); _exit(127); }
         int has_slash = 0; for (const char* t = cmd; *t; ++t) { 
             if (*t == '/') { 
                 has_slash = 1; 

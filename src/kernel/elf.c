@@ -72,8 +72,13 @@ typedef struct {
 #define PF_W 0x2
 #define PF_R 0x4
 
-//build a minimal user stack (argc, argv[], envp[]) into a single page mapped at
-//ustack_top - 0x1000 in new_dir using new_stack_phys returns final ESP value
+//build user stack in SysV style:
+//[esp + 0] = argc
+//[esp + 4] = argv[0]
+//[esp + 8] = argv[1]
+//...
+//[esp + 4 + 4*argc] = NULL
+//[then envp pointers..] followed by NULL
 static int build_user_stack(page_directory_t new_dir,
                             uint32_t ustack_top,
                             uint32_t new_stack_phys,
@@ -105,26 +110,26 @@ static int build_user_stack(page_directory_t new_dir,
         serial_write_string("\"\n");
     }
 
-    //compute sizes
+    //compute total bytes needed within the top page
     uint32_t strings_size = 0;
     for (int i = 0; i < argc; i++) strings_size += (uint32_t)strlen(argv[i]) + 1;
     for (int i = 0; i < envc; i++) strings_size += (uint32_t)strlen(envp[i]) + 1;
-    uint32_t vector_words = 1 + (uint32_t)argc + 1 + (uint32_t)envc + 1;
-    uint32_t vector_bytes = vector_words * 4;
-    if (strings_size + vector_bytes + 64 > 4096) {
+    uint32_t argv_vec_bytes = 4u * ((uint32_t)argc + 1u);
+    uint32_t envp_vec_bytes = 4u * ((uint32_t)envc + 1u);
+    //plus one word for argc
+    if (strings_size + argv_vec_bytes + envp_vec_bytes + 4u + 16u > 4096u) {
         vmm_unmap_page_nofree(temp_kmap);
         if (eflags_save & 0x200) __asm__ volatile ("sti");
         return -1;
     }
 
-    uint32_t* argv_user = NULL;
-    uint32_t* envp_user = NULL;
-    if (argc > 0) argv_user = (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)argc);
-    if (envc > 0) envp_user = (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)envc);
+    //store string addresses as we place them
+    uint32_t* argv_user = (argc > 0) ? (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)argc) : NULL;
+    uint32_t* envp_user = (envc > 0) ? (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)envc) : NULL;
 
     uint32_t sp = ustack_top;
 
-    //copy envp strings
+    //copy envp strings first (top-most)
     for (int i = envc - 1; i >= 0; i--) {
         const char* s = envp[i];
         uint32_t len = (uint32_t)strlen(s) + 1;
@@ -141,18 +146,32 @@ static int build_user_stack(page_directory_t new_dir,
         argv_user[i] = sp;
     }
 
-    //align and push vectors
-    sp &= ~0xF;
-    //envp NULL
-    sp -= 4; *(uint32_t*)(temp_kmap + (sp - ustack_va)) = 0;
-    for (int i = envc - 1; i >= 0; i--) { sp -= 4; *(uint32_t*)(temp_kmap + (sp - ustack_va)) = envp_user[i]; }
-    //argv NULL
-    sp -= 4; *(uint32_t*)(temp_kmap + (sp - ustack_va)) = 0;
-    for (int i = argc - 1; i >= 0; i--) { 
-        sp -= 4; *(uint32_t*)(temp_kmap + (sp - ustack_va)) = argv_user[i]; 
+    //align stack pointer for vectors and argc
+    sp &= ~0xFu;
+
+    //determine where vectors and argc will live
+    uint32_t vec_total = argv_vec_bytes + envp_vec_bytes;
+    uint32_t vec_base = sp - vec_total; //argv vector at vec_base, envp vector immediately after
+    uint32_t argv_vec_va = vec_base;
+    uint32_t envp_vec_va = vec_base + argv_vec_bytes;
+    //SysV i386 ABI: argv[] must begin immediately after argc at [esp+4]
+    //so do not insert padding between argc and the argv vector
+    uint32_t esp0 = vec_base - 4u; //argc at esp0, argv[0] at esp0+4
+
+    //fill argv vector
+    for (uint32_t i = 0; i < (uint32_t)argc; i++) {
+        *(uint32_t*)(temp_kmap + (argv_vec_va - ustack_va) + i * 4u) = argv_user[i];
     }
-    //argc
-    sp -= 4; *(uint32_t*)(temp_kmap + (sp - ustack_va)) = (uint32_t)argc;
+    *(uint32_t*)(temp_kmap + (argv_vec_va - ustack_va) + (uint32_t)argc * 4u) = 0; //NULL
+
+    //fill envp vector
+    for (uint32_t i = 0; i < (uint32_t)envc; i++) {
+        *(uint32_t*)(temp_kmap + (envp_vec_va - ustack_va) + i * 4u) = envp_user[i];
+    }
+    *(uint32_t*)(temp_kmap + (envp_vec_va - ustack_va) + (uint32_t)envc * 4u) = 0; //NULL
+
+    //write argc at esp0
+    *(uint32_t*)(temp_kmap + (esp0 - ustack_va)) = (uint32_t)argc;
 
     if (argv_user) kfree(argv_user);
     if (envp_user) kfree(envp_user);
@@ -160,7 +179,7 @@ static int build_user_stack(page_directory_t new_dir,
     vmm_unmap_page_nofree(temp_kmap);
     if (eflags_save & 0x200) __asm__ volatile ("sti");
 
-    *out_esp = sp;
+    *out_esp = esp0;
     return 0;
 }
 
@@ -178,19 +197,19 @@ int elf_load_into_process(const char* pathname, struct process* proc,
     serial_write_string("\n");
     if (r != (int)sizeof(eh)) { vfs_close(node); serial_write_string("[ELF] header read short\n"); return -2; }
     if (!(eh.e_ident[EI_MAG0] == ELFMAG0 && eh.e_ident[EI_MAG1] == ELFMAG1 &&
-          eh.e_ident[EI_MAG2] == ELFMAG2 && eh.e_ident[EI_MAG3] == ELFMAG3)) { 
-            vfs_close(node); 
+          eh.e_ident[EI_MAG2] == ELFMAG2 && eh.e_ident[EI_MAG3] == ELFMAG3)) {
+            vfs_close(node);
             return -2; }
-    if (eh.e_ident[EI_CLASS] != ELFCLASS32 || eh.e_ident[EI_DATA] != ELFDATA2LSB) { 
-        vfs_close(node); 
+    if (eh.e_ident[EI_CLASS] != ELFCLASS32 || eh.e_ident[EI_DATA] != ELFDATA2LSB) {
+        vfs_close(node);
         return -2; }
-    if (eh.e_type != ET_EXEC || eh.e_machine != EM_386 || eh.e_version != EV_CURRENT) { 
-        vfs_close(node); 
-        return -2; 
+    if (eh.e_type != ET_EXEC || eh.e_machine != EM_386 || eh.e_version != EV_CURRENT) {
+        vfs_close(node);
+        return -2;
     }
-    if (eh.e_phoff == 0 || eh.e_phnum == 0) { 
-        vfs_close(node); 
-        return -2; 
+    if (eh.e_phoff == 0 || eh.e_phnum == 0) {
+        vfs_close(node);
+        return -2;
     }
 
     page_directory_t dir = proc->page_directory;
@@ -217,7 +236,7 @@ int elf_load_into_process(const char* pathname, struct process* proc,
         Elf32_Phdr ph;
         Elf32_Off off = eh.e_phoff + (Elf32_Off)i * (Elf32_Off)eh.e_phentsize;
         r = vfs_read(node, off, sizeof(ph), (char*)&ph);
-        if (r != (int)sizeof(ph)) { 
+        if (r != (int)sizeof(ph)) {
             vfs_close(node);
             return -1; }
         if (ph.p_type != PT_LOAD) continue;
@@ -232,9 +251,9 @@ int elf_load_into_process(const char* pathname, struct process* proc,
             if (!phys) { vfs_close(node); return -1; }
             uint32_t flags = PAGE_PRESENT | PAGE_USER;
             if (ph.p_flags & PF_W) flags |= PAGE_WRITABLE;
-            if (vmm_map_page_in_directory(dir, va, phys, flags) != 0) { 
-                vfs_close(node); 
-                return -1; 
+            if (vmm_map_page_in_directory(dir, va, phys, flags) != 0) {
+                vfs_close(node);
+                return -1;
             }
 
             uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
@@ -263,9 +282,9 @@ int elf_load_into_process(const char* pathname, struct process* proc,
     uint32_t new_stack_top_phys = 0;
     for (int i = 0; i < 4; i++) {
         uint32_t phys = pmm_alloc_page();
-        if (!phys) { 
-            vfs_close(node); 
-            return -1; 
+        if (!phys) {
+            vfs_close(node);
+            return -1;
         }
         uint32_t va = ustack_top - (uint32_t)(i + 1) * 0x1000u;
         if (vmm_map_page_in_directory(dir, va, phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
@@ -277,8 +296,8 @@ int elf_load_into_process(const char* pathname, struct process* proc,
 
     uint32_t new_esp = 0;
     if (build_user_stack(dir, ustack_top, new_stack_top_phys, argv, envp, &new_esp) != 0) {
-        vfs_close(node); 
-        return -1; 
+        vfs_close(node);
+        return -1;
     }
 
     vfs_close(node);
@@ -331,21 +350,21 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
 
     //validate ELF header
     if (!(eh.e_ident[EI_MAG0] == ELFMAG0 && eh.e_ident[EI_MAG1] == ELFMAG1 &&
-          eh.e_ident[EI_MAG2] == ELFMAG2 && eh.e_ident[EI_MAG3] == ELFMAG3)) { 
+          eh.e_ident[EI_MAG2] == ELFMAG2 && eh.e_ident[EI_MAG3] == ELFMAG3)) {
             serial_write_string("[ELF] bad magic\n");
-            vfs_close(node); 
-            return -2; 
+            vfs_close(node);
+            return -2;
         }
-    if (eh.e_ident[EI_CLASS] != ELFCLASS32 || eh.e_ident[EI_DATA] != ELFDATA2LSB) { 
-        vfs_close(node); 
+    if (eh.e_ident[EI_CLASS] != ELFCLASS32 || eh.e_ident[EI_DATA] != ELFDATA2LSB) {
+        vfs_close(node);
         return -2; }
-    if (eh.e_type != ET_EXEC || eh.e_machine != EM_386 || eh.e_version != EV_CURRENT) { 
-        vfs_close(node); 
-        return -2; 
+    if (eh.e_type != ET_EXEC || eh.e_machine != EM_386 || eh.e_version != EV_CURRENT) {
+        vfs_close(node);
+        return -2;
     }
-    if (eh.e_phoff == 0 || eh.e_phnum == 0) { 
-        vfs_close(node); 
-        return -2; 
+    if (eh.e_phoff == 0 || eh.e_phnum == 0) {
+        vfs_close(node);
+        return -2;
     }
 
     //create a new page directory and map kernel space
@@ -360,10 +379,10 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
         Elf32_Phdr ph;
         Elf32_Off off = eh.e_phoff + (Elf32_Off)i * (Elf32_Off)eh.e_phentsize;
         r = vfs_read(node, off, sizeof(ph), (char*)&ph);
-        if (r != (int)sizeof(ph)) { 
+        if (r != (int)sizeof(ph)) {
             serial_write_string("[ELF] phdr read failed\n");
-            vfs_close(node); 
-            return -1; 
+            vfs_close(node);
+            return -1;
         }
         if (ph.p_type != PT_LOAD) continue;
         if (ph.p_memsz == 0) continue;
@@ -375,15 +394,15 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
         for (uint32_t va = seg_start; va < seg_end; va += PAGE_SIZE) {
             //allocate physical page and map into new_dir
             uint32_t phys = pmm_alloc_page();
-            if (!phys) { 
-                vfs_close(node); 
-                return -1; 
+            if (!phys) {
+                vfs_close(node);
+                return -1;
             }
             uint32_t flags = PAGE_PRESENT | PAGE_USER;
             if (ph.p_flags & PF_W) flags |= PAGE_WRITABLE; //X bit ignored by paging
-            if (vmm_map_page_in_directory(new_dir, va, phys, flags) != 0) { 
-                vfs_close(node); 
-                return -1; 
+            if (vmm_map_page_in_directory(new_dir, va, phys, flags) != 0) {
+                vfs_close(node);
+                return -1;
             }
 
             //temp map in kernel to zero and copy segment bytes
@@ -419,16 +438,16 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
     char** kargv = NULL; char** kenvp = NULL;
     if (argc > 0) {
         kargv = (char**)kmalloc(sizeof(char*) * (uint32_t)(argc + 1));
-        if (!kargv) { 
-            vfs_close(node); 
-            return -1; 
+        if (!kargv) {
+            vfs_close(node);
+            return -1;
         }
         for (int i = 0; i < argc; i++) {
             size_t len = strlen(argv[i]);
             char* s = (char*)kmalloc(len + 1);
-            if (!s) { 
-                vfs_close(node); 
-                return -1; 
+            if (!s) {
+                vfs_close(node);
+                return -1;
             }
             memcpy(s, argv[i], len + 1);
             kargv[i] = s;
@@ -437,16 +456,16 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
     }
     if (envc > 0) {
         kenvp = (char**)kmalloc(sizeof(char*) * (uint32_t)(envc + 1));
-        if (!kenvp) { 
-            vfs_close(node); 
-            return -1; 
+        if (!kenvp) {
+            vfs_close(node);
+            return -1;
         }
         for (int i = 0; i < envc; i++) {
             size_t len = strlen(envp[i]);
             char* s = (char*)kmalloc(len + 1);
-            if (!s) { 
+            if (!s) {
                 vfs_close(node);
-                return -1; 
+                return -1;
             }
             memcpy(s, envp[i], len + 1);
             kenvp[i] = s;
@@ -469,11 +488,10 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
 
     uint32_t new_esp = 0;
     if (build_user_stack(new_dir, ustack_top, new_stack_top_phys, (char* const*)kargv, (char* const*)kenvp, &new_esp) != 0) {
-        vfs_close(node); 
-        return -1; 
+        vfs_close(node);
+        return -1;
     }
 
-    //debug inspect the freshly built user stack
     {
         const uint32_t ustack_va = ustack_top - 0x1000;
         const uint32_t TMP = 0x00800000;
