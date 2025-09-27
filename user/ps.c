@@ -1,12 +1,13 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 
-static void puts1(const char* s) { 
-    write(1, s, strlen(s)); 
+static void puts1(const char* s) {
+    fputs(1, s);
 }
 
-static void putc1(char c) { 
-    write(1, &c, 1); 
+static void putc1(char c) {
+    fputc(1, c);
 }
 
 static int is_digits(const char* s) {
@@ -73,10 +74,12 @@ int main(int argc, char** argv, char** envp) {
                 const char* e = s; while (*e && *e != '\n' && *e != '\r') e++;
                 //compare prefix
                 if (e - s >= 5 && s[0]=='N' && s[1]=='a' && s[2]=='m' && s[3]=='e' && s[4]==':') {
-                    const char* val = s + 5; while (*val == '\t' || *val == ' ') val++;
+                    const char* val = s + 5;
+                    while (*val == '\t' || *val == ' ') val++;
                     pname = val;
                 } else if (e - s >= 6 && s[0]=='S' && s[1]=='t' && s[2]=='a' && s[3]=='t' && s[4]=='e' && s[5]==':') {
-                    const char* val = s + 6; while (*val == '\t' || *val == ' ') val++;
+                    const char* val = s + 6;
+                    while (*val == '\t' || *val == ' ') val++;
                     pstate = val;
                 }
                 if (!*e) break;
@@ -85,14 +88,20 @@ int main(int argc, char** argv, char** envp) {
         }
         //trim newlines in pname/pstate for print
         char nbuf[32]; char sbuf[32];
-        int ni=0; for (const char* p=pname; *p && *p!='\n' && *p!='\r' && ni<31; ++p) nbuf[ni++]=*p; nbuf[ni]='\0';
-        int si=0; for (const char* p=pstate; *p && *p!='\n' && *p!='\r' && si<31; ++p) sbuf[si++]=*p; sbuf[si]='\0';
+        int ni=0;
+        for (const char* p=pname; *p && *p!='\n' && *p!='\r' && ni<31; ++p) nbuf[ni++]=*p;
+        nbuf[ni]='\0';
+        int si=0;
+        for (const char* p=pstate; *p && *p!='\n' && *p!='\r' && si<31; ++p) sbuf[si++]=*p;
+        sbuf[si]='\0';
         //fallback command
         const char* cmd = cmdline[0] ? cmdline : nbuf;
         //print row
-        puts1(name); int pad = 5 - (int)strlen(name); while (pad-- > 0) putc1(' ');
+        puts1(name); int pad = 5 - (int)strlen(name);
+        while (pad-- > 0) putc1(' ');
         puts1(" ");
-        puts1(sbuf); pad = 10 - (int)strlen(sbuf); while (pad-- > 0) putc1(' ');
+        puts1(sbuf); pad = 10 - (int)strlen(sbuf);
+        while (pad-- > 0) putc1(' ');
         puts1(" ");
         puts1(cmd);
         putc1('\n');

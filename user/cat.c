@@ -1,22 +1,25 @@
 #include <unistd.h>
 #include <string.h>
-
-static void puts1(const char* s) { write(1, s, strlen(s)); }
+#include <stdio.h>
 
 int main(int argc, char** argv, char** envp) {
     (void)envp;
-    if (argc < 2) {
-        puts1("Usage: cat <file>\n");
+    int number = 0;
+    int ai = 1;
+    if (ai < argc && argv[ai] && strcmp(argv[ai], "-n") == 0) { number = 1; ai++; }
+    if (argc - ai < 1) {
+        fprintf(2, "Usage: cat [-n] <file>\n");
         return 1;
     }
-    int fd = open(argv[1], 0);
+    const char* path = argv[ai];
+    int fd = open(path, 0);
     if (fd < 0) {
-        puts1("cat: cannot open "); 
-        puts1(argv[1]); 
-        puts1("\n");
+        fprintf(2, "cat: cannot open %s\n", path);
         return 1;
     }
     char buf[512];
+    int line = 1;
+    int prev_nl = 1;
     for (;;) {
         int r = read(fd, buf, sizeof(buf));
         if (r < 0) { 
@@ -24,7 +27,11 @@ int main(int argc, char** argv, char** envp) {
             return 1; 
         }
         if (r == 0) break;
-        write(1, buf, (size_t)r);
+        for (int k = 0; k < r; k++) {
+            if (number && prev_nl) { dprintf(1, "%d\t", line++); prev_nl = 0; }
+            fputc(1, buf[k]);
+            prev_nl = (buf[k] == '\n');
+        }
     }
     close(fd);
     return 0;

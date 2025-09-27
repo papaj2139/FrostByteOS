@@ -1,13 +1,18 @@
 #include "fs.h"
 #include "../drivers/serial.h"
+#include "../debug.h"
 #include "fat16_vfs.h"
 #include "devfs.h"
 #include "procfs.h"
 
 static void fs_debug(const char* msg) {
+#if (LOG_VFS) || (DEBUG_ENABLED)
     serial_write_string("[FS] ");
     serial_write_string(msg);
     serial_write_string("\n");
+#else
+    (void)msg;
+#endif
 }
 
 int fs_init(filesystem_t* fs, device_t* device) {

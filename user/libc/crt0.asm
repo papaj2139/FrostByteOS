@@ -3,6 +3,8 @@
 global _start
 extern main
 extern _exit
+extern __libc_run_ctors
+extern __libc_run_dtors
 
 section .text
 _start:
@@ -19,12 +21,18 @@ _start:
     inc ecx                 ;argc + 1 (for argv NULL)
     shl ecx, 2              ;(argc + 1) * 4
     add ecx, ebx            ;envp = &argv[argc + 1]
-    push ecx
-    push ebx
-    push eax
+    ; push args for main and run ctors before calling main
+    push ecx                ; envp
+    push ebx                ; argv
+    push eax                ; argc
+    call __libc_run_ctors
     call main
     add esp, 12
     ;return value in eax
+    ; run dtors before exiting
+    push eax                ; preserve exit code
+    call __libc_run_dtors
+    pop eax
     push eax
     call _exit
     ;not reached

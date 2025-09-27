@@ -1,5 +1,7 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/block.h>
 
 //mkfat16 format a device with FAT16 filesystem
 //usage: mkfat16 <device_or_path> [total_sectors]
@@ -11,27 +13,27 @@
 
 #define SECTOR_SIZE 512
 
-static void puts1(const char* s) { write(1, s, strlen(s)); }
+static void puts1(const char* s) {
+    fputs(1, s);
+}
+
 static void puthex32(unsigned v) {
-    char buf[11]; buf[0]='0'; buf[1]='x';
-    const char* hd="0123456789ABCDEF";
-    for (int i=0;i<8;i++){ unsigned sh=(7-i)*4; buf[2+i]=hd[(v>>sh)&0xF]; }
-    buf[10]='\n'; write(1, buf, sizeof(buf));
+    dprintf(1, "0x%08X\n", v);
 }
 
-static int isdigit_c(char c){ 
-    return c>='0' && c<='9'; 
+static int isdigit_c(char c){
+    return c>='0' && c<='9';
 }
 
-static int ishex_c(char c){ 
-    return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'); 
+static int ishex_c(char c){
+    return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');
 }
 
-static unsigned hexval(char c){ 
-    if(c>='0'&&c<='9')return (unsigned)(c-'0'); 
-    if(c>='a'&&c<='f')return 10u+(unsigned)(c-'a'); 
-    if(c>='A'&&c<='F')return 10u+(unsigned)(c-'A'); 
-    return 0; 
+static unsigned hexval(char c){
+    if(c>='0'&&c<='9')return (unsigned)(c-'0');
+    if(c>='a'&&c<='f')return 10u+(unsigned)(c-'a');
+    if(c>='A'&&c<='F')return 10u+(unsigned)(c-'A');
+    return 0;
 }
 
 static unsigned parse_u32(const char* s){
@@ -39,27 +41,27 @@ static unsigned parse_u32(const char* s){
     //skip spaces
     while (*s==' ') s++;
     unsigned base=10;
-    if (s[0]=='0' && (s[1]=='x'||s[1]=='X')){ 
-        base=16; 
-        s+=2; 
+    if (s[0]=='0' && (s[1]=='x'||s[1]=='X')){
+        base=16;
+        s+=2;
     }
     unsigned v=0;
-    if (base==10){ 
-        while (isdigit_c(*s)){ 
-            v = v*10u + (unsigned)(*s - '0'); 
-            s++; 
-        } 
+    if (base==10){
+        while (isdigit_c(*s)){
+            v = v*10u + (unsigned)(*s - '0');
+            s++;
+        }
     }
-    else { 
-        while (ishex_c(*s)){ 
-            v = (v<<4) | hexval(*s); 
-            s++; 
-        } 
+    else {
+        while (ishex_c(*s)){
+            v = (v<<4) | hexval(*s);
+            s++;
+        }
     }
     return v;
 }
 
-//FAT16 boot sector 
+//FAT16 boot sector
 typedef struct __attribute__((packed)) {
     unsigned char  jmp_boot[3];
     unsigned char  oem_name[8];
@@ -85,8 +87,8 @@ typedef struct __attribute__((packed)) {
     unsigned short boot_signature_end; //0xAA55
 } bs16_t;
 
-static unsigned ceil_div(unsigned a, unsigned b){ 
-    return (a + b - 1) / b; 
+static unsigned ceil_div(unsigned a, unsigned b){
+    return (a + b - 1) / b;
 }
 
 //compute sectors-per-FAT for given total sectors and sectors-per-cluster
@@ -124,8 +126,8 @@ int main(int argc, char** argv, char** envp){
     (void)envp;
     (void)argc;
     //argc recompute
-    int ac=0; if (argv){ 
-        while (argv[ac]) ac++; 
+    int ac=0; if (argv){
+        while (argv[ac]) ac++;
     }
     if (ac < 2){
         puts1("Usage: mkfat16 <device_or_path> [total_sectors]\n");
@@ -139,14 +141,26 @@ int main(int argc, char** argv, char** envp){
         devpath[sizeof(devpath)-1] = '\0';
     } else {
         //assume /dev/<name>
-        int p=0; const char* s="/dev/"; while (*s && p < (int)sizeof(devpath)-1) devpath[p++]=*s++;
-        const char* t=target; while (*t && p < (int)sizeof(devpath)-1) devpath[p++]=*t++;
+        int p=0; const char* s="/dev/";
+        while (*s && p < (int)sizeof(devpath)-1) devpath[p++]=*s++;
+        const char* t=target;
+        while (*t && p < (int)sizeof(devpath)-1) devpath[p++]=*t++;
         devpath[p]='\0';
     }
     unsigned total_sectors = (ac >= 3) ? parse_u32(argv[2]) : 65536u; //default 32 MB
     if (total_sectors < 2048u){
         puts1("mkfat16: total_sectors too small (min 2048)\n");
         return 1;
+    }
+
+    //if user didn't provide size try to query device info via ioctl
+    int fd_probe = open(devpath, 2);
+    if (fd_probe >= 0) {
+        blkdev_info_t info;
+        if (ioctl(fd_probe, IOCTL_BLK_GET_INFO, &info) == 0 && info.sector_count > 0) {
+            total_sectors = info.sector_count;
+        }
+        close(fd_probe);
     }
 
     //choose sectors-per-cluster to keep cluster count in FAT16 limits
@@ -167,9 +181,9 @@ int main(int argc, char** argv, char** envp){
 
     //open device for read/write
     int fd = open(devpath, 2); //O_RDWR
-    if (fd < 0){ 
-        puts1("mkfat16: open failed\n"); 
-        return 1; 
+    if (fd < 0){
+        puts1("mkfat16: open failed\n");
+        return 1;
     }
 
     //build boot sector
@@ -183,8 +197,14 @@ int main(int argc, char** argv, char** envp){
     bs->reserved_sectors = 1;
     bs->num_fats = 2;
     bs->root_entries = 512;
-    if (total_sectors < 65536u){ bs->total_sectors_16 = (unsigned short)total_sectors; bs->total_sectors_32 = 0; }
-    else { bs->total_sectors_16 = 0; bs->total_sectors_32 = total_sectors; }
+    if (total_sectors < 65536u){
+        bs->total_sectors_16 = (unsigned short)total_sectors;
+        bs->total_sectors_32 = 0;
+    }
+    else {
+        bs->total_sectors_16 = 0;
+        bs->total_sectors_32 = total_sectors;
+    }
     bs->media_type = 0xF8; //fixed disk
     bs->sectors_per_fat = (unsigned short)spf;
     bs->sectors_per_track = 63;
@@ -198,61 +218,78 @@ int main(int argc, char** argv, char** envp){
     memcpy(bs->file_system_type, "FAT16   ", 8);
     bs->boot_signature_end = 0xAA55;
 
-    if (write(fd, sector, SECTOR_SIZE) != SECTOR_SIZE){ 
-        puts1("mkfat16: write boot sector failed\n"); 
-        close(fd); 
-        return 1; 
+    if (write(fd, sector, SECTOR_SIZE) != SECTOR_SIZE){
+        puts1("mkfat16: write boot sector failed\n");
+        close(fd);
+        return 1;
     }
 
     //write FAT #0 and FAT #1
-    unsigned fat_bytes = spf * SECTOR_SIZE; 
+    unsigned fat_bytes = spf * SECTOR_SIZE;
     (void)fat_bytes;
     //first sector of each FAT set reserved entries
     unsigned char fat_sec[SECTOR_SIZE]; memset(fat_sec, 0, sizeof(fat_sec));
     //FAT[0] = 0xFFF8 FAT[1] = 0xFFFF (little-endian)
-    fat_sec[0] = 0xF8; fat_sec[1] = 0xFF; fat_sec[2] = 0xFF; fat_sec[3] = 0xFF;
+    fat_sec[0] = 0xF8;
+    fat_sec[1] = 0xFF;
+    fat_sec[2] = 0xFF;
+    fat_sec[3] = 0xFF;
 
     //FAT #0
-    if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){ puts1("mkfat16: write FAT0[0] failed\n"); close(fd); return 1; }
+    if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){
+        puts1("mkfat16: write FAT0[0] failed\n");
+        close(fd);
+        return 1;
+    }
     memset(fat_sec, 0, sizeof(fat_sec));
-    for (unsigned i=1; i<spf; ++i){ 
-        if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){ 
-            puts1("mkfat16: write FAT0 body failed\n"); 
-            close(fd); 
-            return 1; 
-        } 
+    for (unsigned i=1; i<spf; ++i){
+        if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){
+            puts1("mkfat16: write FAT0 body failed\n");
+            close(fd);
+            return 1;
+        }
     }
     //FAT #1
     memset(fat_sec, 0, sizeof(fat_sec));
     //first sector again with reserved entries
     fat_sec[0] = 0xF8; fat_sec[1] = 0xFF; fat_sec[2] = 0xFF; fat_sec[3] = 0xFF;
-    if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){ 
-        puts1("mkfat16: write FAT1[0] failed\n"); 
-        close(fd); 
-        return 1; 
+    if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){
+        puts1("mkfat16: write FAT1[0] failed\n");
+        close(fd);
+        return 1;
     }
     memset(fat_sec, 0, sizeof(fat_sec));
-    for (unsigned i=1; i<spf; ++i){ 
-        if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){ 
-            puts1("mkfat16: write FAT1 body failed\n"); 
-            close(fd); 
-            return 1; 
-        } 
+    for (unsigned i=1; i<spf; ++i){
+        if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){
+            puts1("mkfat16: write FAT1 body failed\n");
+            close(fd);
+            return 1;
+        }
     }
 
     //root directory area
-    for (unsigned i=0; i<root_secs; ++i){ 
-        if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){ 
-            puts1("mkfat16: write root dir failed\n"); 
-            close(fd); 
-            return 1; 
-        } 
+    for (unsigned i=0; i<root_secs; ++i){
+        if (write(fd, fat_sec, SECTOR_SIZE) != SECTOR_SIZE){
+            puts1("mkfat16: write root dir failed\n");
+            close(fd);
+            return 1;
+        }
     }
 
     puts1("mkfat16: formatted FAT16 on "); puts1(devpath); puts1("\n");
     puts1("  total_sectors: "); {
         char buf[12];
-        unsigned v = total_sectors; int pos=0; char tmp[12]; int tp=0; if (v==0) tmp[tp++]='0'; while(v){ tmp[tp++]=(char)('0'+(v%10)); v/=10; } while (tp>0 && pos<11) buf[pos++]=tmp[--tp]; buf[pos]='\n'; write(1, buf, pos+1);
+        unsigned v = total_sectors;
+        int pos=0;
+        char tmp[12];
+        int tp=0;
+        if (v==0) tmp[tp++]='0';
+        while(v){
+            tmp[tp++]=(char)('0'+(v%10)); v/=10;
+        }
+        while (tp>0 && pos<11) buf[pos++]=tmp[--tp];
+        buf[pos]='\n';
+        write(1, buf, pos+1);
     }
     puts1("  sectors_per_cluster: "); puthex32(chosen_spc);
     puts1("  sectors_per_fat: "); puthex32(spf);

@@ -38,7 +38,10 @@ static int vga_dev_init(struct device* d) {
 }
 
 static int vga_dev_read(struct device* d, uint32_t off, void* buf, uint32_t sz) {
-    (void)d; (void)off; (void)buf; (void)sz; 
+    (void)d;
+    (void)off;
+    (void)buf;
+    (void)sz;
     return -1; //not supported
 }
 
@@ -51,6 +54,14 @@ static int vga_dev_write(struct device* d, uint32_t off, const void* buf, uint32
     int h = vga_height();
     if (w <= 0 || h <= 0) return -1;
     uint32_t max_bytes = (uint32_t)w * (uint32_t)h; //one byte per pixel index
+
+    //fast path full-frame writes ignore offset and present once
+    if (sz >= max_bytes) {
+        memcpy(g_fb, buf, max_bytes);
+        vga_present(g_fb);
+        return (int)max_bytes;
+    }
+
     if (off >= max_bytes) return 0; //nothing to write
     uint32_t to_copy = sz;
     if (off + to_copy > max_bytes) to_copy = max_bytes - off;
@@ -73,12 +84,15 @@ static int vga_dev_write(struct device* d, uint32_t off, const void* buf, uint32
     return (int)to_copy;
 }
 
-static int vga_dev_ioctl(struct device* d, uint32_t cmd, void* arg) { 
-    (void)d; (void)cmd; (void)arg; 
-    return -1; 
+static int vga_dev_ioctl(struct device* d, uint32_t cmd, void* arg) {
+    (void)d;
+    (void)cmd;
+    (void)arg;
+
+    return -1;
 }
 
-static void vga_dev_cleanup(struct device* d) { 
+static void vga_dev_cleanup(struct device* d) {
     (void)d;
     //keep buffer for reuse
 }

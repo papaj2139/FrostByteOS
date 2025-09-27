@@ -38,6 +38,23 @@
 #define SYS_SYMLINK        1031
 #define SYS_READLINK       1032
 #define SYS_WAITPID        1033
+#define SYS_DL_GET_INIT    1034
+#define SYS_DL_GET_FINI    1035
+#define SYS_DLOPEN         1036
+#define SYS_DLSYM          1037
+#define SYS_DLCLOSE        1038
+#define SYS_GETUID         1039
+#define SYS_GETEUID        1040
+#define SYS_GETGID         1041
+#define SYS_GETEGID        1042
+#define SYS_UMASK          1043
+#define SYS_STAT           1044
+#define SYS_LSTAT          1045
+#define SYS_FSTAT          1046
+#define SYS_CHMOD          1047
+#define SYS_CHOWN          1048
+#define SYS_FCHMOD         1049
+#define SYS_FCHOWN         1050
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -91,5 +108,22 @@ int32_t sys_kill(uint32_t pid, uint32_t sig);
 int32_t sys_symlink(const char* target, const char* linkpath);
 int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz);
 int32_t sys_waitpid(int32_t pid, int32_t* status, int32_t options);
+int32_t sys_getuid(void);
+int32_t sys_geteuid(void);
+int32_t sys_getgid(void);
+int32_t sys_getegid(void);
+int32_t sys_umask(int32_t new_mask);
+int32_t sys_dl_get_init(uint32_t index);
+int32_t sys_dl_get_fini(uint32_t index);
+int32_t sys_dlopen(const char* path, uint32_t flags);
+int32_t sys_dlclose(int32_t handle);
+int32_t sys_dlsym(int32_t handle, const char* name);
+int32_t sys_stat(const char* path, void* stat_out);
+int32_t sys_lstat(const char* path, void* stat_out);
+int32_t sys_fstat(int32_t fd, void* stat_out);
+int32_t sys_chmod(const char* path, int32_t mode);
+int32_t sys_chown(const char* path, int32_t uid, int32_t gid);
+int32_t sys_fchmod(int32_t fd, int32_t mode);
+int32_t sys_fchown(int32_t fd, int32_t uid, int32_t gid);
 
 #endif

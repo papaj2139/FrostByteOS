@@ -34,6 +34,7 @@ typedef enum {
     PROCFS_NODE_VERSION,
     PROCFS_NODE_FILESYSTEMS,
     PROCFS_NODE_INTERRUPTS,
+    PROCFS_NODE_PARTITIONS,
 } procfs_node_kind_t;
 
 typedef struct {
@@ -62,14 +63,15 @@ static const procfs_root_entry_t g_procfs_root_entries[] = {
     { "tty",     PROCFS_NODE_TTY,             VFS_FILE_TYPE_FILE },
     { "power",   PROCFS_NODE_POWER,           VFS_FILE_TYPE_FILE },
     { "rescan",  PROCFS_NODE_RESCAN,          VFS_FILE_TYPE_FILE },
+    { "partitions", PROCFS_NODE_PARTITIONS,   VFS_FILE_TYPE_FILE },
     { "self",    PROCFS_NODE_DIR_SELF,        VFS_FILE_TYPE_DIRECTORY },
 };
 
 static const uint32_t g_procfs_root_count = (uint32_t)(sizeof(g_procfs_root_entries) / sizeof(g_procfs_root_entries[0]));
 
-static int procfs_open(vfs_node_t* node, uint32_t flags) { 
-    (void)node; (void)flags; 
-    return 0; 
+static int procfs_open(vfs_node_t* node, uint32_t flags) {
+    (void)node; (void)flags;
+    return 0;
 }
 
 //cpuid helpe returns eax, ebx, ecx, edx for the given leaf/subleaf
@@ -111,7 +113,9 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
             kreboot();   //does not return
         } else if (strcmp(cmd, "halt") == 0) {
             __asm__ volatile ("cli");
-            for(;;) { __asm__ volatile ("hlt"); }
+            for(;;) {
+                __asm__ volatile ("hlt");
+            }
         } else {
             return -1;
         }
@@ -159,9 +163,9 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
 }
 
 static int procfs_close(vfs_node_t* node) {
-    if (node && node->private_data) { 
-        kfree(node->private_data); 
-        node->private_data = NULL; 
+    if (node && node->private_data) {
+        kfree(node->private_data);
+        node->private_data = NULL;
     }
     return 0;
 }
@@ -169,7 +173,7 @@ static int procfs_close(vfs_node_t* node) {
 static vfs_node_t* procfs_make_node(const char* name, uint32_t type, procfs_node_kind_t kind, uint32_t pid, vfs_node_t* parent) {
     uint32_t flags = VFS_FLAG_READ;
     if (kind == PROCFS_NODE_VGA_CTRL || kind == PROCFS_NODE_RESCAN) flags = VFS_FLAG_WRITE; //control is write-only
-    if (kind == PROCFS_NODE_POWER) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read capabilities, write to control
+    if (kind == PROCFS_NODE_POWER) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read capabilities write to control
     if (kind == PROCFS_NODE_TTY) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read current write to switch
     vfs_node_t* n = vfs_create_node(name, type, flags);
     if (!n) return NULL;
@@ -186,9 +190,9 @@ static vfs_node_t* procfs_make_node(const char* name, uint32_t type, procfs_node
 //kernel cmdline storage (exposed at /proc/cmdline)
 static char g_kernel_cmdline[512] = {0};
 void procfs_set_cmdline(const char* cmdline) {
-    if (!cmdline) { 
-        g_kernel_cmdline[0] = '\0'; 
-        return; 
+    if (!cmdline) {
+        g_kernel_cmdline[0] = '\0';
+        return;
     }
     size_t n = strlen(cmdline);
     if (n >= sizeof(g_kernel_cmdline)) n = sizeof(g_kernel_cmdline) - 1;
@@ -224,13 +228,13 @@ static int procfs_readdir_root(uint32_t index, vfs_node_t* node, vfs_node_t** ou
 static int procfs_readdir_pid_dir(uint32_t index, vfs_node_t* node, vfs_node_t** out) {
     procfs_priv_t* p = (procfs_priv_t*)node->private_data;
     if (!p) return -1;
-    if (index == 0) { 
-        *out = procfs_make_node("status", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_STATUS, p->pid, node); 
-        return *out ? 0 : -1; 
+    if (index == 0) {
+        *out = procfs_make_node("status", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_STATUS, p->pid, node);
+        return *out ? 0 : -1;
     }
-    if (index == 1) { 
-        *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_CMDLINE, p->pid, node); 
-        return *out ? 0 : -1; 
+    if (index == 1) {
+        *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_CMDLINE, p->pid, node);
+        return *out ? 0 : -1;
     }
     return -1;
 }
@@ -247,13 +251,13 @@ static int procfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
         case PROCFS_NODE_DIR_SELF: {
             process_t* cur = process_get_current();
             uint32_t pid = cur ? cur->pid : 0;
-            if (index == 0) { 
-                *out = procfs_make_node("status", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_STATUS, pid, node); 
-                return *out ? 0 : -1; 
+            if (index == 0) {
+                *out = procfs_make_node("status", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_STATUS, pid, node);
+                return *out ? 0 : -1;
             }
-            if (index == 1) { 
-                *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_CMDLINE, pid, node); 
-                return *out ? 0 : -1; 
+            if (index == 1) {
+                *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_CMDLINE, pid, node);
+                return *out ? 0 : -1;
             }
             return -1;
         }
@@ -305,22 +309,22 @@ static int procfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) 
         return -1;
     } else if (p->kind == PROCFS_NODE_DIR_SELF || p->kind == PROCFS_NODE_DIR_PID) {
         uint32_t pid = (p->kind == PROCFS_NODE_DIR_SELF) ? (process_get_current() ? process_get_current()->pid : 0) : p->pid;
-        if (strcmp(name, "status") == 0) { 
-            *out = procfs_make_node("status", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_STATUS, pid, node); 
+        if (strcmp(name, "status") == 0) {
+            *out = procfs_make_node("status", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_STATUS, pid, node);
             return *out ? 0 : -1;
         }
-        if (strcmp(name, "cmdline") == 0) { 
+        if (strcmp(name, "cmdline") == 0) {
             *out = procfs_make_node("cmdline", VFS_FILE_TYPE_FILE, PROCFS_NODE_FILE_CMDLINE, pid, node);
-            return *out ? 0 : -1; 
+            return *out ? 0 : -1;
         }
         return -1;
     }
     return -1;
 }
 
-static int procfs_get_size(vfs_node_t* node) { 
-    (void)node; 
-    return 0; 
+static int procfs_get_size(vfs_node_t* node) {
+    (void)node;
+    return 0;
 }
 
 
@@ -361,6 +365,30 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
             if (vfs_list_fs_types(names, 16, &cnt) == 0) {
                 for (uint32_t i = 0; i < cnt; i++) {
                     len += ksnprintf(tmp + len, sizeof(tmp) - len, "%s\n", names[i]);
+                    if (len >= sizeof(tmp)) break;
+                }
+            }
+            break;
+        }
+        case PROCFS_NODE_PARTITIONS: {
+            //list block devices and partitions (ATA) with sizes similar to /proc/partitions
+            //header: major minor blocks name
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "major minor blocks name\n");
+            uint32_t idx = 0;
+            uint32_t minor = 0;
+            for (;;) {
+                device_t* dev = NULL;
+                if (device_enumerate(idx++, &dev) != 0 || !dev) break;
+                if (dev->type != DEVICE_TYPE_STORAGE) continue;
+                //query ATA device info via helper
+                extern int ata_query_device_info(device_t* dev, uint64_t* start_lba, uint64_t* sectors, int* is_part);
+                uint64_t start = 0, secs = 0; int is_part = 0;
+                if (ata_query_device_info && ata_query_device_info(dev, &start, &secs, &is_part) == 0) {
+                    //compute 1K blocks
+                    uint64_t blocks = secs / 2ull;
+                    //fake major=8 minor increments for display purposes
+                    uint32_t major = 8u;
+                    len += ksnprintf(tmp + len, sizeof(tmp) - len, "%4u %5u %7u %s\n", major, minor++, (uint32_t)blocks, dev->name);
                     if (len >= sizeof(tmp)) break;
                 }
             }
@@ -491,7 +519,7 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
         case PROCFS_NODE_TTY: {
             process_t* cur = process_get_current();
             const char* name = (cur && cur->tty) ? cur->tty->name : "(none)";
-            len += ksnprintf(tmp + len, sizeof(tmp) - len, "%s\n", name);            
+            len += ksnprintf(tmp + len, sizeof(tmp) - len, "%s\n", name);
             break;
         }
         case PROCFS_NODE_POWER: {
@@ -508,11 +536,11 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
     return (int)to_copy;
 }
 
-static int procfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) { 
-    (void)node; 
-    (void)request; 
-    (void)arg; 
-    return -1; 
+static int procfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) {
+    (void)node;
+    (void)request;
+    (void)arg;
+    return -1;
 }
 
 vfs_operations_t procfs_ops = {

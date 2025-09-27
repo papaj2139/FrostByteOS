@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../device_manager.h"
+#include "../process.h"
 
 //file types
 #define VFS_FILE_TYPE_FILE      0x01
@@ -43,11 +44,24 @@ struct vfs_operations {
     int (*link)(vfs_node_t* parent, const char* name, vfs_node_t* src); //hard link
 };
 
+//permission mode bits (subset of POSIX)
+#ifndef S_IRUSR
+#define S_IRUSR 0400
+#define S_IWUSR 0200
+#define S_IXUSR 0100
+#define S_IRGRP 0040
+#define S_IWGRP 0020
+#define S_IXGRP 0010
+#define S_IROTH 0004
+#define S_IWOTH 0002
+#define S_IXOTH 0001
+#endif
+
 //VFS node structure
 struct vfs_node {
     char name[64];              //node name
     uint32_t type;              //file type
-    uint32_t flags;             //node flags
+    uint32_t flags;             //legacy VFS flags
     uint32_t size;              //file size in bytes
     uint32_t inode;             //inode number
     vfs_operations_t* ops;      //operations for this node
@@ -56,6 +70,9 @@ struct vfs_node {
     uint32_t ref_count;         //reference count
     vfs_mount_t* mount;         //mount point this node belongs to
     vfs_node_t* parent;         //parent directory
+    uint32_t uid;               //owner user id
+    uint32_t gid;               //owner group id
+    uint32_t mode;              //permission bits (S_IRUSR..)
 };
 
 //VFS mount structure
@@ -95,9 +112,19 @@ int vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out);
 int vfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out);
 int vfs_get_size(vfs_node_t* node);
 vfs_node_t* vfs_resolve_path(const char* path);
+//resolve without following the final symlink
+vfs_node_t* vfs_resolve_path_nofollow(const char* path);
 int vfs_register_fs(const char* name, vfs_operations_t* ops);
 vfs_node_t* vfs_create_node(const char* name, uint32_t type, uint32_t flags);
 void vfs_destroy_node(vfs_node_t* node);
+
+//metadata overlay API for filesystems without native POSIX metadata
+//set any of mode/uid/gid for a given absolute path pass has_* to indicate which to set
+int vfs_set_metadata_override(const char* abspath, int has_mode, uint32_t mode,
+                              int has_uid, uint32_t uid,
+                              int has_gid, uint32_t gid);
+//apply overlay (if present) to a node resolved from 'abspath'
+void vfs_apply_metadata_override(vfs_node_t* node, const char* abspath);
 
 //set the root filesystem handlers directly (used by initramfs)
 int vfs_set_root_ops(vfs_operations_t* ops, void* private_data);

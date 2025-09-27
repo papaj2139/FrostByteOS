@@ -31,6 +31,7 @@ void vmm_destroy_directory(page_directory_t directory);
 int vmm_map_page_in_directory(page_directory_t directory, uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags);
 void vmm_map_kernel_space(page_directory_t directory);
 page_directory_t vmm_get_kernel_directory(void);
+page_directory_t vmm_get_current_directory(void);
 void vmm_destroy_directory(page_directory_t directory);
 
 

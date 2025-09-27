@@ -22,6 +22,7 @@
 #include "kernel/panic.h"
 #include "kernel/signal.h"
 #include "kernel/uaccess.h"
+#include "kernel/dynlink.h"
 
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
@@ -30,6 +31,21 @@
 #define MMAP_SCAN_START 0x04000000u   //avoid low 8MB identity region
 #define MMAP_SCAN_END   0x7F000000u   //keep under 2GiB to avoid sign issues
 #define USER_HEAP_BASE 0x03000000u
+
+#ifndef S_IFMT
+#define S_IFMT   0170000
+#define S_IFREG  0100000
+#define S_IFDIR  0040000
+#define S_IFLNK  0120000
+#define S_IFCHR  0020000
+#endif
+
+typedef struct {
+    uint32_t st_mode;  // type + perms
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t st_size;
+} stat32_t;
 
 static const int mdays_norm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
 
@@ -271,6 +287,7 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             const char* p = (const char*)arg1;
             char* const* avp = (char* const*)arg2;
             char* const* evp = (char* const*)arg3;
+            #if LOG_EXEC
             serial_write_string("[SYS_EXECVE] path ptr=0x");
             serial_printf("%x", (uint32_t)p);
             serial_write_string(" path=\"");
@@ -291,6 +308,7 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
                     serial_write_string("\"\n");
                 }
             }
+            #endif
             return sys_execve(p, avp, evp);
         }
         case SYS_WAIT:
@@ -341,6 +359,40 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_chdir((const char*)arg1);
         case SYS_GETCWD:
             return sys_getcwd((char*)arg1, arg2);
+        case SYS_DL_GET_INIT:
+            return sys_dl_get_init(arg1);
+        case SYS_DL_GET_FINI:
+            return sys_dl_get_fini(arg1);
+        case SYS_DLOPEN:
+            return sys_dlopen((const char*)arg1, arg2);
+        case SYS_DLCLOSE:
+            return sys_dlclose((int32_t)arg1);
+        case SYS_DLSYM:
+            return sys_dlsym((int32_t)arg1, (const char*)arg2);
+        case SYS_GETUID:
+            return sys_getuid();
+        case SYS_GETEUID:
+            return sys_geteuid();
+        case SYS_GETGID:
+            return sys_getgid();
+        case SYS_GETEGID:
+            return sys_getegid();
+        case SYS_UMASK:
+            return sys_umask((int32_t)arg1);
+        case SYS_STAT:
+            return sys_stat((const char*)arg1, (void*)arg2);
+        case SYS_LSTAT:
+            return sys_lstat((const char*)arg1, (void*)arg2);
+        case SYS_FSTAT:
+            return sys_fstat((int32_t)arg1, (void*)arg2);
+        case SYS_CHMOD:
+            return sys_chmod((const char*)arg1, (int32_t)arg2);
+        case SYS_CHOWN:
+            return sys_chown((const char*)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_FCHMOD:
+            return sys_fchmod((int32_t)arg1, (int32_t)arg2);
+        case SYS_FCHOWN:
+            return sys_fchown((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
         default:
             print("Unknown syscall\n", 0x0F);
             return -1; //ENOSYS = Function not implemented
@@ -376,13 +428,17 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
         //route stdout/stderr to controlling TTY device
         process_t* curp = process_get_current();
         device_t* dev = (curp) ? curp->tty : NULL;
+        int32_t rc;
         if (dev) {
             int wr = device_write(dev, 0, buf, count);
-            return (wr < 0) ? wr : (int32_t)count;
+            rc = (wr < 0) ? wr : (int32_t)count;
         } else {
             int written = tty_write(buf, count);
-            return (written < 0) ? written : (int32_t)count;
+            rc = (written < 0) ? written : (int32_t)count;
         }
+        //deliver any pending signals for the current process
+        signal_check_current();
+        return rc;
     }
 
     vfs_file_t* file = fd_get(fd);
@@ -405,6 +461,8 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     serial_printf("%d", bytes_written);
     serial_write_string("\n");
     #endif
+    //check signals
+    signal_check_current();
     return bytes_written;
 }
 
@@ -504,7 +562,8 @@ int32_t sys_open(const char* pathname, int32_t flags) {
     if (!node) {
         return -1;
     }
-    return fd_alloc(node, flags);
+    //install into current process descriptor table
+    return fd_alloc(node, vfs_flags);
 }
 
 int32_t sys_close(int32_t fd) {
@@ -515,16 +574,62 @@ int32_t sys_close(int32_t fd) {
 int32_t sys_creat(const char* pathname, int32_t mode) {
     char abspath[VFS_MAX_PATH];
     if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
-    int result = vfs_create(abspath, mode);
-    if (result != 0) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    //apply umask default file mode 0666 if mode==0
+    uint32_t req = (mode == 0) ? 0666u : (uint32_t)mode;
+    uint32_t eff_mode = req & ~cur->umask;
+
+    //create the file (filesystem-specific)
+    if (vfs_create(abspath, 0) != 0) {
         return -1;
     }
-    int fd = sys_open(pathname, 0); //open the file with default flags
-    if (fd < 0) {
-        //failed to open after creating unlink to undo creation
-        vfs_unlink(abspath);
+
+    //persist initial ownership and permissions via overlay so subsequent resolves see them
+    vfs_set_metadata_override(abspath, 1, (eff_mode & 07777), 1, cur->euid, 1, cur->egid);
+
+    //open parent directory directly then locate child and open it to avoid resolution race/case issues
+    char* parent_path = vfs_get_parent_path(abspath);
+    if (!parent_path) {
         return -1;
     }
+    char* base = vfs_get_basename(abspath);
+    if (!base) { kfree(parent_path); return -1; }
+
+    vfs_node_t* parent = vfs_open(parent_path, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    if (!parent) {
+        kfree(parent_path);
+        kfree(base);
+        return -1;
+    }
+
+    vfs_node_t* child = NULL;
+    int fd = -1;
+    if (parent->ops && parent->ops->finddir) {
+        if (parent->ops->finddir(parent, base, &child) == 0 && child) {
+            //best-effort set attributes on node instance as well
+            child->mode = (eff_mode & 07777);
+            child->uid = cur->euid;
+            child->gid = cur->egid;
+            //ensure filesystem-specific open occurs for write
+            if (child->ops && child->ops->open) {
+                if (child->ops->open(child, VFS_FLAG_WRITE) != 0) {
+                    vfs_close(child);
+                    child = NULL;
+                }
+            }
+            if (child) {
+                fd = fd_alloc(child, 1); //O_WRONLY
+                if (fd < 0) {
+                    vfs_close(child);
+                }
+            }
+        }
+    }
+
+    vfs_close(parent);
+    kfree(parent_path);
+    kfree(base);
     return fd;
 }
 
@@ -616,6 +721,9 @@ int32_t sys_fork(void) {
     //inherit TTY mode and controlling TTY
     child->tty = parent->tty;
     child->tty_mode = parent->tty_mode;
+
+    //inherit file descriptors (per-process) and bump open-file refcounts
+    fd_copy_on_fork(parent, child);
 
     //inherit cmdline for /proc/<pid>/cmdline until execve updates it
     child->cmdline[0] = '\0';
@@ -801,11 +909,23 @@ int32_t sys_unlink(const char* path) {
 }
 
 int32_t sys_mkdir(const char* path, int32_t mode) {
-    (void)mode; //modes not supported yet
     if (!path) return -1;
     char abspath[VFS_MAX_PATH];
     if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
-    return vfs_mkdir(abspath, 0);
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    uint32_t req = (mode == 0) ? 0777u : (uint32_t)mode;
+    uint32_t eff_mode = req & ~cur->umask;
+    int r = vfs_mkdir(abspath, 0);
+    if (r != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(abspath);
+    if (n) {
+        n->mode = (eff_mode & 07777);
+        n->uid = cur->euid;
+        n->gid = cur->egid;
+        vfs_close(n);
+    }
+    return 0;
 }
 
 int32_t sys_rmdir(const char* path) {
@@ -854,13 +974,13 @@ int32_t sys_umount(const char* mount_point) {
 }
 
 int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot, uint32_t flags) {
-#if LOG_SYSCALL
-    serial_write_string("[MMAP] req addr=0x"); serial_printf("%x", addr);
-    serial_write_string(" len=0x"); serial_printf("%x", length);
-    serial_write_string(" prot=0x"); serial_printf("%x", prot);
-    serial_write_string(" flags=0x"); serial_printf("%x", flags);
-    serial_write_string("\n");
-#endif
+    #if LOG_SYSCALL
+        serial_write_string("[MMAP] req addr=0x"); serial_printf("%x", addr);
+        serial_write_string(" len=0x"); serial_printf("%x", length);
+        serial_write_string(" prot=0x"); serial_printf("%x", prot);
+        serial_write_string(" flags=0x"); serial_printf("%x", flags);
+        serial_write_string("\n");
+    #endif
     process_t* cur = process_get_current();
     if (!cur || !cur->page_directory || length == 0) return -1;
     //align length up to page size
@@ -910,21 +1030,21 @@ int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot, uint32_t flags) 
             vmm_unmap_page_nofree(TMP);
         }
     }
-#if LOG_SYSCALL
-    serial_write_string("[MMAP] ok start=0x"); serial_printf("%x", (uint32_t)start);
-    serial_write_string(" len=0x"); serial_printf("%x", len);
-    serial_write_string("\n");
-#endif
+    #if LOG_SYSCALL
+        serial_write_string("[MMAP] ok start=0x"); serial_printf("%x", (uint32_t)start);
+        serial_write_string(" len=0x"); serial_printf("%x", len);
+        serial_write_string("\n");
+    #endif
     //return start address as int32
     return (int32_t)start;
 }
 
 int32_t sys_munmap(uint32_t addr, uint32_t length) {
-#if LOG_SYSCALL
-    serial_write_string("[MUNMAP] addr=0x"); serial_printf("%x", addr);
-    serial_write_string(" len=0x"); serial_printf("%x", length);
-    serial_write_string("\n");
-#endif
+    #if LOG_SYSCALL
+        serial_write_string("[MUNMAP] addr=0x"); serial_printf("%x", addr);
+        serial_write_string(" len=0x"); serial_printf("%x", length);
+        serial_write_string("\n");
+    #endif
     process_t* cur = process_get_current();
     if (!cur || !cur->page_directory || length == 0) return -1;
     uint32_t start = addr & ~(PAGE_SIZE - 1);
@@ -1005,6 +1125,204 @@ int32_t sys_nanosleep(const void* req_ts, void* rem_ts) {
     return 0;
 }
 
+static int read_user_u32(page_directory_t dir, uint32_t va, uint32_t* out) {
+    if (!va || !out) return -1;
+    page_directory_t saved = vmm_get_kernel_directory();
+    vmm_switch_directory(dir);
+    uint32_t phys = vmm_get_physical_addr(va & ~0xFFFu) & ~0xFFFu;
+    uint32_t off = va & 0xFFFu;
+    vmm_switch_directory(saved);
+    if (!phys) return -1;
+    uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    const uint32_t TMP = 0x00800000u;
+    if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
+        if (eflags_save & 0x200) __asm__ volatile ("sti");
+        return -1;
+    }
+    *out = *(uint32_t*)(TMP + off);
+    vmm_unmap_page_nofree(TMP);
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
+    return 0;
+}
+
+int32_t sys_dl_get_init(uint32_t index) {
+    process_t* cur = process_get_current();
+    if (!cur) return 0;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (ctx->count <= 0) return 0;
+
+    //enumerate in load order: init_array entries, then init function
+    for (int i = 0; i < ctx->count; i++) {
+        dynobj_t* o = &ctx->objs[i];
+        if (!o->ready) continue;
+        if (o->init_array && o->init_arraysz) {
+            uint32_t entries = o->init_arraysz / 4u;
+            if (index < entries) {
+                uint32_t fn = 0;
+                if (read_user_u32(ctx->dir, o->init_array + index * 4u, &fn) == 0) return (int32_t)fn;
+                return 0;
+            } else {
+                index -= entries;
+            }
+        }
+        if (o->init_addr) {
+            if (index == 0) return (int32_t)o->init_addr;
+            index--;
+        }
+    }
+    return 0;
+}
+
+int32_t sys_dl_get_fini(uint32_t index) {
+    process_t* cur = process_get_current();
+    if (!cur) return 0;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (ctx->count <= 0) return 0;
+
+    //enumerate in reverse order: fini_addr first, then fini_array in reverse
+    for (int i = ctx->count - 1; i >= 0; i--) {
+        dynobj_t* o = &ctx->objs[i];
+        if (!o->ready) continue;
+        if (o->fini_addr) {
+            if (index == 0) return (int32_t)o->fini_addr;
+            index--;
+        }
+        if (o->fini_array && o->fini_arraysz) {
+            uint32_t entries = o->fini_arraysz / 4u;
+            if (index < entries) {
+                uint32_t rev_idx = entries - 1u - index;
+                uint32_t fn = 0;
+                if (read_user_u32(ctx->dir, o->fini_array + rev_idx * 4u, &fn) == 0) return (int32_t)fn;
+                return 0;
+            } else {
+                index -= entries;
+            }
+        }
+    }
+    return 0;
+}
+
+static int build_candidate(char* out, uint32_t outsz, const char* dir, const char* name)
+{
+    if (!out || !dir || !name) return -1;
+    size_t dl = strlen(dir); if (dl >= outsz) dl = outsz - 1;
+    memcpy(out, dir, dl);
+    size_t pos = dl;
+    if (pos == 0 || out[pos - 1] != '/') {
+        if (pos + 1 < outsz) out[pos++] = '/';
+    }
+    size_t nl = strlen(name);
+    if (pos + nl >= outsz) nl = outsz - pos - 1;
+    memcpy(out + pos, name, nl);
+    out[pos + nl] = '\0';
+    return 0;
+}
+
+int32_t sys_dlopen(const char* path, uint32_t flags)
+{
+    (void)flags;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (!ctx->dir) {
+        dynlink_ctx_init(ctx, cur->page_directory);
+    }
+    //dlopen(NULL, ...) returns a special handle for the main program namespace
+    if (path == NULL) {
+        return -2; //special handle: MAIN
+    }
+    char name[96];
+    if (copy_user_string(path, name, sizeof(name)) != 0) return -1;
+
+    //if it already exists (by SONAME or basename) return existing handle
+    int idx_existing = dynlink_find_loaded(ctx, name);
+    if (idx_existing >= 0) {
+        return idx_existing;
+    }
+
+    // If contains '/', try directly
+    int loaded = 0;
+    dynobj_t* child = NULL;
+    if (strchr(name, '/')) {
+        if (dynlink_load_shared(ctx, name, &child) == 0 && child) loaded = 1;
+    } else {
+        //try LD_LIBRARY_PATH list
+        if (ctx->ld_library_path[0]) {
+            const char* s = ctx->ld_library_path; const char* start = s;
+            char cand[128];
+            while (!loaded) {
+                if (*s == ':' || *s == '\0') {
+                    size_t len = (size_t)(s - start);
+                    if (len > 0 && len < sizeof(cand) - 2) {
+                        char dir[96]; if (len >= sizeof(dir)) len = sizeof(dir) - 1;
+                        memcpy(dir, start, len); dir[len] = '\0';
+                        build_candidate(cand, sizeof(cand), dir, name);
+                        if (dynlink_load_shared(ctx, cand, &child) == 0 && child) { loaded = 1; break; }
+                    }
+                    if (*s == '\0') break;
+                    start = s + 1;
+                }
+                s++;
+            }
+        }
+        //fallback /lib/<name>
+        if (!loaded) {
+            char cand[128];
+            build_candidate(cand, sizeof(cand), "/lib", name);
+            if (dynlink_load_shared(ctx, cand, &child) == 0 && child) loaded = 1;
+        }
+    }
+
+    if (!loaded || !child) return -1;
+    int start_idx = cur->dlctx.count - 1; //'child' is the last loaded object index
+    if (start_idx < 0) start_idx = 0;
+    (void)dynlink_load_needed(ctx, child);
+    //apply relocations only to newly loaded objects (avoid re-relocating existing ones)
+    int apply_start = start_idx; //conservative if load_needed added more they are >= start_idx
+    if (dynlink_apply_relocations_from(ctx, apply_start) != 0) return -1;
+    //handle is index of child
+    int handle = (int)(child - &ctx->objs[0]);
+    return handle;
+}
+
+int32_t sys_dlsym(int32_t handle, const char* name) {
+    process_t* cur = process_get_current();
+    if (!cur) return 0;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (!ctx->dir) return 0;
+    char sym[96];
+    if (copy_user_string(name, sym, sizeof(sym)) != 0) return 0;
+    serial_write_string("[DLSYM] ");
+    serial_write_string(sym);
+    serial_write_string(" handle=");
+    serial_printf("%d", handle);
+    serial_write_string("\n");
+
+    void* va = 0;
+    if (handle >= 0 && handle < ctx->count) {
+        va = dynlink_lookup_symbol_in(ctx, handle, sym);
+    } else if (handle == -2) {
+        //main namespace: search main object only (base==0)
+        int main_idx = 0;
+        for (int i = 0; i < ctx->count; i++) { if (ctx->objs[i].base == 0) { main_idx = i; break; } }
+        va = dynlink_lookup_symbol_in(ctx, main_idx, sym);
+    } else {
+        //global search across all loaded objects
+        va = dynlink_lookup_symbol(ctx, sym);
+    }
+
+    serial_write_string("[DLSYM] result=");
+    serial_printf("%x", (uint32_t)(uintptr_t)va);
+    serial_write_string("\n");
+    return (int32_t)(uint32_t)(uintptr_t)va;
+}
+
+int32_t sys_dlclose(int32_t handle)
+{
+    (void)handle; //unloading not supported yet
+    return 0;
+}
+
 int32_t sys_link(const char* oldpath, const char* newpath) {
     if (!oldpath || !newpath) return -1;
     char src[VFS_MAX_PATH], dst[VFS_MAX_PATH];
@@ -1036,6 +1354,159 @@ int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz) {
     char ap[VFS_MAX_PATH];
     if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
     return vfs_readlink(ap, buf, bufsiz);
+}
+
+int32_t sys_getuid(void) {
+    process_t* cur = process_get_current();
+    #if LOG_SYSCALL
+    serial_write_string("[SYSCALL] getuid -> ");
+    serial_printf("%d", cur ? (int)cur->uid : -1);
+    serial_write_string("\n");
+    #endif
+    return cur ? (int32_t)cur->uid : -1;
+}
+
+int32_t sys_geteuid(void) {
+    process_t* cur = process_get_current();
+    #if LOG_SYSCALL
+    serial_write_string("[SYSCALL] geteuid -> ");
+    serial_printf("%d", cur ? (int)cur->euid : -1);
+    serial_write_string("\n");
+    #endif
+    return cur ? (int32_t)cur->euid : -1;
+}
+
+int32_t sys_getgid(void) {
+    process_t* cur = process_get_current();
+    return cur ? (int32_t)cur->gid : -1;
+}
+
+int32_t sys_getegid(void) {
+    process_t* cur = process_get_current();
+    return cur ? (int32_t)cur->egid : -1;
+}
+
+int32_t sys_umask(int32_t new_mask) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    int32_t old = (int32_t)cur->umask;
+    if (new_mask >= 0) cur->umask = (uint32_t)(new_mask & 0777);
+    return old;
+}
+
+static uint32_t vfs_type_to_ifmt(uint32_t t)
+{
+    switch (t) {
+        case VFS_FILE_TYPE_DIRECTORY: return S_IFDIR;
+        case VFS_FILE_TYPE_SYMLINK:   return S_IFLNK;
+        case VFS_FILE_TYPE_DEVICE:    return S_IFCHR;
+        case VFS_FILE_TYPE_FILE:
+        default: return S_IFREG;
+    }
+}
+
+static void fill_stat_from_node(vfs_node_t* n, stat32_t* st)
+{
+    st->st_mode = (n->mode & 07777) | vfs_type_to_ifmt(n->type);
+    st->st_uid = n->uid;
+    st->st_gid = n->gid;
+    st->st_size = n->size;
+}
+
+int32_t sys_stat(const char* path, void* stat_out)
+{
+    if (!path || !stat_out) return -1;
+    if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(ap);
+    if (!n) return -1;
+    stat32_t st; fill_stat_from_node(n, &st);
+    memcpy(stat_out, &st, sizeof(st));
+    vfs_close(n);
+    return 0;
+}
+
+int32_t sys_lstat(const char* path, void* stat_out)
+{
+    if (!path || !stat_out) return -1;
+    if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path_nofollow(ap);
+    if (!n) return -1;
+    stat32_t st; fill_stat_from_node(n, &st);
+    memcpy(stat_out, &st, sizeof(st));
+    vfs_close(n);
+    return 0;
+}
+
+int32_t sys_fstat(int32_t fd, void* stat_out)
+{
+    if (!stat_out) return -1;
+    if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
+    vfs_file_t* f = fd_get(fd);
+    if (!f || !f->node) return -1;
+    stat32_t st; fill_stat_from_node(f->node, &st);
+    memcpy(stat_out, &st, sizeof(st));
+    return 0;
+}
+
+int32_t sys_chmod(const char* path, int32_t mode)
+{
+    if (!path) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(ap);
+    if (!n) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) { vfs_close(n); return -1; }
+    if (!(cur->euid == 0 || cur->euid == n->uid)) { vfs_close(n); return -1; }
+    n->mode = (uint32_t)mode & 07777;
+    vfs_close(n);
+    //persist via overlay so changes stick across re-resolve
+    vfs_set_metadata_override(ap, 1, (uint32_t)mode & 07777, 0, 0, 0, 0);
+    return 0;
+}
+
+int32_t sys_chown(const char* path, int32_t uid, int32_t gid)
+{
+    if (!path) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(ap);
+    if (!n) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) { vfs_close(n); return -1; }
+    if (cur->euid != 0) { vfs_close(n); return -1; }
+    if (uid >= 0) n->uid = (uint32_t)uid;
+    if (gid >= 0) n->gid = (uint32_t)gid;
+    vfs_close(n);
+    vfs_set_metadata_override(ap, 0, 0, uid >= 0, (uint32_t)uid, gid >= 0, (uint32_t)gid);
+    return 0;
+}
+
+int32_t sys_fchmod(int32_t fd, int32_t mode)
+{
+    vfs_file_t* f = fd_get(fd);
+    if (!f || !f->node) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    if (!(cur->euid == 0 || cur->euid == f->node->uid)) return -1;
+    f->node->mode = (uint32_t)mode & 07777;
+    return 0;
+}
+
+int32_t sys_fchown(int32_t fd, int32_t uid, int32_t gid)
+{
+    vfs_file_t* f = fd_get(fd);
+    if (!f || !f->node) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    if (cur->euid != 0) return -1;
+    if (uid >= 0) f->node->uid = (uint32_t)uid;
+    if (gid >= 0) f->node->gid = (uint32_t)gid;
+    return 0;
 }
 
 int32_t sys_waitpid(int32_t pid, int32_t* status, int32_t options) {

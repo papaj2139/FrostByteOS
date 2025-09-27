@@ -1,12 +1,12 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 
 static void puts1(const char* s) { 
-    write(1, s, strlen(s)); 
+    fputs(1, s); 
 }
 static void puts2(const char* a, const char* b) { 
-    write(1, a, strlen(a)); 
-    write(1, b, strlen(b)); 
+    dprintf(1, "%s%s", a, b); 
 }
 
 int main(int argc, char** argv, char** envp) {

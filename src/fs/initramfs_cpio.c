@@ -4,7 +4,7 @@
 #include "../libc/string.h"
 
 //minimal newc (SVR4) CPIO parser
-//taken from linux
+//based on linux docs
 //reference: https://www.kernel.org/doc/Documentation/early-userspace/buffer-format.txt
 
 static inline uint32_t hex8(const char* s) {
@@ -87,6 +87,9 @@ int initramfs_load_cpio(const uint8_t* start, const uint8_t* end) {
         const uint32_t S_IFREG = 0100000;
         const uint32_t S_IFLNK = 0120000;
         uint32_t ftype = mode & S_IFMT;
+
+        //persist permissions and ownership via VFS overlay so later opens see correct exec bits
+        vfs_set_metadata_override(path, 1, (mode & 07777), 1, uid, 1, gid);
 
         if (ftype == S_IFDIR) {
             //ensure dir exists

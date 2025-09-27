@@ -2,24 +2,37 @@
 #include <string.h>
 #include "../io.h"
 #include "../drivers/serial.h"
+#include "../debug.h"
+#include "../mm/heap.h"
+#include "../kernel/cga.h"
 #include <stdint.h>
 
 #define FAT16_END_OF_CHAIN 0xFFF8
 #define FAT16_BAD_CLUSTER  0xFFF7
 #define FAT16_FREE_CLUSTER 0x0000
 
-extern void print(char* msg, unsigned char colour);
+#ifndef FAT16_SECTOR_SIZE
+#define FAT16_SECTOR_SIZE 512u
+#endif
+#ifndef FAT16_READAHEAD_SECTORS
+#define FAT16_READAHEAD_SECTORS 32u  //16KB read ahead by default
+#endif
 
 //forward declaration for chain free helper used by delete ops
 static int fat16_free_chain(fat16_fs_t* fs, uint16_t start);
 
 static void fat16_debug(const char* msg) {
+#if LOG_FAT16
     serial_write_string("[FAT16] ");
     serial_write_string(msg);
     serial_write_string("\n");
+#else
+    (void)msg;
+#endif
 }
 
 static void fat16_debug_hex(const char* msg, uint32_t value) {
+#if LOG_FAT16
     serial_write_string("[FAT16] ");
     serial_write_string(msg);
     serial_write_string(": 0x");
@@ -30,15 +43,17 @@ static void fat16_debug_hex(const char* msg, uint32_t value) {
     hex[8] = '\0';
     serial_write_string(hex);
     serial_write_string("\n");
+#else
+    (void)msg; (void)value;
+#endif
 }
 
 static void fat16_hex_dump(const uint8_t* data, size_t size) {
+#if LOG_FAT16
     serial_write_string("[FAT16] Boot sector hex dump:\n");
     for (size_t i = 0; i < size; i += 16) {
         char line[80];
         int pos = 0;
-
-
         char offset_hex[5] = {'0', '0', '0', '0', ':'};
         for (int j = 3; j >= 0; j--) {
             offset_hex[3-j] = "0123456789ABCDEF"[(i >> (j*4)) & 0xF];
@@ -47,10 +62,8 @@ static void fat16_hex_dump(const uint8_t* data, size_t size) {
             line[pos++] = offset_hex[k];
         }
         line[pos++] = ' ';
-
-        //hex bytes
         for (int j = 0; j < 16; j++) {
-            if (i + j < size) {
+            if (i + j < (size_t)size) {
                 line[pos++] = "0123456789ABCDEF"[data[i + j] >> 4];
                 line[pos++] = "0123456789ABCDEF"[data[i + j] & 0xF];
                 line[pos++] = ' ';
@@ -60,18 +73,18 @@ static void fat16_hex_dump(const uint8_t* data, size_t size) {
                 line[pos++] = ' ';
             }
         }
-
-        //ASCII representation
         line[pos++] = ' ';
-        for (int j = 0; j < 16 && i + j < size; j++) {
+        for (int j = 0; j < 16 && i + j < (size_t)size; j++) {
             char c = data[i + j];
             line[pos++] = (c >= 32 && c <= 126) ? c : '.';
         }
-
         line[pos] = '\0';
         serial_write_string(line);
         serial_write_string("\n");
     }
+#else
+    (void)data; (void)size;
+#endif
 }
 
 
@@ -108,21 +121,22 @@ static void fat16_print_boot_sector_info(fat16_boot_sector_t* bs) {
         return;
     }
 
-    //print OEM name
-    char oem_name[9];
-    memcpy(oem_name, bs->oem_name, 8);
-    oem_name[8] = '\0';
-    serial_write_string("[FAT16] OEM Name: '");
-    serial_write_string(oem_name);
-    serial_write_string("'\n");
+    //print OEM name and fs type (debug)
+    #if LOG_FAT16
+        char oem_name[9];
+        memcpy(oem_name, bs->oem_name, 8);
+        oem_name[8] = '\0';
+        serial_write_string("[FAT16] OEM Name: '");
+        serial_write_string(oem_name);
+        serial_write_string("'\n");
 
-    //print fs type
-    char fs_type[9];
-    memcpy(fs_type, bs->file_system_type, 8);
-    fs_type[8] = '\0';
-    serial_write_string("[FAT16] FS Type: '");
-    serial_write_string(fs_type);
-    serial_write_string("'\n");
+        char fs_type[9];
+        memcpy(fs_type, bs->file_system_type, 8);
+        fs_type[8] = '\0';
+        serial_write_string("[FAT16] FS Type: '");
+        serial_write_string(fs_type);
+        serial_write_string("'\n");
+    #endif
 
     fat16_debug("=== End Boot Sector Analysis ===");
 }
@@ -444,6 +458,17 @@ int fat16_open_file(fat16_fs_t* fs, fat16_file_t* file, const char* filename) {
     file->current_offset = 0;
     file->file_size = file->entry.file_size;
     file->is_open = 1;
+    //initialize sequential read cache
+    file->cached_offset = 0;
+    file->cached_cluster = file->current_cluster;
+    file->cache_valid = 1;
+    //init read-ahead
+    #if FAT16_USE_READAHEAD
+        file->ra_buf = NULL;
+        file->ra_buf_cap = 0;
+        file->ra_len = 0;
+        file->ra_off = 0;
+    #endif
 
     fat16_debug("File opened successfully");
     fat16_debug_hex("Starting cluster", file->current_cluster);
@@ -451,6 +476,104 @@ int fat16_open_file(fat16_fs_t* fs, fat16_file_t* file, const char* filename) {
 
     return 0;
 }
+
+//fill the per-file read-ahead buffer starting at current_offset
+//attempts to fill at least min_bytes (if possible) up to buffer capacity or EOF
+#if FAT16_USE_READAHEAD
+static uint32_t fat16_fill_readahead(fat16_file_t* file, uint32_t min_bytes) {
+    if (!file) return 0;
+    if (!file->ra_buf) {
+        uint32_t cap = FAT16_READAHEAD_SECTORS * FAT16_SECTOR_SIZE;
+        file->ra_buf = (uint8_t*)kmalloc(cap);
+        if (!file->ra_buf) return 0;
+        file->ra_buf_cap = cap;
+    }
+    if (min_bytes > file->ra_buf_cap) min_bytes = file->ra_buf_cap;
+
+    file->ra_off = file->current_offset;
+    file->ra_len = 0;
+
+    if (file->ra_off >= file->file_size) return 0;
+
+    uint32_t sectors_per_cluster = file->fs->boot_sector.sectors_per_cluster;
+    uint32_t cluster_size = sectors_per_cluster * FAT16_SECTOR_SIZE;
+
+    //determine starting cluster for ra_off using cached chain position
+    uint16_t cluster;
+    uint32_t target_index = file->ra_off / cluster_size;
+    if (file->cache_valid && file->cached_offset == file->ra_off) {
+        cluster = file->cached_cluster;
+    } else {
+        uint32_t start_index = 0;
+        uint16_t start_cluster = file->entry.first_cluster;
+        if (file->cache_valid) {
+            uint32_t cached_index = file->cached_offset / cluster_size;
+            if (cached_index <= target_index) {
+                start_index = cached_index;
+                start_cluster = file->cached_cluster;
+            }
+        }
+        cluster = start_cluster;
+        for (uint32_t i = start_index; i < target_index; i++) {
+            uint16_t next = fat16_get_next_cluster(file->fs, cluster);
+            cluster = next;
+            if (cluster >= FAT16_END_OF_CHAIN) return 0;
+        }
+    }
+
+    while (file->ra_len < file->ra_buf_cap && (file->ra_off + file->ra_len) < file->file_size && cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+        uint32_t base_sector = file->fs->data_start + (cluster - 2u) * sectors_per_cluster;
+        uint32_t cur_off = file->ra_off + file->ra_len;
+        uint32_t cluster_offset = cur_off % cluster_size;
+        uint32_t sector_in_cluster = cluster_offset / FAT16_SECTOR_SIZE;
+        uint32_t byte_in_sector = cluster_offset % FAT16_SECTOR_SIZE;
+
+        uint32_t capacity_left = file->ra_buf_cap - file->ra_len;
+        uint32_t file_left = file->file_size - cur_off;
+
+        if (byte_in_sector != 0 || capacity_left < FAT16_SECTOR_SIZE || file_left < FAT16_SECTOR_SIZE) {
+            //handle partial sector
+            uint8_t sector_buffer[FAT16_SECTOR_SIZE];
+            if (device_read(file->fs->device, (base_sector + sector_in_cluster) * FAT16_SECTOR_SIZE, sector_buffer, FAT16_SECTOR_SIZE) != (int)FAT16_SECTOR_SIZE) {
+                break;
+            }
+            uint32_t bytes_in_sector = FAT16_SECTOR_SIZE - byte_in_sector;
+            uint32_t to_copy = (bytes_in_sector < capacity_left) ? bytes_in_sector : capacity_left;
+            if (to_copy > file_left) to_copy = file_left;
+            memcpy(file->ra_buf + file->ra_len, sector_buffer + byte_in_sector, to_copy);
+            file->ra_len += to_copy;
+            cur_off += to_copy;
+            if ((cur_off % cluster_size) == 0) {
+                uint16_t next = fat16_get_next_cluster(file->fs, cluster);
+                cluster = next;
+                if (cluster >= FAT16_END_OF_CHAIN) break;
+            }
+        } else {
+            //read whole sectors directly
+            uint32_t sectors_left_in_cluster = sectors_per_cluster - sector_in_cluster;
+            uint32_t max_sectors_cap = capacity_left / FAT16_SECTOR_SIZE;
+            uint32_t max_sectors_file = file_left / FAT16_SECTOR_SIZE;
+            uint32_t contig = sectors_left_in_cluster;
+            if (contig > max_sectors_cap) contig = max_sectors_cap;
+            if (contig > max_sectors_file) contig = max_sectors_file;
+            if (contig == 0) break;
+            uint32_t to_bytes = contig * FAT16_SECTOR_SIZE;
+            if (device_read(file->fs->device, (base_sector + sector_in_cluster) * FAT16_SECTOR_SIZE, file->ra_buf + file->ra_len, to_bytes) != (int)to_bytes) {
+                break;
+            }
+            file->ra_len += to_bytes;
+            cur_off += to_bytes;
+            if ((cur_off % cluster_size) == 0) {
+                uint16_t next = fat16_get_next_cluster(file->fs, cluster);
+                cluster = next;
+                if (cluster >= FAT16_END_OF_CHAIN) break;
+            }
+        }
+        if (file->ra_len >= min_bytes) break;
+    }
+    return file->ra_len;
+}
+#endif // FAT16_USE_READAHEAD
 
 int fat16_read_file(fat16_file_t* file, void* buffer, uint32_t size) {
     if (!file || !file->is_open || !buffer) return -1;
@@ -467,43 +590,170 @@ int fat16_read_file(fat16_file_t* file, void* buffer, uint32_t size) {
     uint8_t* buf_ptr = (uint8_t*)buffer;
     uint32_t bytes_read = 0;
 
-    while (bytes_read < size && file->current_cluster < FAT16_END_OF_CHAIN) {
-        //calculate sector from cluster
-        uint32_t sector = file->fs->data_start +
-                         (file->current_cluster - 2) * file->fs->boot_sector.sectors_per_cluster;
+    //calculate  cluster size
+    uint32_t sectors_per_cluster = file->fs->boot_sector.sectors_per_cluster;
+    uint32_t cluster_size = sectors_per_cluster * FAT16_SECTOR_SIZE;
 
-        //calculate offset within cluster
-        uint32_t cluster_size = file->fs->boot_sector.sectors_per_cluster * 512;
-        uint32_t cluster_offset = file->current_offset % cluster_size;
-        uint32_t sector_in_cluster = cluster_offset / 512;
-        uint32_t byte_in_sector = cluster_offset % 512;
-
-        //read the sector
-        uint8_t sector_buffer[512];
-        if (device_read(file->fs->device, (sector + sector_in_cluster) * 512, sector_buffer, 512) != 512) {
-            return -1;
+    #if FAT16_USE_READAHEAD
+        //serve from readahead buffer if overlapping
+        if (file->ra_len > 0) {
+            uint32_t ra_end = file->ra_off + file->ra_len;
+            if (file->current_offset >= file->ra_off && file->current_offset < ra_end) {
+                uint32_t offset_in_ra = file->current_offset - file->ra_off;
+                uint32_t avail = file->ra_len - offset_in_ra;
+                uint32_t to_copy = (avail < size) ? avail : size;
+                memcpy(buf_ptr, file->ra_buf + offset_in_ra, to_copy);
+                bytes_read += to_copy;
+                file->current_offset += to_copy;
+                size -= to_copy;
+                if (size == 0) {
+                    //it no longer know the exact cluster for this offset invalidate cache
+                    file->cache_valid = 0;
+                    return (int)bytes_read;
+                }
+            }
         }
 
-        //copy data from sector
-        uint32_t bytes_in_sector = 512 - byte_in_sector;
-        uint32_t bytes_to_copy = (bytes_in_sector < (size - bytes_read)) ? bytes_in_sector : (size - bytes_read);
+        //if the remaining request is small prefetch aggressively and serve
+        if (size > 0 && size <= FAT16_READAHEAD_THRESHOLD_BYTES) {
+            //prefetch up to the full RA capacity to benefit subsequent small sequential reads
+            uint32_t want = FAT16_READAHEAD_SECTORS * FAT16_SECTOR_SIZE;
+            uint32_t got = fat16_fill_readahead(file, want);
+            if (got > 0) {
+                uint32_t to_copy = (got < size) ? got : size;
+                memcpy(buf_ptr + bytes_read, file->ra_buf, to_copy);
+                bytes_read += to_copy;
+                file->current_offset += to_copy;
+                size -= to_copy;
+                if (size == 0) {
+                    //read-ahead consumed we don't know exact cluster so invalidate cache
+                    file->cache_valid = 0;
+                    return (int)bytes_read;
+                }
+            }
+        }
+    #endif
 
-        memcpy(buf_ptr + bytes_read, sector_buffer + byte_in_sector, bytes_to_copy);
-        bytes_read += bytes_to_copy;
-        file->current_offset += bytes_to_copy;
+    //fallback to direct reads across clusters for any remainder
+    if (size > 0) {
+        //locate starting cluster using cached info
+        uint16_t cluster;
+        uint32_t target_index = file->current_offset / cluster_size;
+        if (file->cache_valid && file->cached_offset == file->current_offset) {
+            cluster = file->cached_cluster;
+        } else {
+            uint32_t start_index = 0;
+            uint16_t start_cluster = file->entry.first_cluster;
+            if (file->cache_valid) {
+                uint32_t cached_index = file->cached_offset / cluster_size;
+                if (cached_index <= target_index) {
+                    start_index = cached_index;
+                    start_cluster = file->cached_cluster;
+                }
+            }
+            cluster = start_cluster;
+            for (uint32_t i = start_index; i < target_index; i++) {
+                uint16_t next = fat16_get_next_cluster(file->fs, cluster);
+                cluster = next;
+                if (cluster >= FAT16_END_OF_CHAIN) {
+                    break;
+                }
+            }
+            //after computing update cache only if we remain within a valid cluster
+            if (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+                file->cached_offset = file->current_offset;
+                file->cached_cluster = cluster;
+                file->cache_valid = 1;
+            } else {
+                file->cache_valid = 0;
+            }
+        }
 
-        //check if need to move to next cluster
-        if ((file->current_offset % cluster_size) == 0) {
-            file->current_cluster = fat16_get_next_cluster(file->fs, file->current_cluster);
-            if (file->current_cluster >= FAT16_END_OF_CHAIN) {
+        while (size > 0 && cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+            uint32_t base_sector = file->fs->data_start + (cluster - 2u) * sectors_per_cluster;
+            uint32_t cluster_offset = file->current_offset % cluster_size;
+            uint32_t sector_in_cluster = cluster_offset / FAT16_SECTOR_SIZE;
+            uint32_t byte_in_sector = cluster_offset % FAT16_SECTOR_SIZE;
+
+            if (byte_in_sector == 0 && size >= FAT16_SECTOR_SIZE) {
+                uint32_t sectors_left_in_cluster = sectors_per_cluster - sector_in_cluster;
+                uint32_t max_sectors_from_remaining = size / FAT16_SECTOR_SIZE;
+                uint32_t contig = (sectors_left_in_cluster < max_sectors_from_remaining) ? sectors_left_in_cluster : max_sectors_from_remaining;
+                if (contig > 0) {
+                    uint32_t to_bytes = contig * FAT16_SECTOR_SIZE;
+                    if (device_read(file->fs->device, (base_sector + sector_in_cluster) * FAT16_SECTOR_SIZE, buf_ptr + bytes_read, to_bytes) != (int)to_bytes) {
+                        break;
+                    }
+                    bytes_read += to_bytes;
+                    file->current_offset += to_bytes;
+                    size -= to_bytes;
+                    if ((file->current_offset % cluster_size) == 0) {
+                        uint16_t next = fat16_get_next_cluster(file->fs, cluster);
+                        cluster = next;
+                        file->current_cluster = cluster;
+                        if (cluster >= FAT16_END_OF_CHAIN) break;
+                    }
+                    file->cached_offset = file->current_offset;
+                    file->cached_cluster = cluster;
+                    file->cache_valid = 1;
+                    continue;
+                }
+            }
+
+            uint8_t sector_buffer[FAT16_SECTOR_SIZE];
+            if (device_read(file->fs->device, (base_sector + sector_in_cluster) * FAT16_SECTOR_SIZE, sector_buffer, FAT16_SECTOR_SIZE) != (int)FAT16_SECTOR_SIZE) {
                 break;
             }
+            uint32_t bytes_in_sector = FAT16_SECTOR_SIZE - byte_in_sector;
+            uint32_t bytes_to_copy = (bytes_in_sector < size) ? bytes_in_sector : size;
+            memcpy(buf_ptr + bytes_read, sector_buffer + byte_in_sector, bytes_to_copy);
+            bytes_read += bytes_to_copy;
+            file->current_offset += bytes_to_copy;
+            size -= bytes_to_copy;
+
+            if ((file->current_offset % cluster_size) == 0) {
+                uint16_t next = fat16_get_next_cluster(file->fs, cluster);
+                cluster = next;
+                file->current_cluster = cluster;
+                if (cluster >= FAT16_END_OF_CHAIN) break;
+            }
+            file->cached_offset = file->current_offset;
+            file->cached_cluster = cluster;
+            file->cache_valid = 1;
+        }
+    }
+
+    //if nothing read but not at EOF try to read one sector via a direct recompute
+    if (bytes_read == 0 && size > 0 && file->current_offset < file->file_size) {
+        uint32_t sectors_per_cluster = file->fs->boot_sector.sectors_per_cluster;
+        uint32_t cluster_size = sectors_per_cluster * FAT16_SECTOR_SIZE;
+        uint32_t target_index = file->current_offset / cluster_size;
+        uint16_t cluster = file->entry.first_cluster;
+        for (uint32_t i = 0; i < target_index; i++) {
+            uint16_t next = fat16_get_next_cluster(file->fs, cluster);
+            cluster = next;
+            if (cluster >= FAT16_END_OF_CHAIN) break;
+        }
+        if (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+            uint32_t base_sector = file->fs->data_start + (cluster - 2u) * sectors_per_cluster;
+            uint32_t cluster_offset = file->current_offset % cluster_size;
+            uint32_t sector_in_cluster = cluster_offset / FAT16_SECTOR_SIZE;
+            uint32_t byte_in_sector = cluster_offset % FAT16_SECTOR_SIZE;
+            uint8_t sector_buffer[FAT16_SECTOR_SIZE];
+            if (device_read(file->fs->device, (base_sector + sector_in_cluster) * FAT16_SECTOR_SIZE, sector_buffer, FAT16_SECTOR_SIZE) == (int)FAT16_SECTOR_SIZE) {
+                uint32_t bytes_in_sector = FAT16_SECTOR_SIZE - byte_in_sector;
+                uint32_t to_copy = (bytes_in_sector < size) ? bytes_in_sector : size;
+                memcpy(buf_ptr + bytes_read, sector_buffer + byte_in_sector, to_copy);
+                bytes_read += to_copy;
+                file->current_offset += to_copy;
+            }
+            //invalidate cache since we bypassed normal path
+            file->cache_valid = 0;
         }
     }
 
     fat16_debug_hex("Bytes read from file", bytes_read);
-
-    return bytes_read;
+    return (int)bytes_read;
 }
 
 static uint16_t fat16_find_free_cluster(fat16_fs_t* fs) {
@@ -601,6 +851,64 @@ static int fat16_update_dir_entry_on_disk(fat16_fs_t* fs, const fat16_dir_entry_
     return -1;
 }
 
+//update a file directory entry in a specific directory (by first_cluster)
+//or root when dir_first_cluster =0 returns 0 on success
+int fat16_update_dir_entry_in_dir(fat16_fs_t* fs, uint16_t dir_first_cluster, const fat16_dir_entry_t* entry)
+{
+    if (!fs || !entry) return -1;
+    uint8_t buffer[512];
+    uint32_t per_sec = 512 / sizeof(fat16_dir_entry_t);
+
+    if (dir_first_cluster == 0) {
+        //root directory fixed area
+        uint32_t root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+        for (uint32_t sector = 0; sector < root_dir_sectors; sector++) {
+            uint32_t offset = (fs->root_dir_start + sector) * 512;
+            if (device_read(fs->device, offset, buffer, 512) != 512) return -1;
+            fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+            for (uint32_t i = 0; i < per_sec; i++) {
+                if (entries[i].filename[0] == 0x00) return -1; //not found
+                if (entries[i].filename[0] == 0xE5) continue;
+                if (entries[i].attributes & FAT16_ATTR_VOLUME_ID) continue;
+                if (memcmp(entries[i].filename, entry->filename, 8) == 0 &&
+                    memcmp(entries[i].extension, entry->extension, 3) == 0) {
+                    entries[i].file_size = entry->file_size;
+                    entries[i].first_cluster = entry->first_cluster;
+                    return (device_write(fs->device, offset, buffer, 512) == 512) ? 0 : -1;
+                }
+            }
+        }
+        return -1;
+    } else {
+        //subdirectory stored in data area scan cluster chain
+        uint16_t cluster = dir_first_cluster;
+        while (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+            uint32_t base_lba = fs->data_start + (cluster - 2) * fs->boot_sector.sectors_per_cluster;
+            for (uint32_t s = 0; s < fs->boot_sector.sectors_per_cluster; s++) {
+                if (device_read(fs->device, (base_lba + s) * 512, buffer, 512) != 512) return -1;
+                fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+                for (uint32_t i = 0; i < per_sec; i++) {
+                    if (entries[i].filename[0] == 0x00) goto next_cluster; //end of dir
+                    if (entries[i].filename[0] == 0xE5) continue;
+                    if (entries[i].attributes & FAT16_ATTR_VOLUME_ID) continue;
+                    if (memcmp(entries[i].filename, entry->filename, 8) == 0 &&
+                        memcmp(entries[i].extension, entry->extension, 3) == 0) {
+                        entries[i].file_size = entry->file_size;
+                        entries[i].first_cluster = entry->first_cluster;
+                        return (device_write(fs->device, (base_lba + s) * 512, buffer, 512) == 512) ? 0 : -1;
+                    }
+                }
+            }
+        next_cluster:
+            {
+                uint16_t next = fat16_get_next_cluster(fs, cluster);
+                if (next >= FAT16_END_OF_CHAIN) break; else cluster = next;
+            }
+        }
+        return -1;
+    }
+}
+
 int fat16_delete_file_root(fat16_fs_t* fs, const char* filename) {
     if (!fs || !filename) return -1;
     //convert to 8.3
@@ -632,6 +940,41 @@ int fat16_delete_file_root(fat16_fs_t* fs, const char* filename) {
                 return 0;
             }
         }
+    }
+    return -1;
+}
+
+int fat16_delete_file_in_dir(fat16_fs_t* fs, uint16_t dir_first_cluster, const char* name)
+{
+    if (!fs || !name) return -1;
+    if (dir_first_cluster == 0) return fat16_delete_file_root(fs, name);
+    char fat_name[11];
+    fat16_to_83_name(name, fat_name);
+    uint8_t buffer[512];
+    uint32_t per_sec = 512 / sizeof(fat16_dir_entry_t);
+    uint16_t cluster = dir_first_cluster;
+    while (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+        uint32_t base = fs->data_start + (cluster - 2) * fs->boot_sector.sectors_per_cluster;
+        for (uint32_t s = 0; s < fs->boot_sector.sectors_per_cluster; s++) {
+            if (device_read(fs->device, (base + s) * 512, buffer, 512) != 512) return -1;
+            fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+            for (uint32_t i = 0; i < per_sec; i++) {
+                if (entries[i].filename[0] == 0x00) return -1; //end marker = not found
+                if (entries[i].filename[0] == 0xE5) continue;
+                if (entries[i].attributes & FAT16_ATTR_VOLUME_ID) continue;
+                if (memcmp(entries[i].filename, fat_name, 8) == 0 && memcmp(entries[i].extension, fat_name+8, 3) == 0) {
+                    //must be file
+                    if (entries[i].attributes & FAT16_ATTR_DIRECTORY) return -1;
+                    uint16_t first_cluster = entries[i].first_cluster;
+                    entries[i].filename[0] = 0xE5; //mark deleted
+                    if (device_write(fs->device, (base + s) * 512, buffer, 512) != 512) return -1;
+                    if (first_cluster >= 2) fat16_free_chain(fs, first_cluster);
+                    return 0;
+                }
+            }
+        }
+        uint16_t next = fat16_get_next_cluster(fs, cluster);
+        if (next >= FAT16_END_OF_CHAIN) break; else cluster = next;
     }
     return -1;
 }
@@ -840,6 +1183,17 @@ found_entry:
 int fat16_close_file(fat16_file_t* file) {
     if (!file || !file->is_open) return -1;
 
+    //free read-ahead buffer if allocated
+    #if FAT16_USE_READAHEAD
+        if (file->ra_buf) {
+            kfree(file->ra_buf);
+            file->ra_buf = NULL;
+            file->ra_buf_cap = 0;
+            file->ra_len = 0;
+            file->ra_off = 0;
+        }
+    #endif
+
     file->is_open = 0;
     return 0;
 }
@@ -854,6 +1208,190 @@ static int fat16_free_chain(fat16_fs_t* fs, uint16_t start) {
         cluster = next;
     }
     return 0;
+}
+
+//find or create an empty directory entry slot in a directory cluster chain returns 0 and outputs LBA and index
+static int fat16_dir_find_slot_in_dir(fat16_fs_t* fs, uint16_t dir_first_cluster, uint32_t* out_lba, uint32_t* out_index)
+{
+    if (!fs || !out_lba || !out_index) return -1;
+    uint8_t buffer[512];
+    uint32_t entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+    if (dir_first_cluster == 0) {
+        //root directory fixed size scan for deleted (0xE5) or 0x00 empty
+        uint32_t root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+        for (uint32_t sector = 0; sector < root_dir_sectors; sector++) {
+            uint32_t lba = fs->root_dir_start + sector;
+            if (device_read(fs->device, lba * 512, buffer, 512) != 512) return -1;
+            fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+            for (uint32_t i = 0; i < entries_per_sector; i++) {
+                if (entries[i].filename[0] == 0xE5 || entries[i].filename[0] == 0x00) {
+                    *out_lba = lba; *out_index = i; return 0;
+                }
+            }
+        }
+        return -1; //no space in root
+    } else {
+        //subdirectory scan cluster chain if none found extend chain with a new zeroed cluster
+        uint16_t cluster = dir_first_cluster;
+        for (;;) {
+            uint32_t base_lba = fs->data_start + (cluster - 2) * fs->boot_sector.sectors_per_cluster;
+            for (uint32_t s = 0; s < fs->boot_sector.sectors_per_cluster; s++) {
+                if (device_read(fs->device, (base_lba + s) * 512, buffer, 512) != 512) return -1;
+                fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+                for (uint32_t i = 0; i < entries_per_sector; i++) {
+                    if (entries[i].filename[0] == 0xE5 || entries[i].filename[0] == 0x00) {
+                        *out_lba = base_lba + s; *out_index = i; return 0;
+                    }
+                }
+            }
+            //advance cluster if EOC allocate new cluster and zero it chain it
+            uint16_t next = fat16_get_next_cluster(fs, cluster);
+            if (next >= FAT16_END_OF_CHAIN) {
+                uint16_t newc = fat16_find_free_cluster(fs);
+                if (newc == 0) return -1;
+                if (fat16_set_cluster_value(fs, cluster, newc) != 0) return -1;
+                if (fat16_set_cluster_value(fs, newc, 0xFFFF) != 0) return -1;
+                //zero all sectors in the new cluster
+                uint32_t new_base = fs->data_start + (newc - 2) * fs->boot_sector.sectors_per_cluster;
+                memset(buffer, 0, 512);
+                for (uint32_t s = 0; s < fs->boot_sector.sectors_per_cluster; s++) {
+                    if (device_write(fs->device, (new_base + s) * 512, buffer, 512) != 512) return -1;
+                }
+                //first slot of new cluster
+                *out_lba = new_base; *out_index = 0; return 0;
+            } else {
+                cluster = next;
+            }
+        }
+    }
+}
+
+int fat16_create_file_in_dir(fat16_fs_t* fs, uint16_t dir_first_cluster, const char* name)
+{
+    if (!fs || !name) return -1;
+    //convert to 8.3 and check existence first
+    char fat_name[11];
+    fat16_to_83_name(name, fat_name);
+
+    //if root reuse existing finder else scan dir
+    if (dir_first_cluster == 0) {
+        //reuse root-level create if not exists
+        fat16_dir_entry_t tmp;
+        if (fat16_find_file(fs, name, &tmp) == 0) return -1; //EEXIST
+        return fat16_create_file(fs, name);
+    }
+
+    //check if exists in this subdir
+    //scan the directory entries
+    uint8_t buffer[512];
+    uint32_t per_sec = 512 / sizeof(fat16_dir_entry_t);
+    uint16_t cluster = dir_first_cluster;
+    while (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+        uint32_t base = fs->data_start + (cluster - 2) * fs->boot_sector.sectors_per_cluster;
+        for (uint32_t s = 0; s < fs->boot_sector.sectors_per_cluster; s++) {
+            if (device_read(fs->device, (base + s) * 512, buffer, 512) != 512) return -1;
+            fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+            for (uint32_t i = 0; i < per_sec; i++) {
+                if (entries[i].filename[0] == 0x00) break; //end marker
+                if (entries[i].filename[0] == 0xE5) continue;
+                if (memcmp(entries[i].filename, fat_name, 8) == 0 && memcmp(entries[i].extension, fat_name+8, 3) == 0) {
+                    return -1; //EEXIST
+                }
+            }
+        }
+        uint16_t next = fat16_get_next_cluster(fs, cluster);
+        if (next >= FAT16_END_OF_CHAIN) break; else cluster = next;
+    }
+
+    //allocate a new data cluster for the file
+    uint16_t file_cluster = fat16_find_free_cluster(fs);
+    if (file_cluster == 0) return -1;
+    if (fat16_set_cluster_value(fs, file_cluster, 0xFFFF) != 0) return -1;
+
+    //find slot in directory (may extend dir if needed)
+    uint32_t lba = 0, idx = 0;
+    if (fat16_dir_find_slot_in_dir(fs, dir_first_cluster, &lba, &idx) != 0) return -1;
+    if (device_read(fs->device, lba * 512, buffer, 512) != 512) return -1;
+    fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+    fat16_dir_entry_t* e = &entries[idx];
+    memset(e, 0, sizeof(*e));
+    memcpy(e->filename, fat_name, 8);
+    memcpy(e->extension, fat_name + 8, 3);
+    e->attributes = FAT16_ATTR_ARCHIVE;
+    e->first_cluster = file_cluster;
+    e->file_size = 0;
+    if (device_write(fs->device, lba * 512, buffer, 512) != 512) return -1;
+    return 0;
+}
+
+int fat16_create_dir_in_dir(fat16_fs_t* fs, uint16_t parent_first_cluster, const char* name)
+{
+    if (!fs || !name) return -1;
+    //don't allow "." or ".."
+    if ((name[0] == '.' && name[1] == '\0') || (name[0] == '.' && name[1] == '.' && name[2] == '\0')) return -1;
+
+    //convert to 8.3
+    char fat_name[11];
+    fat16_to_83_name(name, fat_name);
+
+    //if parent is root reuse root mkdir
+    if (parent_first_cluster == 0) {
+        return fat16_create_dir_root(fs, name);
+    }
+
+    //check existence in subdir
+    uint8_t buffer[512];
+    uint32_t per_sec = 512 / sizeof(fat16_dir_entry_t);
+    uint16_t cluster = parent_first_cluster;
+    while (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+        uint32_t base = fs->data_start + (cluster - 2) * fs->boot_sector.sectors_per_cluster;
+        for (uint32_t s = 0; s < fs->boot_sector.sectors_per_cluster; s++) {
+            if (device_read(fs->device, (base + s) * 512, buffer, 512) != 512) return -1;
+            fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+            for (uint32_t i = 0; i < per_sec; i++) {
+                if (entries[i].filename[0] == 0x00) break;
+                if (entries[i].filename[0] == 0xE5) continue;
+                if (memcmp(entries[i].filename, fat_name, 8) == 0 && memcmp(entries[i].extension, fat_name+8, 3) == 0) return -1; //EEXIST
+            }
+        }
+        uint16_t next = fat16_get_next_cluster(fs, cluster);
+        if (next >= FAT16_END_OF_CHAIN) break; else cluster = next;
+    }
+
+    //allocate new cluster for directory
+    uint16_t newc = fat16_find_free_cluster(fs);
+    if (newc == 0) return -1;
+    if (fat16_set_cluster_value(fs, newc, 0xFFFF) != 0) return -1;
+
+    //initialize directory cluster '.' and '..'
+    memset(buffer, 0, sizeof(buffer));
+    fat16_dir_entry_t* d0 = (fat16_dir_entry_t*)buffer;
+    fat16_dir_entry_t* d1 = d0 + 1;
+    memset(d0, 0, sizeof(*d0)); memset(d1, 0, sizeof(*d1));
+    memset(d0->filename, ' ', 8); memset(d0->extension, ' ', 3); d0->filename[0] = '.'; d0->attributes = FAT16_ATTR_DIRECTORY; d0->first_cluster = newc; d0->file_size = 0;
+    memset(d1->filename, ' ', 8); memset(d1->extension, ' ', 3); d1->filename[0] = '.'; d1->filename[1] = '.'; d1->attributes = FAT16_ATTR_DIRECTORY; d1->first_cluster = parent_first_cluster; d1->file_size = 0;
+    uint32_t base_lba = fs->data_start + (newc - 2) * fs->boot_sector.sectors_per_cluster;
+    if (device_write(fs->device, base_lba * 512, buffer, 512) != 512) return -1;
+    if (fs->boot_sector.sectors_per_cluster > 1) {
+        memset(buffer, 0, 512);
+        for (uint32_t s = 1; s < fs->boot_sector.sectors_per_cluster; s++) {
+            if (device_write(fs->device, (base_lba + s) * 512, buffer, 512) != 512) return -1;
+        }
+    }
+
+    //find slot in parent directory (may extend)
+    uint32_t lba = 0, idx = 0;
+    if (fat16_dir_find_slot_in_dir(fs, parent_first_cluster, &lba, &idx) != 0) return -1;
+    if (device_read(fs->device, lba * 512, buffer, 512) != 512) return -1;
+    fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+    fat16_dir_entry_t* e = &entries[idx];
+    memset(e, 0, sizeof(*e));
+    memcpy(e->filename, fat_name, 8);
+    memcpy(e->extension, fat_name + 8, 3);
+    e->attributes = FAT16_ATTR_DIRECTORY;
+    e->first_cluster = newc;
+    e->file_size = 0;
+    return (device_write(fs->device, lba * 512, buffer, 512) == 512) ? 0 : -1;
 }
 
 //create a subdirectory in the root directory

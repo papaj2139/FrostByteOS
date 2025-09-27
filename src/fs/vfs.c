@@ -7,6 +7,17 @@
 #include "../libc/stdlib.h"
 #include "../mm/heap.h"
 
+//VFS metadata overlay
+typedef struct vfs_meta_override {
+    char path[VFS_MAX_PATH];
+    int has_mode; uint32_t mode;
+    int has_uid;  uint32_t uid;
+    int has_gid;  uint32_t gid;
+    struct vfs_meta_override* next;
+} vfs_meta_override_t;
+
+static vfs_meta_override_t* g_meta_overrides = NULL;
+
 //root VFS node
 vfs_node_t* vfs_root = NULL;
 
@@ -20,16 +31,65 @@ typedef struct vfs_fs_type {
 static vfs_fs_type_t* registered_fs_types = NULL;
 static vfs_mount_t* mount_list = NULL;
 
-static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth);
+static vfs_node_t* vfs_resolve_path_internal2(const char* path, int depth, bool nofollow_last);
+static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth) {
+    return vfs_resolve_path_internal2(path, depth, false);
+}
 
 //VFS debug function
 static void vfs_debug(const char* msg) {
     (void)msg;
-#if LOG_VFS
-    serial_write_string("[VFS] ");
-    serial_write_string(msg);
-    serial_write_string("\n");
-#endif
+    #if LOG_VFS
+        serial_write_string("[VFS] ");
+        serial_write_string(msg);
+        serial_write_string("\n");
+    #endif
+}
+
+static vfs_meta_override_t* vfs_find_override(const char* abspath) {
+    for (vfs_meta_override_t* it = g_meta_overrides; it; it = it->next) {
+        if (strncmp(it->path, abspath, VFS_MAX_PATH) == 0) return it;
+    }
+    return NULL;
+}
+
+int vfs_set_metadata_override(const char* abspath, int has_mode, uint32_t mode,
+                              int has_uid, uint32_t uid,
+                              int has_gid, uint32_t gid)
+{
+    if (!abspath || abspath[0] != '/') return -1;
+    vfs_meta_override_t* o = vfs_find_override(abspath);
+    if (!o) {
+        o = (vfs_meta_override_t*)kmalloc(sizeof(*o));
+        if (!o) return -1;
+        memset(o, 0, sizeof(*o));
+        strncpy(o->path, abspath, sizeof(o->path) - 1);
+        o->path[sizeof(o->path) - 1] = '\0';
+        o->next = g_meta_overrides;
+        g_meta_overrides = o;
+    }
+    if (has_mode) {
+        o->has_mode = 1;
+        o->mode = mode & 07777;
+    }
+    if (has_uid)  {
+        o->has_uid  = 1;
+        o->uid  = uid;
+    }
+    if (has_gid)  {
+        o->has_gid  = 1;
+        o->gid  = gid;
+    }
+    return 0;
+}
+
+void vfs_apply_metadata_override(vfs_node_t* node, const char* abspath) {
+    if (!node || !abspath) return;
+    vfs_meta_override_t* o = vfs_find_override(abspath);
+    if (!o) return;
+    if (o->has_mode) node->mode = o->mode;
+    if (o->has_uid)  node->uid  = o->uid;
+    if (o->has_gid)  node->gid  = o->gid;
 }
 
 //enumerate registered filesystem type names (read-only snapshot)
@@ -141,6 +201,13 @@ vfs_node_t* vfs_create_node(const char* name, uint32_t type, uint32_t flags) {
     node->type = type;
     node->flags = flags;
     node->ref_count = 1;
+    //default ownership and perms (root:root)
+    node->uid = 0;
+    node->gid = 0;
+    //dirs default 0755 files 0644 devices 0666
+    if (type == VFS_FILE_TYPE_DIRECTORY) node->mode = S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
+    else if (type == VFS_FILE_TYPE_DEVICE) node->mode = S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH;
+    else node->mode = S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH;
 
     return node;
 }
@@ -306,11 +373,11 @@ static vfs_mount_t* vfs_find_mount(const char* path) {
         if (ml == 0) continue;
         //'/' matches everything but has length 1 prefer longer matches
         if (strncmp(path, mp, ml) == 0) {
-            //ensure boundary: either exact match or next char in path is '/'
+            //ensure boundary either exact match or next char in path is '/'
             if (path[ml] == '\0' || path[ml] == '/') {
-                if (ml > best_len) { 
-                    best = cur; 
-                    best_len = ml; 
+                if (ml > best_len) {
+                    best = cur;
+                    best_len = ml;
                 }
             }
         }
@@ -396,7 +463,7 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
     strncpy(mount->fs_name, fs_type, sizeof(mount->fs_name) - 1);
 
     //add to mount list
-    mount->next = mount_list;   
+    mount->next = mount_list;
     mount_list = mount;
 
     vfs_debug("Filesystem mounted successfully");
@@ -439,13 +506,19 @@ int vfs_unmount(const char* mount_point) {
     return -1;
 }
 
-//resolve a path to a VFS node (public API)
+//resolve a path to a VFS node
 vfs_node_t* vfs_resolve_path(const char* path) {
-    return vfs_resolve_path_internal(path, 0);
+    vfs_node_t* n = vfs_resolve_path_internal2(path, 0, false);
+    if (n) vfs_apply_metadata_override(n, path);
+    return n;
+}
+
+vfs_node_t* vfs_resolve_path_nofollow(const char* path) {
+    return vfs_resolve_path_internal2(path, 0, true);
 }
 
 //internal resolver with symlink following
-static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth) {
+static vfs_node_t* vfs_resolve_path_internal2(const char* path, int depth, bool nofollow_last) {
     if (!path) {
         return NULL;
     }
@@ -500,6 +573,26 @@ static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth) {
         memcpy(component, p, len);
         component[len] = '\0';
 
+        //check execute/search permission on the current directory
+        process_t* curp = process_get_current();
+        uint32_t req = VFS_FLAG_EXECUTE; //search permission
+        //compute which bits apply
+        uint32_t mode = current_node->mode;
+        uint32_t mask = (curp && curp->euid == current_node->uid) ? (S_IXUSR)
+                       : (curp && curp->egid == current_node->gid) ? (S_IXGRP)
+                       : (S_IXOTH);
+        if ((mask & S_IXUSR) && !(mode & S_IXUSR)) {
+            vfs_close(current_node);
+            return NULL;
+        }
+        if ((mask & S_IXGRP) && !(mode & S_IXGRP)) {
+            vfs_close(current_node);
+            return NULL;
+        }
+        if ((mask & S_IXOTH) && !(mode & S_IXOTH)) {
+            vfs_close(current_node);
+            return NULL;
+        }
         //open the directory so it can search it
         if (current_node->ops && current_node->ops->open) {
             current_node->ops->open(current_node, VFS_FLAG_READ);
@@ -512,7 +605,8 @@ static vfs_node_t* vfs_resolve_path_internal(const char* path, int depth) {
                 //found it release the parent and continue with the child
                 vfs_close(current_node); //vfs_close just decrements ref_count
                 //handle symlink
-                if (child && child->type == VFS_FILE_TYPE_SYMLINK) {
+                bool is_last = (*end == '\0');
+                if (child && child->type == VFS_FILE_TYPE_SYMLINK && !(nofollow_last && is_last)) {
                     if (depth > 8) {
                         vfs_close(child);
                         vfs_debug("Symlink recursion limit reached");
@@ -590,15 +684,15 @@ int vfs_symlink(const char* target, const char* linkpath) {
     char* parent_path = vfs_get_parent_path(linkpath);
     if (!parent_path) return -1;
     char* linkname = vfs_get_basename(linkpath);
-    if (!linkname) { 
-        kfree(parent_path); 
-        return -1; 
+    if (!linkname) {
+        kfree(parent_path);
+        return -1;
     }
     vfs_node_t* parent = vfs_open(parent_path, VFS_FLAG_READ | VFS_FLAG_WRITE);
-    if (!parent) { 
-        kfree(parent_path); 
-        kfree(linkname); 
-        return -1; 
+    if (!parent) {
+        kfree(parent_path);
+        kfree(linkname);
+        return -1;
     }
     int r = -1;
     if (parent->ops && parent->ops->symlink) {
@@ -628,21 +722,32 @@ vfs_node_t* vfs_open(const char* path, uint32_t flags) {
 
     //resolve path to node
     vfs_node_t* node = vfs_resolve_path(path);
+    //apply overlay again to be certain (ensures permission checks use overridden bits)
+    if (node) vfs_apply_metadata_override(node, path);
     if (!node) {
         vfs_debug("Failed to resolve path");
         return NULL;
     }
 
-    //check permissions
-    if ((flags & VFS_FLAG_READ) && !(node->flags & VFS_FLAG_READ)) {
+    //check permissions based on uid/gid/mode
+    process_t* curp = process_get_current();
+    uint32_t mode = node->mode;
+    //select class
+    int cls = 2; // other
+    if (curp && curp->euid == node->uid) cls = 0; else if (curp && curp->egid == node->gid) cls = 1;
+    uint32_t rbit = (cls==0?S_IRUSR:(cls==1?S_IRGRP:S_IROTH));
+    uint32_t wbit = (cls==0?S_IWUSR:(cls==1?S_IWGRP:S_IWOTH));
+    uint32_t xbit = (cls==0?S_IXUSR:(cls==1?S_IXGRP:S_IXOTH));
+    if ((flags & VFS_FLAG_READ) && !(mode & rbit)) {
         vfs_destroy_node(node);
-        vfs_debug("Read permission denied");
         return NULL;
     }
-
-    if ((flags & VFS_FLAG_WRITE) && !(node->flags & VFS_FLAG_WRITE)) {
+    if ((flags & VFS_FLAG_WRITE) && !(mode & wbit)) {
         vfs_destroy_node(node);
-        vfs_debug("Write permission denied");
+        return NULL;
+    }
+    if ((flags & VFS_FLAG_EXECUTE) && !(mode & xbit)) {
+        vfs_destroy_node(node);
         return NULL;
     }
 
@@ -684,7 +789,11 @@ int vfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer) {
     }
 
     //check permissions
-    if (!(node->flags & VFS_FLAG_READ)) {
+    //allow read only if read bit set
+    process_t* curp = process_get_current();
+    int cls = 2; if (curp && curp->euid == node->uid) cls = 0; else if (curp && curp->egid == node->gid) cls = 1;
+    uint32_t rbit = (cls==0?S_IRUSR:(cls==1?S_IRGRP:S_IROTH));
+    if (!(node->mode & rbit)) {
         vfs_debug("Read permission denied");
         return -1;
     }
@@ -712,7 +821,10 @@ int vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const char* buff
     }
 
     //check permissions
-    if (!(node->flags & VFS_FLAG_WRITE)) {
+    process_t* curp2 = process_get_current();
+    int cls2 = 2; if (curp2 && curp2->euid == node->uid) cls2 = 0; else if (curp2 && curp2->egid == node->gid) cls2 = 1;
+    uint32_t wbit2 = (cls2==0?S_IWUSR:(cls2==1?S_IWGRP:S_IWOTH));
+    if (!(node->mode & wbit2)) {
         vfs_debug("Write permission denied");
         return -1;
     }
@@ -808,6 +920,9 @@ int vfs_unlink(const char* path) {
     //call filesystem-specific unlink
     int result = -1;
     if (parent->ops && parent->ops->unlink) {
+        //ensure the filesystem unlink op has a valid parent context
+        //some FS implementations access node->parent to derive directory state
+        node->parent = parent;
         result = parent->ops->unlink(node);
     }
 

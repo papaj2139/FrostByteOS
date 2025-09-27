@@ -63,16 +63,20 @@ static vfs_operations_t g_irfs_ops = {
 };
 
 static void irfs_debug(const char* m) {
-    serial_write_string("[initramfs] ");
-    serial_write_string(m);
-    serial_write_string("\n");
+    #if LOG_VFS
+        serial_write_string("[initramfs] ");
+        serial_write_string(m);
+        serial_write_string("\n");
+    #else
+        (void)m;
+    #endif
 }
 
 int initramfs_add_dir(const char* path) {
     if (!g_ramfs_root || !path || path[0] != '/') return -1;
-    //ensure path exists as directories    
+    //ensure path exists as directories
     initramfs_node_t* dir = irfs_ensure_dir_path(path);
-    return dir ? 0 : -1;    
+    return dir ? 0 : -1;
 }
 
 static initramfs_node_t* irfs_create_node(const char* name, uint32_t type) {
@@ -262,9 +266,9 @@ void initramfs_install_as_root(void) {
     irfs_debug("Installed as root");
 }
 
-vfs_operations_t* initramfs_get_ops(void* unused) { 
-    (void)unused; 
-    return &g_irfs_ops; 
+vfs_operations_t* initramfs_get_ops(void* unused) {
+    (void)unused;
+    return &g_irfs_ops;
 }
 
 static initramfs_node_t* irfs_node_from_vnode(vfs_node_t* vnode) {
@@ -287,13 +291,13 @@ static int irfs_open(vfs_node_t* node, uint32_t flags) {
     (void)node; (void)flags; return 0;
 }
 
-static int irfs_close(vfs_node_t* node) { 
-    (void)node; 
-    return 0; 
+static int irfs_close(vfs_node_t* node) {
+    (void)node;
+    return 0;
 }
 
 static int irfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const char* buffer) {
-    (void)node; (void)offset; (void)size; (void)buffer; 
+    (void)node; (void)offset; (void)size; (void)buffer;
     return -1; //read-only
 }
 
@@ -301,8 +305,8 @@ static int irfs_create(vfs_node_t* parent, const char* name, uint32_t flags) {
     (void)parent; (void)name; (void)flags; return -1; //not supported
 }
 
-static int irfs_unlink(vfs_node_t* vnode) { 
-    if (!vnode) return -1; 
+static int irfs_unlink(vfs_node_t* vnode) {
+    if (!vnode) return -1;
     initramfs_node_t* n = irfs_node_from_vnode(vnode);
     if (!n) return -1;
     if (n->type == VFS_FILE_TYPE_DIRECTORY) return -1;
@@ -328,17 +332,17 @@ static int irfs_unlink(vfs_node_t* vnode) {
     }
     //free node
     kfree(n);
-    return 0; 
+    return 0;
 }
 
 static int irfs_mkdir(vfs_node_t* parent, const char* name, uint32_t flags) {
-    (void)parent; (void)name; (void)flags; 
-    return -1; 
+    (void)parent; (void)name; (void)flags;
+    return -1;
 
 }
-static int irfs_rmdir(vfs_node_t* node) { 
-    (void)node; 
-    return -1; 
+static int irfs_rmdir(vfs_node_t* node) {
+    (void)node;
+    return -1;
 }
 
 static int irfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer) {
@@ -390,8 +394,11 @@ static int irfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
 }
 
 static int irfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) {
-    (void)node; (void)request; (void)arg; 
-    return -1; 
+    (void)node;
+    (void)request;
+    (void)arg;
+
+    return -1;
 }
 
 static int irfs_readlink(vfs_node_t* node, char* buf, uint32_t bufsize) {

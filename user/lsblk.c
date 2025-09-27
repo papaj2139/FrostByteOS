@@ -1,20 +1,21 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 
 static char g_buf[4096];
 static char g_buf2[4096];
 
-typedef struct { 
-    char dev[32]; 
-    char mnt[64]; 
+typedef struct {
+    char dev[32];
+    char mnt[64];
 } mnt_t;
 
-static void puts1(const char* s) { 
-    write(1, s, strlen(s)); 
+static void puts1(const char* s) {
+    fputs(1, s);
 }
 
-static void putc1(char c) { 
-    write(1, &c, 1); 
+static void putc1(char c) {
+    fputc(1, c);
 }
 
 static int read_file(const char* path, char* buf, int bufsz) {
@@ -38,13 +39,15 @@ static int load_mounts(mnt_t* arr, int maxn) {
     int count = 0;
     const char* s = g_buf2;
     while (*s && count < maxn) {
-        const char* e = s; while (*e && *e != '\n' && *e != '\r') e++;
+        const char* e = s;
+        while (*e && *e != '\n' && *e != '\r') e++;
         //format: <mount_point> <fs> <dev>
         //extract three tokens
         const char* p = s;
         //mount_point
         while (p < e && *p == ' ') p++;
-        const char* mp = p; while (p < e && *p != ' ' && *p != '\t') p++;
+        const char* mp = p;
+        while (p < e && *p != ' ' && *p != '\t') p++;
         //fs (skip token)
         while (p < e && (*p == ' ' || *p == '\t')) p++;
         while (p < e && *p != ' ' && *p != '\t') p++;
@@ -57,10 +60,12 @@ static int load_mounts(mnt_t* arr, int maxn) {
             memcpy(arr[count].dev, dv, dl); arr[count].dev[dl] = '\0';
             int ml = (int)(mp ? (int)(e - (e < mp ? e : mp)) : 0); //default
             //recompute mount len precisely up to first space after mp
-            const char* q = mp; while (q < e && *q != ' ' && *q != '\t') q++;
+            const char* q = mp;
+            while (q < e && *q != ' ' && *q != '\t') q++;
             ml = (int)(q - mp);
             if (ml >= (int)sizeof(arr[count].mnt)) ml = (int)sizeof(arr[count].mnt) - 1;
-            memcpy(arr[count].mnt, mp, ml); arr[count].mnt[ml] = '\0';
+            memcpy(arr[count].mnt, mp, ml);
+            arr[count].mnt[ml] = '\0';
             count++;
         }
         if (!*e) break;
@@ -96,10 +101,14 @@ int main(int argc, char** argv, char** envp) {
         //get line
         const char* e = s; while (*e && *e != '\n' && *e != '\r') e++;
         //extract name and type by splitting on space
-        const char* p = s; while (p < e && *p == ' ') p++;
-        const char* name = p; while (p < e && *p != ' ' && *p != '\t') p++;
-        const char* type = p; while (type < e && (*type == ' ' || *type == '\t')) type++;
-        const char* type_end = type; while (type_end < e && *type_end != ' ' && *type_end != '\t' && *type_end != '\n' && *type_end != '\r') type_end++;
+        const char* p = s;
+        while (p < e && *p == ' ') p++;
+        const char* name = p;
+        while (p < e && *p != ' ' && *p != '\t') p++;
+        const char* type = p;
+        while (type < e && (*type == ' ' || *type == '\t')) type++;
+        const char* type_end = type;
+        while (type_end < e && *type_end != ' ' && *type_end != '\t' && *type_end != '\n' && *type_end != '\r') type_end++;
         if (name < e) {
             int nl = (int)(p - name);
             int tl = (int)(type_end - type);
@@ -115,9 +124,16 @@ int main(int argc, char** argv, char** envp) {
                 const char* t = type; for (int i = 0; i < tl && t + i < e; i++) putc1(t[i]);
                 for (int i = tl; i < 10; i++) putc1(' ');
                 //mountpoint if any
-                char nbuf[32]; int k = 0; while (k < (int)sizeof(nbuf)-1 && name + k < e && k < nl) { nbuf[k] = name[k]; k++; } nbuf[k] = '\0';
+                char nbuf[32]; int k = 0;
+                while (k < (int)sizeof(nbuf)-1 && name + k < e && k < nl) {
+                    nbuf[k] = name[k];
+                    k++;
+                }
+                nbuf[k] = '\0';
                 const char* mp = find_mnt(mnts, mcnt, nbuf);
-                if (mp && *mp) { puts1(mp); }
+                if (mp && *mp) {
+                    puts1(mp);
+                }
                 putc1('\n');
             }
         }

@@ -1,6 +1,10 @@
 #ifndef DEBUG_H
 #define DEBUG_H
 
+#ifndef DEBUG_ENABLED
+#define DEBUG_ENABLED 0
+#endif
+
 //compile-time debug controls set to 1 to enable classes of logs
 #ifndef LOG_SCHED
 #define LOG_SCHED 0
@@ -49,6 +53,16 @@
 
 #ifndef LOG_ATA
 #define LOG_ATA 0
+#endif
+
+//enable/disable FAT16 read-ahead buffer across cluster
+#ifndef FAT16_USE_READAHEAD
+#define FAT16_USE_READAHEAD 0
+#endif
+
+//use read ahead only when the read size is small enough to benefit
+#ifndef FAT16_READAHEAD_THRESHOLD_BYTES
+#define FAT16_READAHEAD_THRESHOLD_BYTES 2048u  //2 KiB
 #endif
 
 #endif

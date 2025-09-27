@@ -5,6 +5,9 @@
 #include "serial.h"
 #include <stdint.h>
 #include <string.h>
+#include "../kernel/uaccess.h"
+#include "../libc/string.h"
+#include "ata.h"
 
 //forward declarations
 static int ata_device_init(device_t* device);
@@ -37,6 +40,7 @@ static ata_part_priv_t ata_part_privs[16];
 static int ata_part_count = 0;
 
 
+#if LOG_ATA
 static void ata_debug(const char* msg) {
     serial_write_string("[ATA] ");
     serial_write_string(msg);
@@ -55,10 +59,14 @@ static void ata_debug_hex(const char* msg, uint32_t value) {
     serial_write_string(hex);
     serial_write_string("\n");
 }
+#else
+static void ata_debug(const char* msg) { (void)msg; }
+static void ata_debug_hex(const char* msg, uint32_t value) { (void)msg; (void)value; }
+#endif
 
-static int ata_part_init(device_t* d) { 
-    (void)d; 
-    return 0; 
+static int ata_part_init(device_t* d) {
+    (void)d;
+    return 0;
 }
 
 static int ata_part_read(device_t* d, uint32_t offset, void* buffer, uint32_t size) {
@@ -77,13 +85,26 @@ static int ata_part_write(device_t* d, uint32_t offset, const void* buffer, uint
     uint32_t abs_off = (uint32_t)(pp->start_lba * 512ull + (uint64_t)offset);
     return device_write(pp->base, abs_off, buffer, size);
 }
-static int ata_part_ioctl(device_t* d, uint32_t cmd, void* arg) { 
-    (void)d; 
-    (void)cmd; 
-    (void)arg; 
-    return -1; 
+static int ata_part_ioctl(device_t* d, uint32_t cmd, void* arg) {
+    if (!d) return -1;
+    if (cmd == IOCTL_BLK_GET_INFO) {
+        typedef struct {
+            uint32_t sector_size;
+            uint32_t sector_count;
+        } blkdev_info_t;
+        if (!arg) return -1;
+        ata_part_priv_t* pp = (ata_part_priv_t*)d->private_data;
+        if (!pp) return -1;
+        blkdev_info_t info; info.sector_size = 512u; info.sector_count = pp->sectors;
+        //copy to user
+        if (copy_to_user(arg, &info, sizeof(info)) != 0) return -1;
+        return 0;
+    }
+    return -1;
 }
-static void ata_part_cleanup(device_t* d) { (void)d; }
+static void ata_part_cleanup(device_t* d) {
+    (void)d;
+}
 
 static const device_ops_t ata_part_ops = {
     .init = ata_part_init,
@@ -129,6 +150,28 @@ static void ata_register_partitions(device_t* base_dev, int drive_no) {
             ata_part_count++;
         }
     }
+}
+
+//query helper for /proc/partitions exposure
+int ata_query_device_info(device_t* dev, uint64_t* start_lba, uint64_t* sector_count, int* is_partition) {
+    if (!dev || !start_lba || !sector_count || !is_partition) return -1;
+    if (dev->subtype != DEVICE_SUBTYPE_STORAGE_ATA) return -1;
+    //partition device if ops match ata_part_ops
+    if (dev->ops == &ata_part_ops) {
+        ata_part_priv_t* pp = (ata_part_priv_t*)dev->private_data;
+        if (!pp || !pp->base) return -1;
+        *start_lba = pp->start_lba;
+        *sector_count = pp->sectors;
+        *is_partition = 1;
+        return 0;
+    }
+    //whole disk device
+    ata_device_data_t* data = (ata_device_data_t*)dev->private_data;
+    if (!data) return -1;
+    *start_lba = 0;
+    *sector_count = data->total_sectors;
+    *is_partition = 0;
+    return 0;
 }
 
 void ata_rescan_partitions(void) {
@@ -216,7 +259,7 @@ static int ata_device_init(device_t* device) {
     #if LOG_ATA
     ata_debug("Drive selected");
     #endif
-    
+
     //wait for drive to be ready
     if (ata_wait_bsy(data) != 0) {
         #if LOG_ATA
@@ -262,11 +305,16 @@ static int ata_device_init(device_t* device) {
         return -1; //drive error
     }
 
-    //read and discard identify data
+    //read IDENTIFY data (256 words)
     ata_debug("Reading IDENTIFY data...");
+    uint16_t id[256];
     for (int i = 0; i < 256; i++) {
-        inw(data->data_port);
+        id[i] = inw(data->data_port);
     }
+    //parse 28-bit LBA sector count from words 60-61 (little-endian word order)
+    uint32_t lba28 = ((uint32_t)id[61] << 16) | (uint32_t)id[60];
+    data->total_sectors = lba28;
+    ata_debug_hex("IDENTIFY LBA28 sectors", data->total_sectors);
 
     ata_debug("Device initialization successful");
     return 0; //success
@@ -455,12 +503,22 @@ int ata_device_write(device_t* device, uint32_t offset, const void* buffer, uint
     }
     return size; //return bytes written
 }
-
 int ata_device_ioctl(device_t* device, uint32_t cmd, void* arg) {
-    (void)device; (void)cmd; (void)arg;
+    if (!device) return -1;
+    if (cmd == IOCTL_BLK_GET_INFO) {
+        typedef struct {
+            uint32_t sector_size;
+            uint32_t sector_count;
+        } blkdev_info_t;
+        if (!arg) return -1;
+        ata_device_data_t* data = (ata_device_data_t*)device->private_data;
+        if (!data) return -1;
+        blkdev_info_t info; info.sector_size = 512u; info.sector_count = data->total_sectors;
+        if (copy_to_user(arg, &info, sizeof(info)) != 0) return -1;
+        return 0;
+    }
     return -1;
 }
-
 void ata_device_cleanup(device_t* device) {
     if (device && device->private_data) {
         //nothing yet theres no memory managment
@@ -483,7 +541,7 @@ void ata_probe_and_register(void) {
             data->control_port = ctrl_ports[i];
             data->is_slave = j;
             data->drive_select = j ? ATA_DRIVE_SLAVE : ATA_DRIVE_MASTER;
-            
+
             dev->private_data = data;
 
             //try to initialize the device
@@ -494,7 +552,7 @@ void ata_probe_and_register(void) {
                 char num_str[2];
                 itoa(drive_no, num_str);
                 strcat(dev->name, num_str);
-                
+
                 dev->type = DEVICE_TYPE_STORAGE;
                 dev->status = DEVICE_STATUS_UNINITIALIZED; //will be set to READY by devicd manager
                 dev->subtype = DEVICE_SUBTYPE_STORAGE_ATA;

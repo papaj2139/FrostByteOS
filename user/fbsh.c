@@ -1,26 +1,15 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 #include <tty.h>
 #include <sys/wait.h>
 
-static void print(const char* s) { write(1, s, strlen(s)); }
+static void print(const char* s) {
+    fputs(1, s);
+}
 
 static void print_dec(int v) {
-    char buf[16];
-    int i = 0;
-    if (v == 0) { buf[i++] = '0'; }
-    else {
-        int n = (v < 0) ? -v : v;
-        char tmp[16]; int t = 0;
-        while (n > 0 && t < (int)sizeof(tmp)) { 
-            tmp[t++] = '0' + (n % 10); 
-            n /= 10; 
-        }
-        if (v < 0 && i < (int)sizeof(buf)) buf[i++] = '-';
-        while (t > 0 && i < (int)sizeof(buf)) buf[i++] = tmp[--t];
-    }
-    buf[i] = '\0';
-    print(buf);
+    printf("%d", v);
 }
 
 static void chomp(char* b, int n) {
@@ -59,13 +48,22 @@ static int run_command(char** prog_argv, char** envp)
     path[0] = '\0';
     if (cmd && cmd[0]) {
         int has_slash = 0;
-        for (const char* t = cmd; *t; ++t) { if (*t == '/') { has_slash = 1; break; } }
+        for (const char* t = cmd; *t; ++t) {
+            if (*t == '/') {
+                has_slash = 1;
+                break;
+            }
+        }
         char* p = path;
         if (!has_slash && cmd[0] != '/') {
             const char* pref = "/bin/";
-            for (const char* q = pref; *q && (p - path) < (int)sizeof(path) - 1; ++q) { *p++ = *q; }
+            for (const char* q = pref; *q && (p - path) < (int)sizeof(path) - 1; ++q) {
+                *p++ = *q;
+            }
         }
-        for (const char* q = cmd; *q && (p - path) < (int)sizeof(path) - 1; ++q) { *p++ = *q; }
+        for (const char* q = cmd; *q && (p - path) < (int)sizeof(path) - 1; ++q) {
+            *p++ = *q;
+        }
         *p = '\0';
     }
     if (path[0] == '\0') {
@@ -149,7 +147,7 @@ int main(int argc, char** argv, char** envp) {
         int n = read(0, buf, sizeof(buf) - 1);
         if (n <= 0) continue;
         buf[n] = 0;
-        chomp(buf, n);  
+        chomp(buf, n);
         //skip leading whitespace
         char* s = buf;
         while (*s && *s <= ' ') s++;

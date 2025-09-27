@@ -1,11 +1,12 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 
 #define SIGTERM 15
 #define SIGKILL 9
 
 static void puts1(const char* s) { 
-    write(1, s, strlen(s)); 
+    fputs(1, s); 
 }
 
 int main(int argc, char** argv, char** envp) {

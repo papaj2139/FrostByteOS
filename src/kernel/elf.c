@@ -6,6 +6,8 @@
 #include "../drivers/serial.h"
 #include "../drivers/tty.h"
 #include "../process.h"
+#include "dynlink.h"
+#include "../debug.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -68,6 +70,7 @@ typedef struct {
 #define ET_EXEC 2
 #define EM_386 3
 #define PT_LOAD 1
+#define PT_DYNAMIC 2
 #define PF_X 0x1
 #define PF_W 0x2
 #define PF_R 0x4
@@ -97,18 +100,26 @@ static int build_user_stack(page_directory_t new_dir,
     memset((void*)temp_kmap, 0, PAGE_SIZE);
 
     //count argc/envc
-    int argc = 0; if (argv) { while (argv[argc]) argc++; }
-    int envc = 0; if (envp) { while (envp[envc]) envc++; }
-    serial_write_string("[ELF] build_user_stack argc=\n");
-    serial_printf("%d", argc);
-    serial_write_string(" envc=\n");
-    serial_printf("%d", envc);
-    serial_write_string("\n");
-    if (argc > 0 && argv && argv[0]) {
-        serial_write_string("[ELF] argv0=\"\n");
-        serial_write_string(argv[0]);
-        serial_write_string("\"\n");
+    int argc = 0;
+    if (argv) {
+        while (argv[argc]) argc++;
     }
+    int envc = 0;
+    if (envp) {
+        while (envp[envc]) envc++;
+    }
+    #if LOG_ELF
+        serial_write_string("[ELF] build_user_stack argc=\n");
+        serial_printf("%d", argc);
+        serial_write_string(" envc=\n");
+        serial_printf("%d", envc);
+        serial_write_string("\n");
+        if (argc > 0 && argv && argv[0]) {
+            serial_write_string("[ELF] argv0=\"\n");
+            serial_write_string(argv[0]);
+            serial_write_string("\"\n");
+        }
+    #endif
 
     //compute total bytes needed within the top page
     uint32_t strings_size = 0;
@@ -156,7 +167,7 @@ static int build_user_stack(page_directory_t new_dir,
     uint32_t envp_vec_va = vec_base + argv_vec_bytes;
     //SysV i386 ABI: argv[] must begin immediately after argc at [esp+4]
     //so do not insert padding between argc and the argv vector
-    uint32_t esp0 = vec_base - 4u; //argc at esp0, argv[0] at esp0+4
+    uint32_t esp0 = vec_base - 4u; //argc at esp0 argv[0] at esp0+4
 
     //fill argv vector
     for (uint32_t i = 0; i < (uint32_t)argc; i++) {
@@ -187,15 +198,21 @@ static int build_user_stack(page_directory_t new_dir,
 int elf_load_into_process(const char* pathname, struct process* proc,
                           char* const argv[], char* const envp[]) {
     if (!pathname || !proc) return -1;
-    vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ);
+    vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ | VFS_FLAG_EXECUTE);
     if (!node) return -1;
 
     Elf32_Ehdr eh;
     int r = vfs_read(node, 0, sizeof(eh), (char*)&eh);
-    serial_write_string("[ELF] read header bytes=\n");
-    serial_printf("%d", r);
-    serial_write_string("\n");
-    if (r != (int)sizeof(eh)) { vfs_close(node); serial_write_string("[ELF] header read short\n"); return -2; }
+    #if LOG_ELF
+        serial_write_string("[ELF] read header bytes=\n");
+        serial_printf("%d", r);
+        serial_write_string("\n");
+    #endif
+    if (r != (int)sizeof(eh)) {
+        vfs_close(node);
+        serial_write_string("[ELF] header read short\n");
+        return -2;
+    }
     if (!(eh.e_ident[EI_MAG0] == ELFMAG0 && eh.e_ident[EI_MAG1] == ELFMAG1 &&
           eh.e_ident[EI_MAG2] == ELFMAG2 && eh.e_ident[EI_MAG3] == ELFMAG3)) {
             vfs_close(node);
@@ -215,7 +232,10 @@ int elf_load_into_process(const char* pathname, struct process* proc,
     page_directory_t dir = proc->page_directory;
     if (!dir) {
         dir = vmm_create_directory();
-        if (!dir) { vfs_close(node); return -1; }
+        if (!dir) {
+            vfs_close(node);
+            return -1;
+        }
         vmm_map_kernel_space(dir);
         vmm_map_page_in_directory(dir, 0x000B8000, 0x000B8000, PAGE_PRESENT | PAGE_WRITABLE);
         proc->page_directory = dir;
@@ -248,7 +268,10 @@ int elf_load_into_process(const char* pathname, struct process* proc,
         uint32_t file_cursor = 0;
         for (uint32_t va = seg_start; va < seg_end; va += PAGE_SIZE) {
             uint32_t phys = pmm_alloc_page();
-            if (!phys) { vfs_close(node); return -1; }
+            if (!phys) {
+                vfs_close(node);
+                return -1;
+            }
             uint32_t flags = PAGE_PRESENT | PAGE_USER;
             if (ph.p_flags & PF_W) flags |= PAGE_WRITABLE;
             if (vmm_map_page_in_directory(dir, va, phys, flags) != 0) {
@@ -333,11 +356,13 @@ int elf_load_into_process(const char* pathname, struct process* proc,
 int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
     if (!pathname) return -1;
 
-    serial_write_string("[ELF] exec pathname=\"");
-    serial_write_string(pathname);
-    serial_write_string("\"\n");
+    #if LOG_ELF
+        serial_write_string("[ELF] exec pathname=\"");
+        serial_write_string(pathname);
+        serial_write_string("\"\n");
+    #endif
 
-    vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ);
+    vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ | VFS_FLAG_EXECUTE);
     if (!node) {
         serial_write_string("[ELF] vfs_open failed\n");
         return -1;
@@ -351,7 +376,9 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
     //validate ELF header
     if (!(eh.e_ident[EI_MAG0] == ELFMAG0 && eh.e_ident[EI_MAG1] == ELFMAG1 &&
           eh.e_ident[EI_MAG2] == ELFMAG2 && eh.e_ident[EI_MAG3] == ELFMAG3)) {
-            serial_write_string("[ELF] bad magic\n");
+    #if LOG_ELF
+        serial_write_string("[ELF] bad magic\n");
+    #endif
             vfs_close(node);
             return -2;
         }
@@ -380,7 +407,9 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
         Elf32_Off off = eh.e_phoff + (Elf32_Off)i * (Elf32_Off)eh.e_phentsize;
         r = vfs_read(node, off, sizeof(ph), (char*)&ph);
         if (r != (int)sizeof(ph)) {
+        #if LOG_ELF
             serial_write_string("[ELF] phdr read failed\n");
+        #endif
             vfs_close(node);
             return -1;
         }
@@ -492,11 +521,91 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
         return -1;
     }
 
+    //if main has PT_DYNAMIC attach it and load libc then apply relocations (MVP)
+    {
+        //scan program headers again to find PT_DYNAMIC
+        uint32_t dyn_va = 0;
+        for (int i = 0; i < eh.e_phnum; i++) {
+            Elf32_Phdr ph;
+            Elf32_Off off = eh.e_phoff + (Elf32_Off)i * (Elf32_Off)eh.e_phentsize;
+            int rr = vfs_read(node, off, sizeof(ph), (char*)&ph);
+            if (rr != (int)sizeof(ph)) { dyn_va = 0; break; }
+            if (ph.p_type == PT_DYNAMIC) {
+                //for ET_EXEC mains base is 0 we mapped at p_vaddr
+                dyn_va = ph.p_vaddr; //base 0 for now
+                break;
+            }
+        }
+        if (dyn_va) {
+            dynlink_ctx_t dlctx; dynlink_ctx_init(&dlctx, new_dir);
+            //capture LD_LIBRARY_PATH from envp if present
+            if (kenvp) {
+                dlctx.ld_library_path[0] = '\0';
+                for (int i = 0; kenvp[i]; i++) {
+                    const char* kv = kenvp[i];
+                    const char* prefix = "LD_LIBRARY_PATH=";
+                    size_t pl = strlen(prefix);
+                    if (strncmp(kv, prefix, pl) == 0) {
+                        size_t vl = strlen(kv + pl);
+                        if (vl >= sizeof(dlctx.ld_library_path)) vl = sizeof(dlctx.ld_library_path) - 1;
+                        memcpy(dlctx.ld_library_path, kv + pl, vl);
+                        dlctx.ld_library_path[vl] = '\0';
+                        break;
+                    }
+                }
+            }
+            dynobj_t* main_obj = NULL;
+            //attach main's dynamic section
+            if (dynlink_attach_from_memory(&dlctx, 0, dyn_va, "(main)", &main_obj) == 0) {
+                //auto-load all DT_NEEDED dependencies recursively
+                int ln = dynlink_load_needed(&dlctx, main_obj);
+                if (ln != 0) {
+                #if LOG_ELF
+                    serial_write_string("[DYNLINK] load_needed failed\n");
+                #endif
+                    vfs_close(node);
+                    return -1;
+                }
+                //apply relocations eagerly across all loaded objects
+                int ar = dynlink_apply_relocations(&dlctx);
+                if (ar != 0) {
+                #if LOG_ELF
+                    serial_write_string("[DYNLINK] apply_relocations failed\n");
+                #endif
+                    vfs_close(node);
+                    return -1;
+                }
+                //persist the dynlink context on the process for later (ctors/dtors, symbol lookups)
+                process_t* pcur = process_get_current();
+                if (pcur) {
+                    pcur->dlctx = dlctx; //shallow copy of context and loaded objects metadata
+                }
+                //debug resolve a couple of known symbols
+                #if LOG_ELF
+                    void* symw = dynlink_lookup_symbol(&dlctx, "write");
+                    void* syms = dynlink_lookup_symbol(&dlctx, "strlen");
+                    serial_write_string("[DYNLINK] write="); serial_printf("%x", (uint32_t)(uintptr_t)symw);
+                    serial_write_string(" strlen="); serial_printf("%x", (uint32_t)(uintptr_t)syms);
+                    serial_write_string("\n");
+                #else
+                    (void)dynlink_lookup_symbol;
+                #endif
+            } else {
+            #if LOG_ELF
+                serial_write_string("[DYNLINK] attach main failed\n");
+            #endif
+                vfs_close(node);
+                return -1;
+            }
+        }
+    }
+
     {
         const uint32_t ustack_va = ustack_top - 0x1000;
         const uint32_t TMP = 0x00800000;
         uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
         if (vmm_map_page(TMP, new_stack_top_phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+        #if LOG_ELF
             uint32_t argc_dbg = *(uint32_t*)(TMP + (new_esp - ustack_va));
             uint32_t argv0_ptr = *(uint32_t*)(TMP + (new_esp - ustack_va + 4));
             serial_write_string("[ELF] stack argc=\n");
@@ -509,7 +618,8 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
                 serial_write_string("[ELF] stack argv0=\"\n");
                 serial_write_string(s0);
                 serial_write_string("\"\n");
-            }
+                }
+        #endif
             vmm_unmap_page_nofree(TMP);
         }
         if (eflags_save & 0x200) __asm__ volatile ("sti");

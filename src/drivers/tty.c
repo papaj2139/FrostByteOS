@@ -244,6 +244,8 @@ int tty_register_device(void) {
         return -1;
     }
     g_tty_dev.status = DEVICE_STATUS_READY;
+    #if DEBUG_ENABLED
     serial_write_string("TTY device registered as tty0\n");
+    #endif
     return 0;
 }

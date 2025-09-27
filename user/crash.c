@@ -1,8 +1,9 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 
 static void puts1(const char* s) { 
-    write(1, s, strlen(s)); 
+    fputs(1, s); 
 }
 
 static void do_div0(void) {

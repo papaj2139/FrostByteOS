@@ -8,6 +8,7 @@
 #include "drivers/timer.h"
 #include "drivers/serial.h"
 #include "debug.h"
+#include "fd.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -35,7 +36,7 @@ static void kernel_idle(void) {
 void process_init(void) {
     //initialize process table
     memset(process_table, 0, sizeof(process_table));
-    
+
     //create kernel process (PID 0)
     process_t* kernel_proc = &process_table[0];
     kernel_proc->pid = 0;
@@ -45,6 +46,12 @@ void process_init(void) {
     kernel_proc->page_directory = vmm_get_kernel_directory();
     kernel_proc->priority = 0;
     kernel_proc->time_slice = TIME_SLICE_TICKS;
+    //root credentials
+    kernel_proc->uid = 0;
+    kernel_proc->gid = 0;
+    kernel_proc->euid = 0;
+    kernel_proc->egid = 0;
+    kernel_proc->umask = 0022;
     //kernel current working directory is root
     strcpy(kernel_proc->cwd, "/");
 
@@ -67,7 +74,7 @@ void process_init(void) {
         //EBP field must point to the location of the saved EBP on the stack
         kernel_proc->kcontext.ebp = (uint32_t)ksp;
     }
-    
+
     current_process = kernel_proc;
     next_pid = 1;
 }
@@ -102,7 +109,7 @@ uint32_t process_get_next_pid(void) {
             if (next_pid >= MAX_PROCESSES) next_pid = 1;
             return pid;
         }
-    }   
+    }
     //fallback monotonically allocate (should not happen under normal table size)
     uint32_t pid = next_pid++;
     if (next_pid >= MAX_PROCESSES) next_pid = 1;
@@ -115,7 +122,7 @@ process_t* process_get_current(void) {
 
 process_t* process_get_by_pid(uint32_t pid) {
     if (pid >= MAX_PROCESSES) return NULL;
-    
+
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (process_table[i].state != PROC_UNUSED && process_table[i].pid == pid) {
             return &process_table[i];
@@ -152,13 +159,24 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
             break;
         }
     }
-    
+
     if (!proc) { serial_write_string("[PROC] no free slot\n"); return NULL; }  //no free slots
-    
+
     //initialize process
     memset(proc, 0, sizeof(process_t));
     proc->pid = process_get_next_pid();
     proc->ppid = current_process ? current_process->pid : 0;
+    //inherit credentials
+    if (current_process) {
+        proc->uid = current_process->uid;
+        proc->gid = current_process->gid;
+        proc->euid = current_process->euid;
+        proc->egid = current_process->egid;
+        proc->umask = current_process->umask;
+    } else {
+        proc->uid = proc->gid = proc->euid = proc->egid = 0;
+        proc->umask = 0022;
+    }
     proc->state = PROC_EMBRYO;
     strncpy(proc->name, name, PROCESS_NAME_MAX - 1);
     proc->priority = 1;  //default priority
@@ -170,7 +188,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         strcpy(proc->cwd, "/");
     }
     proc->time_slice = TIME_SLICE_TICKS;
-    
+
     //set up memory space
     if (user_mode) {
         #if LOG_PROC
@@ -182,7 +200,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
             proc->state = PROC_UNUSED;
             return NULL;
         }
-        
+
         //map kernel space into user process
         vmm_map_kernel_space(proc->page_directory);
 
@@ -191,7 +209,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
                                   0x000B8000,
                                   0x000B8000,
                                   PAGE_PRESENT | PAGE_WRITABLE);
-        
+
         //allocate kernel stack (kernel virtual memory)
         #if LOG_PROC
         serial_write_string("[PROC] kmalloc kstack (user)\n");
@@ -207,7 +225,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         serial_write_string("[PROC] kstack ok (user)\n");
         #endif
         proc->kernel_stack = (uint32_t)kstk_base + KERNEL_STACK_SIZE; //top of stack
-        
+
         //set up user stack (top of user space)
         proc->user_stack_top = USER_VIRTUAL_END;
         #if LOG_PROC
@@ -224,22 +242,22 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         #if LOG_PROC
         serial_write_string("[PROC] user stack phys ok\n");
         #endif
-        
+
         //map user stack
         #if LOG_PROC
         serial_write_string("[PROC] map user stack\n");
         #endif
-        vmm_map_page_in_directory(proc->page_directory, 
-                                USER_VIRTUAL_END - 0x1000, 
-                                user_stack_phys, 
+        vmm_map_page_in_directory(proc->page_directory,
+                                USER_VIRTUAL_END - 0x1000,
+                                user_stack_phys,
                                 PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
         //no longer map the user stack into the kernel directory with per-process
         //CR3 switching the stack lives only in the process address space
-        
+
         //set up heap: place outside 0..8MB identity region so PDEs can be user-accessible
         proc->heap_start = 0x03000000;  //USER_HEAP_BASE (must match sys_brk/sbrk)
         proc->heap_end = proc->heap_start;
-        
+
         //initialize CPU context for user mode
         proc->context.eip = (uint32_t)entry_point;
         proc->context.esp = USER_VIRTUAL_END - 16;  //keave some space
@@ -253,7 +271,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         //set controlling TTY and default mode (canonical + echo)
         proc->tty = device_find_by_name("tty0");
         proc->tty_mode = TTY_MODE_CANON | TTY_MODE_ECHO;
-        
+
     } else {
         #if LOG_PROC
         serial_write_string("[PROC] kernel path\n");
@@ -273,7 +291,7 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         #if LOG_PROC
         serial_write_string("[PROC] kstack ok (kern)\n");
         #endif
-        
+
         //initialize CPU context for kernel mode
         proc->context.eip = (uint32_t)entry_point;
         //build a fake call frame so kernel restore via 'pop ebp; ret' works
@@ -291,19 +309,24 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
         //mirror into kcontext (we use kcontext when restoring kernel targets)
         proc->kcontext = proc->context;
     }
-    
+
     //set parent-child relationship
     if (current_process) {
         proc->parent = current_process;
         proc->sibling = current_process->children;
         current_process->children = proc;
     }
-    
+
     //initialize file descriptor table
     for (int i = 0; i < 16; i++) {
         proc->fd_table[i] = -1;  //all closed initially
     }
-    
+
+    //set up stdio for user processes if possible (/dev/tty0)
+    if (user_mode) {
+        fd_init_process_stdio(proc);
+    }
+
     proc->state = PROC_RUNNABLE;
     #if LOG_PROC
     serial_write_string("[PROC] create end\n");
@@ -313,17 +336,20 @@ process_t* process_create(const char* name, void* entry_point, bool user_mode) {
 
 void process_destroy(process_t* proc) {
     if (!proc || proc->state == PROC_UNUSED) return;
-    
+
+    //close all open file descriptors for this process
+    fd_close_all_for(proc);
+
     //free memory resources
     if (proc->page_directory != vmm_get_kernel_directory()) {
         vmm_destroy_directory(proc->page_directory);
     }
-    
+
     if (proc->kernel_stack) {
-        //kernel_stack stores the top-of-stack (virtual). Free the base.
+        //kernel_stack stores the top-of-stack (virtual) free the base
         kfree((void*)(proc->kernel_stack - KERNEL_STACK_SIZE));
     }
-    
+
     //remove from parent child list
     if (proc->parent) {
         if (proc->parent->children == proc) {
@@ -338,7 +364,7 @@ void process_destroy(process_t* proc) {
             }
         }
     }
-    
+
     //mark as unused
     proc->state = PROC_UNUSED;
     memset(proc, 0, sizeof(process_t));
@@ -351,12 +377,12 @@ void scheduler_init(void) {
 //round-robin scheduler
 void schedule(void) {
     if (!current_process) return;
-    
+
     //reap defunct processes whenever we enter the scheduler (safe to free non-current)
     process_reap_zombies();
 
     process_t* next = NULL;
-    
+
     //find next runnable process
     int start_idx = (current_process - process_table + 1) % MAX_PROCESSES;
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -366,7 +392,7 @@ void schedule(void) {
             break;
         }
     }
-    
+
     //if no runnable process found stay with current (or kernel)
     if (!next) {
         #if LOG_SCHED
@@ -400,7 +426,7 @@ void schedule(void) {
         //current process is not running, switch to kernel process
         next = &process_table[0];  //kernel process
     }
-    
+
     //context switch if different process
     if (next != current_process) {
         process_t* old = current_process;
@@ -516,7 +542,7 @@ void process_yield(void) {
 
 void process_exit(int exit_code) {
     if (!current_process || current_process->pid == 0) return;  //cn't exit kernel
-    
+
     //reparent all children to init (PID 1) before zombifying
     process_t* initp = process_get_by_pid(1);
     process_t* child = current_process->children;
@@ -538,12 +564,12 @@ void process_exit(int exit_code) {
 
     current_process->exit_code = exit_code;
     current_process->state = PROC_ZOMBIE;
-    
+
     //wake up parent if waiting
     if (current_process->parent) {
         process_wake(current_process->parent);
     }
-    
+
     schedule();  //switch to another process
 }
 

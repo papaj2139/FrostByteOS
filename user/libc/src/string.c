@@ -70,3 +70,10 @@ char* strchr(const char* s, int c) {
     if (ch == '\0') return (char*)s;
     return 0;
 }
+
+char* strcat(char* dst, const char* src) {
+    char* d = dst;
+    while (*d) d++;
+    while ((*d++ = *src++)) {}
+    return dst;
+}

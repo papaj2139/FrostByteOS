@@ -1,12 +1,19 @@
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 
 int main(int argc, char** argv, char** envp) {
     (void)envp;
-    for (int i = 1; i < argc; i++) {
-        if (i > 1) write(1, " ", 1);
-        if (argv[i]) write(1, argv[i], strlen(argv[i]));
+    int newline = 1;
+    int i = 1;
+    if (i < argc && argv[i] && strcmp(argv[i], "-n") == 0) {
+        newline = 0;
+        i++;
     }
-    write(1, "\n", 1);
+    for (; i < argc; i++) {
+        if (i > (newline ? 1 : 2)) fputc(1, ' ');
+        if (argv[i]) fputs(1, argv[i]);
+    }
+    if (newline) fputc(1, '\n');
     return 0;
 }

@@ -364,21 +364,44 @@ page_directory_t vmm_get_kernel_directory(void) {
     return kernel_directory;
 }
 
+//get the current active page directory
+page_directory_t vmm_get_current_directory(void) {
+    return current_directory ? current_directory : kernel_directory;
+}
+
 //destroy a page directory and free its resources
 void vmm_destroy_directory(page_directory_t directory) {
     if (!directory || directory == kernel_directory) {
         return; //don't destroy kernel directory or NULL pointer
     }
 
-    //free all user page tables (not kernel ones)
+    //walk all user PDEs and free mapped pages and their page tables
     for (int i = 0; i < 768; i++) { //only user space (0-3GB)
         if (!(directory[i] & PAGE_PRESENT)) continue;
         //do NOT free shared identity-mapped PTs (0..8MB) copied from kernel dir
+        //PDE size is 4MB so indices 0 and 1 cover 0..8MB
         if (i < 2 && kernel_directory && directory[i] == kernel_directory[i]) {
             continue;
         }
         uint32_t pt_phys = directory[i] & ~0xFFF;
+        //map the page table temporarily to walk PTEs
+        uint32_t saved_entry;
+        page_table_t pt = map_pt_temp(pt_phys, &saved_entry);
+        if (pt) {
+            for (int j = 0; j < 1024; j++) {
+                uint32_t pte = pt[j];
+                if (pte & PAGE_PRESENT) {
+                    uint32_t page_phys = pte & ~0xFFF;
+                    //free the mapped physical page frame
+                    pmm_free_page(page_phys);
+                    pt[j] = 0;
+                }
+            }
+            unmap_pt_temp(saved_entry);
+        }
+        //free the page table frame itself
         pmm_free_page(pt_phys);
+        directory[i] = 0;
     }
 
     //free the page directory itself

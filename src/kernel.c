@@ -78,9 +78,11 @@ void watchdogTick(void) {
 //returns 1 on success 0 on failure
 static int spawn_user_from_vfs(const char* path) {
     if (!path || !*path) return 0;
+    #if DEBUG_ENABLED
     serial_write_string("\nLoading app from VFS: ");
     serial_write_string(path);
     serial_write_string("\n");
+    #endif
 
     //create a fresh user process
     process_t* proc = process_create(path, (void*)0, true);
@@ -942,9 +944,11 @@ void kmain(uint32_t magic, uint32_t addr) {
                         const uint8_t* mstart = (const uint8_t*)(uintptr_t)mods[i].mod_start; //identity-mapped low memory
                         const uint8_t* mend   = (const uint8_t*)(uintptr_t)mods[i].mod_end;
                         if (initramfs_load_cpio(mstart, mend) == 0) {
+                            #if DEBUG_ENABLED
                             serial_write_string("[init] loaded initramfs module: ");
                             if (mstr) serial_write_string(mstr);
                             serial_write_string("\n");
+                            #endif
                             break;
                         }
                     }
