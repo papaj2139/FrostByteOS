@@ -45,7 +45,8 @@ int main(int argc, char** argv, char** envp) {
             while (*pref) *p++ = *pref++;
         }
         const char* q = cmd;
-        while (*q) *p++ = *q++; *p = '\0';
+        while (*q) { *p++ = *q++; }
+        *p = '\0';
         //shift argv by one for execve
         static char* exargv[16]; int xi = 0;
         for (int i = 1; i < argc && xi < 15; i++) exargv[xi++] = argv[i];

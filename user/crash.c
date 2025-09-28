@@ -48,7 +48,7 @@ static void do_x87_fpe(void) {
 static void do_align_check(void) {
     //set AC flag in EFLAGS (bit 18)
     asm volatile("pushf; pop %%eax; or $0x40000, %%eax; push %%eax; popf" ::: "eax");
-    volatile char buf[8];
+    volatile char buf[8] = {0};
     volatile int* p = (volatile int*)(buf + 1); //misaligned dword
     int v = *p; (void)v;
 }

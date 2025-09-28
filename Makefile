@@ -11,7 +11,7 @@ LDFLAGS = -m32 -nostdlib -T linker.ld
 USER_LIBC_OBJS = user/libc/crt0.o user/libc/syscalls.o user/libc/string.o user/libc/stdio.o user/libc/errno.o user/libc/signal.o
 INITRAMFS_DIR := initramfs_root
 #VERY soon this will get horendously long and complex find a better solution maybe just a wildcard?
-.PHONY: all clean run iso
+.PHONY: all clean run iso menuconfig
 
 all: iso
 
@@ -47,6 +47,9 @@ tty.o: src/drivers/tty.c
 
 serial.o: src/drivers/serial.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+sb16.o: src/drivers/sb16.c src/drivers/sb16.h
+	$(CC) $(CFLAGS) -c src/drivers/sb16.c -o $@
 
 pc_speaker.o: src/drivers/pc_speaker.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -368,6 +371,12 @@ user/vplay.o: user/vplay.c
 user/vplay.elf: user/vplay.o user/libc/crt0.o user/libc/libc.so.1
 	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/vplay.o -L user/libc -l:libc.so.1 -o $@
 
+user/sbplay.o: user/sbplay.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/sbplay.elf: user/sbplay.o user/libc/crt0.o user/libc/libc.so.1
+	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/sbplay.o -L user/libc -l:libc.so.1 -o $@
+
 user/chmod.o: user/chmod.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -471,14 +480,14 @@ process_asm.o: src/process_asm.asm
 	$(ASM) $(ASMFLAGS) $< -o $@
 
 $(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
-           keyboard.o mouse.o tty.o serial.o pc_speaker.o timer.o rtc.o ata.o \
+           keyboard.o mouse.o tty.o serial.o sb16.o pc_speaker.o timer.o rtc.o ata.o \
            vga.o vga_dev.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
            syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o devfs.o procfs.o fd.o initramfs.o initramfs_cpio.o \
            pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o \
            acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o uaccess.o elf.o dynlink.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf user/ldd.elf user/dltest.elf user/hello_dyn.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/vplay.elf user/libc/libc.so.1
+initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf user/ldd.elf user/dltest.elf user/hello_dyn.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/vplay.elf user/sbplay.elf user/libc/libc.so.1
 	rm -rf $(INITRAMFS_DIR) initramfs.cpio
 	mkdir -p $(INITRAMFS_DIR)/bin $(INITRAMFS_DIR)/etc $(INITRAMFS_DIR)/dev $(INITRAMFS_DIR)/proc $(INITRAMFS_DIR)/mnt $(INITRAMFS_DIR)/usr/bin $(INITRAMFS_DIR)/lib
 	cp user/init.elf $(INITRAMFS_DIR)/bin/init
@@ -524,6 +533,7 @@ initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf use
 	cp user/hd.elf $(INITRAMFS_DIR)/bin/hd
 	cp user/which.elf $(INITRAMFS_DIR)/bin/which
 	cp user/vplay.elf $(INITRAMFS_DIR)/bin/vplay
+	cp user/sbplay.elf $(INITRAMFS_DIR)/bin/sbplay
 	cp user/libc/libc.so.1 $(INITRAMFS_DIR)/lib/libc.so.1
 	echo "Welcome to FrostByte (cpio initramfs)" > $(INITRAMFS_DIR)/etc/motd
 	ln -sf /etc/motd $(INITRAMFS_DIR)/motd_link
@@ -554,5 +564,16 @@ disk-reset:
 	rm -f disk.img
 	dd if=/dev/zero of=disk.img bs=1M count=64
 
+HOST_CC ?= gcc
+HOST_CFLAGS ?= -O2 -Wall -Wextra
+MENUCONFIG_BIN := tools/menuconfig/menuconfig
+
+$(MENUCONFIG_BIN): tools/menuconfig/menuconfig.c
+	@echo "  HOSTCC  $@"
+	@$(HOST_CC) $(HOST_CFLAGS) -o $@ $< -lncurses
+
+menuconfig: $(MENUCONFIG_BIN)
+	@$(MENUCONFIG_BIN)
+
 clean:
-	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir $(INITRAMFS_DIR) initramfs.cpio user/*.o user/*.elf
+	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir $(INITRAMFS_DIR) initramfs.cpio user/*.o user/*.elf $(MENUCONFIG_BIN)

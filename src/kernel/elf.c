@@ -601,11 +601,11 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
     }
 
     {
-        const uint32_t ustack_va = ustack_top - 0x1000;
         const uint32_t TMP = 0x00800000;
         uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
         if (vmm_map_page(TMP, new_stack_top_phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
         #if LOG_ELF
+            const uint32_t ustack_va = ustack_top - 0x1000;
             uint32_t argc_dbg = *(uint32_t*)(TMP + (new_esp - ustack_va));
             uint32_t argv0_ptr = *(uint32_t*)(TMP + (new_esp - ustack_va + 4));
             serial_write_string("[ELF] stack argc=\n");

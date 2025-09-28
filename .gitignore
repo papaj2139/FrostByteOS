@@ -11,3 +11,5 @@ src/fs/*_blob.h
 initramfs_root/
 *.elf
 *.so.*
+*.vga
+*.raw

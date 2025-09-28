@@ -41,9 +41,11 @@ static void of_drop(int32_t idx) {
 }
 
 //find lowest free fd slot in a process
+//reserve 0,1,2 for stdio regardless of whether they are bound yet
 static int find_free_fd_slot(process_t* p) {
     if (!p) return -1;
-    for (int i = 0; i < (int)(sizeof(p->fd_table)/sizeof(p->fd_table[0])); i++) {
+    int n = (int)(sizeof(p->fd_table)/sizeof(p->fd_table[0]));
+    for (int i = 3; i < n; i++) {
         if (p->fd_table[i] < 0) return i;
     }
     return -1;

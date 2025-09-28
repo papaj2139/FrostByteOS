@@ -72,7 +72,8 @@ int main(int argc, char** argv, char** envp) {
             tmp[t++] = (char)('0' + (v % 10));
             v/=10;
         }
-        while (t) nb[i++] = tmp[--t]; nb[i]='\0';
+        while (t) { nb[i++] = tmp[--t]; }
+        nb[i] = '\0';
         putstr(nb);
         putstr("\n");
     }

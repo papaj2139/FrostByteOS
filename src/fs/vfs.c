@@ -7,6 +7,11 @@
 #include "../libc/stdlib.h"
 #include "../mm/heap.h"
 
+//toggle to disable strict permission enforcement
+#ifndef VFS_ENFORCE_PERMS
+#define VFS_ENFORCE_PERMS 0
+#endif
+
 //VFS metadata overlay
 typedef struct vfs_meta_override {
     char path[VFS_MAX_PATH];
@@ -573,26 +578,27 @@ static vfs_node_t* vfs_resolve_path_internal2(const char* path, int depth, bool 
         memcpy(component, p, len);
         component[len] = '\0';
 
-        //check execute/search permission on the current directory
-        process_t* curp = process_get_current();
-        uint32_t req = VFS_FLAG_EXECUTE; //search permission
-        //compute which bits apply
-        uint32_t mode = current_node->mode;
-        uint32_t mask = (curp && curp->euid == current_node->uid) ? (S_IXUSR)
-                       : (curp && curp->egid == current_node->gid) ? (S_IXGRP)
-                       : (S_IXOTH);
-        if ((mask & S_IXUSR) && !(mode & S_IXUSR)) {
-            vfs_close(current_node);
-            return NULL;
-        }
-        if ((mask & S_IXGRP) && !(mode & S_IXGRP)) {
-            vfs_close(current_node);
-            return NULL;
-        }
-        if ((mask & S_IXOTH) && !(mode & S_IXOTH)) {
-            vfs_close(current_node);
-            return NULL;
-        }
+        #if VFS_ENFORCE_PERMS
+                //check execute/search permission on the current directory
+                process_t* curp = process_get_current();
+                //compute which bits apply
+                uint32_t mode = current_node->mode;
+                uint32_t mask = (curp && curp->euid == current_node->uid) ? (S_IXUSR)
+                            : (curp && curp->egid == current_node->gid) ? (S_IXGRP)
+                            : (S_IXOTH);
+                if ((mask & S_IXUSR) && !(mode & S_IXUSR)) {
+                    vfs_close(current_node);
+                    return NULL;
+                }
+                if ((mask & S_IXGRP) && !(mode & S_IXGRP)) {
+                    vfs_close(current_node);
+                    return NULL;
+                }
+                if ((mask & S_IXOTH) && !(mode & S_IXOTH)) {
+                    vfs_close(current_node);
+                    return NULL;
+                }
+        #endif
         //open the directory so it can search it
         if (current_node->ops && current_node->ops->open) {
             current_node->ops->open(current_node, VFS_FLAG_READ);
@@ -729,27 +735,30 @@ vfs_node_t* vfs_open(const char* path, uint32_t flags) {
         return NULL;
     }
 
-    //check permissions based on uid/gid/mode
-    process_t* curp = process_get_current();
-    uint32_t mode = node->mode;
-    //select class
-    int cls = 2; // other
-    if (curp && curp->euid == node->uid) cls = 0; else if (curp && curp->egid == node->gid) cls = 1;
-    uint32_t rbit = (cls==0?S_IRUSR:(cls==1?S_IRGRP:S_IROTH));
-    uint32_t wbit = (cls==0?S_IWUSR:(cls==1?S_IWGRP:S_IWOTH));
-    uint32_t xbit = (cls==0?S_IXUSR:(cls==1?S_IXGRP:S_IXOTH));
-    if ((flags & VFS_FLAG_READ) && !(mode & rbit)) {
-        vfs_destroy_node(node);
-        return NULL;
-    }
-    if ((flags & VFS_FLAG_WRITE) && !(mode & wbit)) {
-        vfs_destroy_node(node);
-        return NULL;
-    }
-    if ((flags & VFS_FLAG_EXECUTE) && !(mode & xbit)) {
-        vfs_destroy_node(node);
-        return NULL;
-    }
+    #if VFS_ENFORCE_PERMS
+        //check permissions based on uid/gid/mode
+        process_t* curp = process_get_current();
+        uint32_t mode = node->mode;
+        //select class
+        int cls = 2; // other
+        if (curp && curp->euid == node->uid) cls = 0;
+            else if (curp && curp->egid == node->gid) cls = 1;
+        uint32_t rbit = (cls==0?S_IRUSR:(cls==1?S_IRGRP:S_IROTH));
+        uint32_t wbit = (cls==0?S_IWUSR:(cls==1?S_IWGRP:S_IWOTH));
+        uint32_t xbit = (cls==0?S_IXUSR:(cls==1?S_IXGRP:S_IXOTH));
+        if ((flags & VFS_FLAG_READ) && !(mode & rbit)) {
+            vfs_destroy_node(node);
+            return NULL;
+        }
+        if ((flags & VFS_FLAG_WRITE) && !(mode & wbit)) {
+            vfs_destroy_node(node);
+            return NULL;
+        }
+        if ((flags & VFS_FLAG_EXECUTE) && !(mode & xbit)) {
+            vfs_destroy_node(node);
+            return NULL;
+        }
+    #endif
 
     //call filesystem specific open if available
     if (node->ops && node->ops->open) {
@@ -788,15 +797,17 @@ int vfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer) {
         return -1;
     }
 
-    //check permissions
-    //allow read only if read bit set
-    process_t* curp = process_get_current();
-    int cls = 2; if (curp && curp->euid == node->uid) cls = 0; else if (curp && curp->egid == node->gid) cls = 1;
-    uint32_t rbit = (cls==0?S_IRUSR:(cls==1?S_IRGRP:S_IROTH));
-    if (!(node->mode & rbit)) {
-        vfs_debug("Read permission denied");
-        return -1;
-    }
+    #if VFS_ENFORCE_PERMS
+        //check permissions
+        //allow read only if read bit set
+        process_t* curp = process_get_current();
+        int cls = 2; if (curp && curp->euid == node->uid) cls = 0; else if (curp && curp->egid == node->gid) cls = 1;
+        uint32_t rbit = (cls==0?S_IRUSR:(cls==1?S_IRGRP:S_IROTH));
+        if (!(node->mode & rbit)) {
+            vfs_debug("Read permission denied");
+            return -1;
+        }
+    #endif
 
     //call filesystem-specific read
     if (node->ops && node->ops->read) {
@@ -820,14 +831,16 @@ int vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const char* buff
         return -1;
     }
 
-    //check permissions
-    process_t* curp2 = process_get_current();
-    int cls2 = 2; if (curp2 && curp2->euid == node->uid) cls2 = 0; else if (curp2 && curp2->egid == node->gid) cls2 = 1;
-    uint32_t wbit2 = (cls2==0?S_IWUSR:(cls2==1?S_IWGRP:S_IWOTH));
-    if (!(node->mode & wbit2)) {
-        vfs_debug("Write permission denied");
-        return -1;
-    }
+    #if VFS_ENFORCE_PERMS
+        //check permissions
+        process_t* curp2 = process_get_current();
+        int cls2 = 2; if (curp2 && curp2->euid == node->uid) cls2 = 0; else if (curp2 && curp2->egid == node->gid) cls2 = 1;
+        uint32_t wbit2 = (cls2==0?S_IWUSR:(cls2==1?S_IWGRP:S_IWOTH));
+        if (!(node->mode & wbit2)) {
+            vfs_debug("Write permission denied");
+            return -1;
+        }
+    #endif
 
     //call filesystemspecific write
     if (node->ops && node->ops->write) {

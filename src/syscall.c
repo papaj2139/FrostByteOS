@@ -452,9 +452,20 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Writing to file via VFS\n");
     #endif
-    int bytes_written = vfs_write(file->node, file->offset, count, buf);
-    if (bytes_written >= 0) {
-        file->offset += bytes_written;
+    //bounce buffer from user to kernel for filesystem/device writes
+    int bytes_written = -1;
+    char* kbuf = (char*)kmalloc(count);
+    if (kbuf) {
+        if (copy_from_user(kbuf, buf, count) == 0) {
+            int r = vfs_write(file->node, file->offset, count, kbuf);
+            if (r >= 0) {
+                file->offset += r;
+                bytes_written = r;
+            } else {
+                bytes_written = r;
+            }
+        }
+        kfree(kbuf);
     }
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Write completed, bytes: ");
@@ -536,9 +547,22 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
         return -1; //EBADF
     }
 
-    int bytes_read = vfs_read(file->node, file->offset, count, buf);
-    if (bytes_read >= 0) {
-        file->offset += bytes_read;
+    //bounce buffer in kernel space then copy to user
+    int bytes_read = -1;
+    char* kbuf = (char*)kmalloc(count);
+    if (kbuf) {
+        int r = vfs_read(file->node, file->offset, count, kbuf);
+        if (r > 0) {
+            if (copy_to_user(buf, kbuf, (size_t)r) == 0) {
+                file->offset += r;
+                bytes_read = r;
+            } else {
+                bytes_read = -1;
+            }
+        } else {
+            bytes_read = r;
+        }
+        kfree(kbuf);
     }
     signal_check_current();
     return bytes_read;
@@ -1202,8 +1226,7 @@ int32_t sys_dl_get_fini(uint32_t index) {
     return 0;
 }
 
-static int build_candidate(char* out, uint32_t outsz, const char* dir, const char* name)
-{
+static int build_candidate(char* out, uint32_t outsz, const char* dir, const char* name) {
     if (!out || !dir || !name) return -1;
     size_t dl = strlen(dir); if (dl >= outsz) dl = outsz - 1;
     memcpy(out, dir, dl);
@@ -1218,8 +1241,7 @@ static int build_candidate(char* out, uint32_t outsz, const char* dir, const cha
     return 0;
 }
 
-int32_t sys_dlopen(const char* path, uint32_t flags)
-{
+int32_t sys_dlopen(const char* path, uint32_t flags) {
     (void)flags;
     process_t* cur = process_get_current();
     if (!cur) return -1;
@@ -1317,8 +1339,7 @@ int32_t sys_dlsym(int32_t handle, const char* name) {
     return (int32_t)(uint32_t)(uintptr_t)va;
 }
 
-int32_t sys_dlclose(int32_t handle)
-{
+int32_t sys_dlclose(int32_t handle) {
     (void)handle; //unloading not supported yet
     return 0;
 }
@@ -1427,8 +1448,7 @@ int32_t sys_stat(const char* path, void* stat_out)
     return 0;
 }
 
-int32_t sys_lstat(const char* path, void* stat_out)
-{
+int32_t sys_lstat(const char* path, void* stat_out) {
     if (!path || !stat_out) return -1;
     if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
     char ap[VFS_MAX_PATH];
@@ -1441,8 +1461,7 @@ int32_t sys_lstat(const char* path, void* stat_out)
     return 0;
 }
 
-int32_t sys_fstat(int32_t fd, void* stat_out)
-{
+int32_t sys_fstat(int32_t fd, void* stat_out) {
     if (!stat_out) return -1;
     if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
     vfs_file_t* f = fd_get(fd);
@@ -1452,8 +1471,7 @@ int32_t sys_fstat(int32_t fd, void* stat_out)
     return 0;
 }
 
-int32_t sys_chmod(const char* path, int32_t mode)
-{
+int32_t sys_chmod(const char* path, int32_t mode) {
     if (!path) return -1;
     char ap[VFS_MAX_PATH];
     if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
@@ -1469,8 +1487,7 @@ int32_t sys_chmod(const char* path, int32_t mode)
     return 0;
 }
 
-int32_t sys_chown(const char* path, int32_t uid, int32_t gid)
-{
+int32_t sys_chown(const char* path, int32_t uid, int32_t gid) {
     if (!path) return -1;
     char ap[VFS_MAX_PATH];
     if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
@@ -1486,8 +1503,7 @@ int32_t sys_chown(const char* path, int32_t uid, int32_t gid)
     return 0;
 }
 
-int32_t sys_fchmod(int32_t fd, int32_t mode)
-{
+int32_t sys_fchmod(int32_t fd, int32_t mode) {
     vfs_file_t* f = fd_get(fd);
     if (!f || !f->node) return -1;
     process_t* cur = process_get_current();
@@ -1497,8 +1513,7 @@ int32_t sys_fchmod(int32_t fd, int32_t mode)
     return 0;
 }
 
-int32_t sys_fchown(int32_t fd, int32_t uid, int32_t gid)
-{
+int32_t sys_fchown(int32_t fd, int32_t uid, int32_t gid) {
     vfs_file_t* f = fd_get(fd);
     if (!f || !f->node) return -1;
     process_t* cur = process_get_current();

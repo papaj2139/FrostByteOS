@@ -12,6 +12,7 @@
 #include "drivers/timer.h"
 #include "drivers/rtc.h"
 #include "drivers/ata.h"
+#include "drivers/sb16.h"
 #include "syscall.h"
 #include "interrupts/gdt.h"
 #include "interrupts/tss.h"
@@ -192,7 +193,7 @@ static void cmd_help(const char *args) {
     print("  echo <text> - Display text\n", 0x0F);
     print("  desktop     - Start the desktop environment\n", 0x0F);
     print("  iceedit     - ICE (Interpreted Compiled Executable) Editor\n", 0x0F);
-    
+
     print("  readsector <dev> <sector> - Read a sector from a device\n", 0x0F);
     print("  reboot      - Reboot the system\n", 0x0F);
     print("  shutdown    - Shut down the system\n", 0x0F);
@@ -877,9 +878,10 @@ void kmain(uint32_t magic, uint32_t addr) {
     device_manager_init();
     DEBUG_PRINT("Device manager initialized");
 
-    //initialize serial and RTC devices
+    //initialize serial RTC and SB16 devices
     (void)serial_register_device();
     (void)rtc_register_device();
+    (void)sb16_register_device();
 
     //initialize and register ATA driver
     ata_init();
@@ -917,11 +919,11 @@ void kmain(uint32_t magic, uint32_t addr) {
     DEBUG_PRINT("IDT installed");
     syscall_init();
     DEBUG_PRINT("Syscalls initialized");
-    
+
     //initialize process manager before timer to avoid scheduling before ready
     process_init();
     DEBUG_PRINT("Process manager initialized");
-    
+
     timer_init(100); //100 hz
     keyboard_init(); //enable IRQ1 and setup keyboard handler
     DEBUG_PRINT("Timer initialized");
@@ -934,7 +936,7 @@ void kmain(uint32_t magic, uint32_t addr) {
         //register filesystems with VFS
         if (fs_vfs_init() == 0) {
             DEBUG_PRINT("Filesystems registered with VFS");
-            //install initramfs as root 
+            //install initramfs as root
             initramfs_init();
             if (mbi && (mbi->flags & MBI_FLAG_MODS) && mbi->mods_count > 0) {
                 multiboot_module_t* mods = (multiboot_module_t*)(uintptr_t)mbi->mods_addr;
@@ -966,8 +968,8 @@ void kmain(uint32_t magic, uint32_t addr) {
                     if (!mstr || strstr(mstr, "initramfs") || strstr(mstr, ".cpio")) {
                         const uint8_t* mstart = (const uint8_t*)(uintptr_t)mods[i].mod_start; //identity-mapped low memory
                         const uint8_t* mend   = (const uint8_t*)(uintptr_t)mods[i].mod_end;
-                        if (initramfs_load_cpio(mstart, mend) == 0) { 
-                            break; 
+                        if (initramfs_load_cpio(mstart, mend) == 0) {
+                            break;
                         }
                     }
                 }
@@ -1008,8 +1010,8 @@ void kmain(uint32_t magic, uint32_t addr) {
     }
     commandLoop();
     //idle scheduler will run user processes
-    for (;;) { 
-        __asm__ volatile ("hlt"); 
+    for (;;) {
+        __asm__ volatile ("hlt");
     }
 }
 extern char kernel_start, kernel_end;

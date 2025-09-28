@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "../drivers/sb16.h"
 
 typedef enum {
     PROCFS_NODE_ROOT = 0,
@@ -35,6 +36,7 @@ typedef enum {
     PROCFS_NODE_FILESYSTEMS,
     PROCFS_NODE_INTERRUPTS,
     PROCFS_NODE_PARTITIONS,
+    PROCFS_NODE_SB16,
 } procfs_node_kind_t;
 
 typedef struct {
@@ -64,6 +66,7 @@ static const procfs_root_entry_t g_procfs_root_entries[] = {
     { "power",   PROCFS_NODE_POWER,           VFS_FILE_TYPE_FILE },
     { "rescan",  PROCFS_NODE_RESCAN,          VFS_FILE_TYPE_FILE },
     { "partitions", PROCFS_NODE_PARTITIONS,   VFS_FILE_TYPE_FILE },
+    { "sb16",    PROCFS_NODE_SB16,            VFS_FILE_TYPE_FILE },
     { "self",    PROCFS_NODE_DIR_SELF,        VFS_FILE_TYPE_DIRECTORY },
 };
 
@@ -152,6 +155,55 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
         if (!cur) return -1;
         cur->tty = dev;
         return (int)size;
+    }
+    if (p->kind == PROCFS_NODE_SB16) {
+        //accept commands: "rate <hz>" "speaker on" "speaker off"
+        //note: it parses up to the first whitespace-delimited token
+        char line[64];
+        if (size >= sizeof(line)) size = sizeof(line) - 1;
+        memcpy(line, buffer, size);
+        line[size] = '\0';
+        //lowercase copy and trim
+        for (uint32_t i = 0; i < size; i++) {
+            if (line[i] >= 'A' && line[i] <= 'Z') line[i] = (char)(line[i] - 'A' + 'a');
+        }
+        //tokenize
+        char* s = line;
+        while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+        if (*s == '\0') return 0;
+        //find first token
+        char* t0 = s;
+        while (*s && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') s++;
+        char c0 = *s; *s = '\0';
+        s++;
+        if (strcmp(t0, "rate") == 0) {
+            //parse integer
+            while (*s == ' ' || *s == '\t') s++;
+            int val = 0;
+            while (*s >= '0' && *s <= '9') {
+                val = val * 10 + (*s - '0');
+                s++;
+            }
+            if (val <= 0) return -1;
+            return sb16_set_rate((uint16_t)val) == 0 ? (int)size : -1;
+        } else if (strcmp(t0, "speaker") == 0) {
+            while (*s == ' ' || *s == '\t') s++;
+            char* t1 = s;
+            while (*s && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') s++;
+            char save = *s; *s = '\0';
+            if (strcmp(t1, "on") == 0) {
+                sb16_speaker_on();
+                return (int)size;
+            }
+            if (strcmp(t1, "off") == 0) {
+                sb16_speaker_off();
+                return (int)size;
+            }
+            (void)save;
+            return -1;
+        } else {
+            return -1;
+        }
     }
     if (p->kind == PROCFS_NODE_RESCAN) {
         //ATA rescan
@@ -527,9 +579,23 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
                              "capabilities: poweroff reboot halt\nstate: on\n");
             break;
         }
+        case PROCFS_NODE_SB16: {
+            uint16_t rate = sb16_get_rate();
+            int spk = sb16_is_speaker_on();
+            uint8_t irq = sb16_get_irq();
+            uint8_t dma = sb16_get_dma8();
+            len += ksnprintf(tmp + len, sizeof(tmp) - len,
+                             "rate: %u\nspeaker: %s\nirq: %u\ndma8: %u\n",
+                             (unsigned)rate, spk ? "on" : "off", (unsigned)irq, (unsigned)dma);
+            break;
+        }
         default: return -1;
     }
 
+    //ensure we never present a zero-length file to userland unless offset beyond content
+    if (len == 0) {
+        len += ksnprintf(tmp + len, sizeof(tmp) - len, "(empty)\n");
+    }
     if (offset >= len) return 0;
     uint32_t to_copy = (uint32_t)((len - offset) < size ? (len - offset) : size);
     memcpy(buffer, tmp + offset, to_copy);

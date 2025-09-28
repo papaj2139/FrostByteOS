@@ -166,3 +166,20 @@ void heap_get_stats(heap_stats_t* stats) {
         current = current->next;
     }
 }
+
+//aligned allocation  (fallback kmalloc for now)
+void* kmalloc_aligned(size_t size, uint32_t alignment) {
+    (void)alignment;
+    return kmalloc(size);
+}
+
+//allocate memory and also return the physical address of the first byte
+void* kmalloc_physical(size_t size, uint32_t* physical_addr) {
+    void* p = kmalloc(size);
+    if (!p) return 0;
+    if (physical_addr) {
+        //translate the first byte to physical address
+        *physical_addr = vmm_get_physical_addr((uint32_t)p);
+    }
+    return p;
+}

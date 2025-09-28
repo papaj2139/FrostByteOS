@@ -1,0 +1,311 @@
+#include "sb16.h"
+#include "../io.h"
+#include "../device_manager.h"
+#include "../interrupts/irq.h"
+#include "../interrupts/pic.h"
+#include "../mm/vmm.h"
+#include "serial.h"
+#include <string.h>
+
+//default base
+#define SB16_BASE_DEFAULT 0x220
+
+//DSP register offsets from base
+#define DSP_RESET_OFF   0x6   //base+6
+#define DSP_READ_OFF    0xA   //base+0xA
+#define DSP_WRITE_OFF   0xC   //base+0xC (also status for write buffer)
+#define DSP_RSTAT_OFF   0xE   //base+0xE read buffer status
+
+//mixer ports
+#define MIXER_ADDR_OFF  0x4   //base+0x224
+#define MIXER_DATA_OFF  0x5   //base+0x225
+
+//ISA DMA (8237) controller 1 (8-bit channels 0 to 3)
+#define DMA1_CH1_ADDR   0x02
+#define DMA1_CH1_COUNT  0x03
+#define DMA1_MASK_REG   0x0A
+#define DMA1_MODE_REG   0x0B
+#define DMA1_CLEAR_FF   0x0C
+#define DMA1_MASTER_CLR 0x0D
+#define DMA1_PAGE_CH1   0x83
+
+//device state
+static uint16_t g_sb_base = SB16_BASE_DEFAULT;
+static uint8_t  g_sb_irq  = 5;   //default common SB16 IRQ
+static uint8_t  g_dma8_ch = 1;   //default 8-bit DMA channel
+static uint16_t g_rate    = 22050; //default sample rate
+static volatile int g_irq_block_done = 0;
+static int g_speaker_enabled = 0;
+
+static device_t g_sb_dev;
+
+//delay for restt timing
+static inline void io_delay(void) {
+    //port I/O delay: read from an unused port
+    (void)inb(0x80);
+}
+
+static inline int dsp_write_wait(uint8_t v) {
+    //wait for write buffer to be ready (bit7 of base+0xC == 0)
+    for (int i = 0; i < 65536; ++i) {
+        if ((inb(g_sb_base + DSP_WRITE_OFF) & 0x80) == 0) {
+            outb(g_sb_base + DSP_WRITE_OFF, v);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static inline int dsp_read_wait(uint8_t* out) {
+    if (!out) return -1;
+    for (int i = 0; i < 65536; ++i) {
+        if (inb(g_sb_base + DSP_RSTAT_OFF) & 0x80) {
+            *out = inb(g_sb_base + DSP_READ_OFF);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int dsp_reset(void) {
+    outb(g_sb_base + DSP_RESET_OFF, 1);
+    io_delay(); io_delay(); io_delay();
+    outb(g_sb_base + DSP_RESET_OFF, 0);
+    //expect 0xAA from DSP
+    uint8_t v = 0;
+    if (dsp_read_wait(&v) != 0) return -1;
+    return (v == 0xAA) ? 0 : -1;
+}
+
+static void mixer_write(uint8_t reg, uint8_t val) {
+    outb(g_sb_base + MIXER_ADDR_OFF, reg);
+    outb(g_sb_base + MIXER_DATA_OFF, val);
+}
+static uint8_t mixer_read(uint8_t reg) {
+    outb(g_sb_base + MIXER_ADDR_OFF, reg);
+    return inb(g_sb_base + MIXER_DATA_OFF);
+}
+
+static void dsp_set_rate(uint16_t rate) {
+    //SB16: 0x41 Set output sample rate, high then low
+    (void)dsp_write_wait(0x41);
+    (void)dsp_write_wait((uint8_t)(rate >> 8));
+    (void)dsp_write_wait((uint8_t)(rate & 0xFF));
+}
+
+static void dsp_speaker_on(void) {
+    (void)dsp_write_wait(0xD1);
+}
+
+static void dsp_speaker_off(void) {
+    (void)dsp_write_wait(0xD3);
+}
+
+//detect configured IRQ and DMA from mixer
+static void detect_irq_dma(void) {
+    //IRQ select at mixer 0x80: typical bits (1<<1)=IRQ5, (1<<2)=IRQ7, (1<<3)=IRQ10, (1<<0)=IRQ2
+    uint8_t irq_sel = mixer_read(0x80);
+    if      (irq_sel & 0x02) g_sb_irq = 5;
+    else if (irq_sel & 0x04) g_sb_irq = 7;
+    else if (irq_sel & 0x08) g_sb_irq = 10;
+    else if (irq_sel & 0x01) g_sb_irq = 2; //unlikely as shit
+    else g_sb_irq = 5; //fallback
+
+    //DMA select at mixer 0x81: bits for 8-bit ch {0,1,3}
+    uint8_t dma_sel = mixer_read(0x81);
+    if      (dma_sel & 0x02) g_dma8_ch = 1;
+    else if (dma_sel & 0x08) g_dma8_ch = 3;
+    else if (dma_sel & 0x01) g_dma8_ch = 0;
+    else g_dma8_ch = 1; //fallback
+}
+
+//IRQ handler acknowledge SB16 8-bit DMA interrupt and signal completion
+static void sb16_irq_handler(void) {
+    //acknowledge read status then data to clear 8-bit IRQ
+    (void)inb(g_sb_base + DSP_RSTAT_OFF);
+    (void)inb(g_sb_base + DSP_READ_OFF);
+    g_irq_block_done = 1;
+}
+
+//program DMA channel 1 for 8-bit playback from physical address
+static void dma8_program_ch1(uint32_t phys, uint16_t len) {
+    //mask channel 1
+    outb(DMA1_MASK_REG, (uint8_t)(0x04 | 1));
+
+    //reset flip-flop
+    outb(DMA1_CLEAR_FF, 0x00);
+
+    //address (low, high) for ch1
+    outb(DMA1_CH1_ADDR, (uint8_t)(phys & 0xFF));
+    outb(DMA1_CH1_ADDR, (uint8_t)((phys >> 8) & 0xFF));
+    //page
+    outb(DMA1_PAGE_CH1, (uint8_t)((phys >> 16) & 0xFF));
+
+    //count = len-1 (low, high)
+    uint16_t cnt = (uint16_t)(len - 1);
+    outb(DMA1_CLEAR_FF, 0x00);
+    outb(DMA1_CH1_COUNT, (uint8_t)(cnt & 0xFF));
+    outb(DMA1_CH1_COUNT, (uint8_t)((cnt >> 8) & 0xFF));
+
+    //mode: channel 1 | single-cycle | increment | read (mem->device)
+    //transfer type read=10b -> 0x80, single=01b -> 0x04
+    outb(DMA1_MODE_REG, (uint8_t)(0x80 | 0x04 | 1)); //0x85
+
+    //unmask channel 1
+    outb(DMA1_MASK_REG, 0x01);
+}
+
+//play one 8-bit block via single-cycle DMA wait for IRQ to complete
+static int sb16_play_block(uint32_t phys, uint16_t len) {
+    if (len == 0) return 0;
+    //program DMA for channel 1 only
+    if (g_dma8_ch != 1) {
+        //rn in this basic driver force channel 1 setup other channels not implemented
+        g_dma8_ch = 1;
+    }
+    dma8_program_ch1(phys, len);
+
+    //set sample rate and start 8-bit single-cycle DMA playback (command 0x14 length-1 low high)
+    dsp_set_rate(g_rate);
+    (void)dsp_write_wait(0x14);
+    uint16_t cnt = (uint16_t)(len - 1);
+    (void)dsp_write_wait((uint8_t)(cnt & 0xFF));
+    (void)dsp_write_wait((uint8_t)((cnt >> 8) & 0xFF));
+
+    //wait for IRQ to signal completion
+    g_irq_block_done = 0;
+    //busy-wait with HLT to avoid burning CPU timer or this IRQ will wake
+    while (!g_irq_block_done) {
+        __asm__ volatile ("hlt");
+    }
+    return 0;
+}
+
+uint16_t sb16_get_rate(void) {
+    return g_rate;
+}
+
+int sb16_set_rate(uint16_t rate) {
+    if (rate < 4000) rate = 4000;
+    if (rate > 48000) rate = 48000;
+    g_rate = rate;
+    dsp_set_rate(g_rate);
+    return 0;
+}
+
+void sb16_speaker_on(void) {
+    dsp_speaker_on();
+    g_speaker_enabled = 1;
+}
+
+void sb16_speaker_off(void) {
+    dsp_speaker_off();
+    g_speaker_enabled = 0;
+}
+
+int sb16_is_speaker_on(void) {
+    return g_speaker_enabled;
+}
+
+uint8_t sb16_get_irq(void) {
+    return g_sb_irq;
+}
+
+uint8_t sb16_get_dma8(void) {
+    return g_dma8_ch;
+}
+
+//device ops
+static int sb16_dev_init(struct device* d) {
+    (void)d;
+    //reset DSP and verify
+    if (dsp_reset() != 0) {
+        serial_write_string("[SB16] DSP reset failed\n");
+        return -1;
+    }
+
+    //detect IRQ and DMA settings
+    detect_irq_dma();
+
+    //install IRQ handler and unmask
+    irq_install_handler(g_sb_irq, sb16_irq_handler);
+    pic_clear_mask(g_sb_irq);
+
+    //default: speaker off set default rate
+    sb16_speaker_off();
+    dsp_set_rate(g_rate);
+    return 0;
+}
+
+static int sb16_dev_read(struct device* d, uint32_t off, void* buf, uint32_t sz) {
+    (void)d;
+    (void)off;
+    (void)buf;
+    (void)sz;
+    return -1; // not supported
+}
+
+static int sb16_dev_write(struct device* d, uint32_t off, const void* buf, uint32_t sz) {
+    (void)d;
+    (void)off;
+    if (!buf || sz == 0) return 0;
+
+    uint32_t pos = 0;
+    while (pos < sz) {
+        //physical address of current chunk
+        uint32_t vaddr = (uint32_t)buf + pos;
+        uint32_t phys  = vmm_get_physical_addr(vaddr);
+        if (!phys) return (int)pos; //can't translate so stop
+
+        //limit chunk to 64KiB boundary and 65535 max
+        uint32_t max = sz - pos;
+        if (max > 65535u) max = 65535u;
+        uint32_t next_boundary = (phys & 0xFFFF0000u) + 0x10000u;
+        uint32_t remain_in_64k = (next_boundary > phys) ? (next_boundary - phys) : 0x10000u;
+        if (max > remain_in_64k) max = remain_in_64k;
+
+        //play this block
+        if (sb16_play_block(phys, (uint16_t)max) != 0) {
+            return (int)pos; //error - return bytes consumed so far
+        }
+        pos += (uint32_t)max;
+    }
+    return (int)sz;
+}
+
+static int sb16_dev_ioctl(struct device* d, uint32_t cmd, void* arg) {
+    (void)d;
+    (void)cmd;
+    (void)arg;
+    return -1;
+}
+
+static void sb16_dev_cleanup(struct device* d) {
+    (void)d;
+    sb16_speaker_off();
+    irq_uninstall_handler(g_sb_irq);
+}
+
+static const device_ops_t sb16_ops = {
+    .init = sb16_dev_init,
+    .read = sb16_dev_read,
+    .write = sb16_dev_write,
+    .ioctl = sb16_dev_ioctl,
+    .cleanup = sb16_dev_cleanup,
+};
+
+int sb16_register_device(void) {
+    memset(&g_sb_dev, 0, sizeof(g_sb_dev));
+    strcpy(g_sb_dev.name, "sb16");
+    g_sb_dev.type = DEVICE_TYPE_OUTPUT;
+    g_sb_dev.subtype = DEVICE_SUBTYPE_AUDIO;
+    g_sb_dev.status = DEVICE_STATUS_UNINITIALIZED;
+    g_sb_dev.ops = &sb16_ops;
+    if (device_register(&g_sb_dev) != 0) return -1;
+    if (device_init(&g_sb_dev) != 0) {
+        device_unregister(g_sb_dev.device_id);
+        return -1;
+    }
+    g_sb_dev.status = DEVICE_STATUS_READY;
+    return 0;
+}

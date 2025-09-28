@@ -59,7 +59,7 @@ static void puts1(const char* s) {
     fputs(1, s);
 }
 
-static void puthex(unsigned x) {
+static void __attribute__((unused)) puthex(unsigned x) {
     dprintf(1, "%08x", x);
 }
 
@@ -207,6 +207,7 @@ int main(int argc, char** argv, char** envp) {
     }
 
     //translate STRTAB VA to file offset
+    (void)strsz;
     unsigned strtab_off = 0;
     if (strtab_va == 0 || va_to_off(segs, ph_count, strtab_va, &strtab_off) != 0) {
         puts1("ldd: could not locate STRTAB\n");
