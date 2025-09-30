@@ -24,6 +24,18 @@ static volatile int cursor_enabled = 1;
 static volatile int cursor_visible = 0;
 static int cursor_px = 0, cursor_py = 0; //pixel pos of current cell
 static uint32_t blink_div = 0; //ticks threshold
+//ANSI escape sequence parser for fbcon
+typedef enum {
+    FBCON_ANSI_NORMAL,
+    FBCON_ANSI_ESC,
+    FBCON_ANSI_CSI,
+    FBCON_ANSI_CSI_PARAM
+} fbcon_ansi_state_t;
+
+static fbcon_ansi_state_t ansi_state = FBCON_ANSI_NORMAL;
+static int ansi_params[8];
+static int ansi_param_count = 0;
+static unsigned char current_attr = 0x0F;
 
 static inline uint32_t rgb_from_attr(unsigned char attr) {
     //VGA attr: low nibble = FG high nibble = BG (blink ignored)
@@ -43,8 +55,6 @@ static void draw_glyph(int px, int py, char ch, unsigned char attr) {
     int max_x = (int)fb_w - 1;
     int max_y = (int)fb_h - 1;
 
-    int gw = ch_w;
-    int gh = ch_h;
     if (psf_h > 0) {
         //draw from psf_glyphs
         int index = (int)(unsigned char)ch;
@@ -306,4 +316,168 @@ int fbcon_putchar(char c, unsigned char attr) {
     cursor_px = cur_x * ch_w;
     cursor_py = cur_y * ch_h;
     return 1;
+}
+
+void fbcon_get_cursor(int* x, int* y) {
+    if (x) *x = cur_x;
+    if (y) *y = cur_y;
+}
+
+void fbcon_set_cursor(int x, int y) {
+    if (!ready) return;
+    fbcon_cursor_erase_if_drawn();
+    int cols = (int)(fb_w / ch_w);
+    int rows = (int)(fb_h / ch_h);
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= cols) x = cols - 1;
+    if (y >= rows) y = rows - 1;
+    cur_x = x;
+    cur_y = y;
+    cursor_px = cur_x * ch_w;
+    cursor_py = cur_y * ch_h;
+}
+
+static unsigned char ansi_to_vga_attr(int ansi_code) {
+    if (ansi_code == 0) return 0x0F; //reset
+    if (ansi_code == 7) return 0x70; //inverse
+    if (ansi_code == 30) return (current_attr & 0xF0) | 0x00; //black fg
+    if (ansi_code == 31) return (current_attr & 0xF0) | 0x04; //red fg
+    if (ansi_code == 32) return (current_attr & 0xF0) | 0x02; //green fg
+    if (ansi_code == 33) return (current_attr & 0xF0) | 0x06; //yellow fg
+    if (ansi_code == 34) return (current_attr & 0xF0) | 0x01; //blue fg
+    if (ansi_code == 35) return (current_attr & 0xF0) | 0x05; //magenta fg
+    if (ansi_code == 36) return (current_attr & 0xF0) | 0x03; //cyan fg
+    if (ansi_code == 37) return (current_attr & 0xF0) | 0x07; //white fg
+    if (ansi_code == 90) return (current_attr & 0xF0) | 0x08; //gray fg
+    if (ansi_code == 91) return (current_attr & 0xF0) | 0x0C; //bright red fg
+    if (ansi_code == 92) return (current_attr & 0xF0) | 0x0A; //bright green fg
+    if (ansi_code == 93) return (current_attr & 0xF0) | 0x0E; //bright yellow fg
+    if (ansi_code == 94) return (current_attr & 0xF0) | 0x09; //bright blue fg
+    if (ansi_code == 95) return (current_attr & 0xF0) | 0x0D; //bright magenta fg
+    if (ansi_code == 96) return (current_attr & 0xF0) | 0x0B; //bright cyan fg
+    if (ansi_code == 97) return (current_attr & 0xF0) | 0x0F; //bright white fg
+    return current_attr;
+}
+
+static void fbcon_process_csi(char final_char) {
+    if (!ready) return;
+
+    if (ansi_param_count == 0) {
+        ansi_params[0] = 0;
+        ansi_param_count = 1;
+    }
+
+    int cols = (int)(fb_w / ch_w);
+    int rows = (int)(fb_h / ch_h);
+
+    //cursor movement: ESC[<row>;<col>H or ESC[<row>;<col>f
+    if (final_char == 'H' || final_char == 'f') {
+        if (ansi_param_count >= 2) {
+            int row = ansi_params[0] - 1; //ANSI is 1-indexed
+            int col = ansi_params[1] - 1;
+            fbcon_set_cursor(col, row);
+        }
+        return;
+    }
+
+    if (final_char == 'J') {
+        //clear screen
+        if (ansi_params[0] == 2) {
+            fbcon_clear_with_attr(current_attr);
+        }
+        return;
+    }
+
+    if (final_char == 'K') {
+        //clear line to end
+        fbcon_cursor_erase_if_drawn();
+        int px = cur_x * ch_w;
+        int py = cur_y * ch_h;
+        for (int x = cur_x; x < cols; x++) {
+            int xp = x * ch_w;
+            for (int y = 0; y < ch_h; y++) {
+                memset(fb + (py + y) * fb_pitch + xp * (fb_bpp/8), 0x00, ch_w * (fb_bpp/8));
+            }
+        }
+        cursor_px = cur_x * ch_w;
+        cursor_py = cur_y * ch_h;
+        return;
+    }
+
+    if (final_char == 'm') {
+        //SGR - set graphic rendition (colors/attributes)
+        for (int i = 0; i < ansi_param_count; i++) {
+            current_attr = ansi_to_vga_attr(ansi_params[i]);
+        }
+        return;
+    }
+}
+
+int fbcon_write(const char* buf, uint32_t size) {
+    if (!ready || !buf || size == 0) return 0;
+
+    for (uint32_t i = 0; i < size; i++) {
+        char c = buf[i];
+
+        switch (ansi_state) {
+            case FBCON_ANSI_NORMAL:
+                if (c == '\033' || c == '\x1B') { //ESC
+                    ansi_state = FBCON_ANSI_ESC;
+                } else {
+                    fbcon_putchar(c, current_attr);
+                }
+                break;
+
+            case FBCON_ANSI_ESC:
+                if (c == '[') {
+                    ansi_state = FBCON_ANSI_CSI;
+                    ansi_param_count = 0;
+                    for (int j = 0; j < 8; j++) ansi_params[j] = 0;
+                } else if (c == '?') {
+                    //CSI ? sequences - consume
+                    ansi_state = FBCON_ANSI_CSI;
+                    ansi_param_count = 0;
+                } else {
+                    //unknown escape - back to normal
+                    ansi_state = FBCON_ANSI_NORMAL;
+                }
+                break;
+
+            case FBCON_ANSI_CSI:
+                if (c >= '0' && c <= '9') {
+                    if (ansi_param_count == 0) ansi_param_count = 1;
+                    ansi_params[ansi_param_count - 1] = ansi_params[ansi_param_count - 1] * 10 + (c - '0');
+                    ansi_state = FBCON_ANSI_CSI_PARAM;
+                } else if (c == ';') {
+                    if (ansi_param_count < 8) ansi_param_count++;
+                } else if (c == 'H' || c == 'f' || c == 'J' || c == 'K' || c == 'm' ||
+                           c == 'A' || c == 'B' || c == 'C' || c == 'D' || c == 'h' || c == 'l') {
+                    fbcon_process_csi(c);
+                    ansi_state = FBCON_ANSI_NORMAL;
+                } else {
+                    //unknown - back to normal
+                    ansi_state = FBCON_ANSI_NORMAL;
+                }
+                break;
+
+            case FBCON_ANSI_CSI_PARAM:
+                if (c >= '0' && c <= '9') {
+                    ansi_params[ansi_param_count - 1] = ansi_params[ansi_param_count - 1] * 10 + (c - '0');
+                } else if (c == ';') {
+                    if (ansi_param_count < 8) ansi_param_count++;
+                    ansi_state = FBCON_ANSI_CSI;
+                } else if (c == 'H' || c == 'f' || c == 'J' || c == 'K' || c == 'm' ||
+                           c == 'A' || c == 'B' || c == 'C' || c == 'D' || c == 'h' || c == 'l') {
+                    fbcon_process_csi(c);
+                    ansi_state = FBCON_ANSI_NORMAL;
+                } else {
+                    //unknown - back to normal
+                    ansi_state = FBCON_ANSI_NORMAL;
+                }
+                break;
+        }
+    }
+
+    return (int)size;
 }

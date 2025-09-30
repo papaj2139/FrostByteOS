@@ -364,7 +364,9 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
 
     vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ | VFS_FLAG_EXECUTE);
     if (!node) {
+    #if DEBUG_ENABLED
         serial_write_string("[ELF] vfs_open failed\n");
+    #endif
         return -1;
     }
 

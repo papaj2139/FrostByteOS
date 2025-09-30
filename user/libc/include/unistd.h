@@ -78,6 +78,10 @@ int chown(const char* path, int uid, int gid);
 int dlopen(const char* path, int flags);
 void* dlsym(int handle, const char* name);
 int dlclose(int handle);
+int rename(const char* oldpath, const char* newpath);
+int dup(int fd);
+int dup2(int oldfd, int newfd);
+int pipe(int pipefd[2]);
 
 #ifdef __cplusplus
 }

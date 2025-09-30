@@ -97,6 +97,41 @@ int putchar_term(char c, unsigned char colour) {
     return 1;
 }
 
+//put single char bypassing quiet flag (for TTY echo)
+int putchar_term_force(char c, unsigned char colour) {
+    if (fbcon_available()) {
+        return fbcon_putchar(c, colour);
+    }
+    if (c == '\n') {
+        cursor_x = 0;
+        cursor_y++;
+    } else if (c == '\b') {
+        if (cursor_x > 0) {
+            cursor_x--;
+            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = ' ';
+            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
+        } else if (cursor_y > 0) {
+            cursor_y--;
+            cursor_x = SCREEN_WIDTH - 1;
+            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = ' ';
+            VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
+        } else {
+            return 0;
+        }
+    } else {
+        VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2] = c;
+        VID_MEM[(cursor_y * SCREEN_WIDTH + cursor_x) * 2 + 1] = colour;
+        cursor_x++;
+        if (cursor_x >= SCREEN_WIDTH) {
+            cursor_x = 0;
+            cursor_y++;
+        }
+    }
+    scroll_if_needed();
+    update_cursor();
+    return 1;
+}
+
 void print(char* msg, unsigned char colour){
     if (!msg) return;
     //always mirror to klog for later retrieval via /dev/kmsg
@@ -147,4 +182,37 @@ void put_char_at(char c, uint8_t attr, int x, int y) {
     int offset = (y * SCREEN_WIDTH + x) * 2;
     VID_MEM[offset] = c;
     VID_MEM[offset + 1] = attr;
+}
+
+//CGA write function that just calls print for now
+int cga_write(const char* buf, uint32_t size) {
+    if (!buf || size == 0) return 0;
+    char tmp[256];
+    uint32_t written = 0;
+
+    for (uint32_t i = 0; i < size; i++) {
+        char c = buf[i];
+        if (c == '\n') {
+            if (written > 0) {
+                tmp[written] = '\0';
+                print(tmp, 0x0F);
+                written = 0;
+            }
+            print("\n", 0x0F);
+        } else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) {
+            tmp[written++] = c;
+            if (written >= sizeof(tmp) - 1) {
+                tmp[written] = '\0';
+                print(tmp, 0x0F);
+                written = 0;
+            }
+        }
+    }
+
+    if (written > 0) {
+        tmp[written] = '\0';
+        print(tmp, 0x0F);
+    }
+
+    return (int)size;
 }

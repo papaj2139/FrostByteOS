@@ -14,6 +14,7 @@ int fputs(int fd, const char* s);
 int printf(const char* fmt, ...);
 int fprintf(int fd, const char* fmt, ...);
 int dprintf(int fd, const char* fmt, ...);
+int snprintf(char* buf, unsigned long size, const char* fmt, ...);
 
 #ifdef __cplusplus
 }

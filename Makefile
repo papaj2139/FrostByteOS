@@ -8,7 +8,7 @@ USER_CC = i686-elf-gcc
 USER_CFLAGS = -m32 -ffreestanding -Os -Wall -Wextra -fno-stack-protector -fno-omit-frame-pointer -nostdlib -Iuser/libc/include
 USER_PIC_CFLAGS = $(USER_CFLAGS)
 LDFLAGS = -m32 -nostdlib -T linker.ld
-USER_LIBC_OBJS = user/libc/crt0.o user/libc/syscalls.o user/libc/string.o user/libc/stdio.o user/libc/errno.o user/libc/signal.o
+USER_LIBC_OBJS := user/libc/crt0.o user/libc/syscalls.o user/libc/string.o user/libc/stdio.o user/libc/errno.o user/libc/signal.o user/libc/stdlib.o
 INITRAMFS_DIR := initramfs_root
 #VERY soon this will get horendously long and complex find a better solution maybe just a wildcard?
 .PHONY: all clean run iso menuconfig
@@ -126,6 +126,9 @@ devfs.o: src/fs/devfs.c
 procfs.o: src/fs/procfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+tmpfs.o: src/fs/tmpfs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 initramfs_cpio.o: src/fs/initramfs_cpio.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -150,6 +153,9 @@ user/libc/errno.o: user/libc/src/errno.c
 user/libc/signal.o: user/libc/src/signal.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
+user/libc/stdlib.o: user/libc/src/stdlib.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
 user/libc/syscalls.pic.o: user/libc/src/syscalls.c
 	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
 
@@ -165,7 +171,10 @@ user/libc/errno.pic.o: user/libc/src/errno.c
 user/libc/signal.pic.o: user/libc/src/signal.c
 	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
 
-user/libc/libc.so.1: user/libc/syscalls.pic.o user/libc/string.pic.o user/libc/stdio.pic.o user/libc/errno.pic.o user/libc/signal.pic.o
+user/libc/stdlib.pic.o: user/libc/src/stdlib.c
+	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
+
+user/libc/libc.so.1: user/libc/syscalls.pic.o user/libc/string.pic.o user/libc/stdio.pic.o user/libc/errno.pic.o user/libc/signal.pic.o user/libc/stdlib.pic.o
 	i686-elf-ld -shared -m elf_i386 -nostdlib -soname libc.so.1 $^ -o $@
 
 user/init.o: user/init.c
@@ -390,6 +399,18 @@ user/fbfill.o: user/fbfill.c
 user/fbfill.elf: user/fbfill.o user/libc/crt0.o user/libc/libc.so.1
 	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/fbfill.o -L user/libc -l:libc.so.1 -o $@
 
+user/edit.o: user/edit.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/edit.elf: user/edit.o user/libc/crt0.o user/libc/libc.so.1
+	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/edit.o -L user/libc -l:libc.so.1 -o $@
+
+user/pipetest.o: user/pipetest.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/pipetest.elf: user/pipetest.o user/libc/crt0.o user/libc/libc.so.1
+	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/pipetest.o -L user/libc -l:libc.so.1 -o $@
+
 user/chmod.o: user/chmod.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -495,14 +516,14 @@ process_asm.o: src/process_asm.asm
 $(KERNEL): boot.o kernel.o string.o stdlib.o io.o font.o \
            keyboard.o mouse.o tty.o serial.o sb16.o pc_speaker.o timer.o rtc.o ata.o \
            vga.o vga_dev.o fb.o fbcon.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
-           syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o devfs.o procfs.o fd.o initramfs.o initramfs_cpio.o \
+           syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o devfs.o procfs.o tmpfs.o fd.o initramfs.o initramfs_cpio.o \
            pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o \
            acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o uaccess.o elf.o dynlink.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf user/ldd.elf user/dltest.elf user/hello_dyn.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/clear.elf user/vplay.elf user/sbplay.elf user/fbfill.elf user/libc/libc.so.1
+initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf user/ldd.elf user/dltest.elf user/hello_dyn.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/clear.elf user/vplay.elf user/sbplay.elf user/fbfill.elf user/edit.elf user/pipetest.elf user/libc/libc.so.1
 	rm -rf $(INITRAMFS_DIR) initramfs.cpio
-	mkdir -p $(INITRAMFS_DIR)/bin $(INITRAMFS_DIR)/etc $(INITRAMFS_DIR)/dev $(INITRAMFS_DIR)/proc $(INITRAMFS_DIR)/mnt $(INITRAMFS_DIR)/usr/bin $(INITRAMFS_DIR)/lib
+	mkdir -p $(INITRAMFS_DIR)/bin $(INITRAMFS_DIR)/etc $(INITRAMFS_DIR)/dev $(INITRAMFS_DIR)/proc $(INITRAMFS_DIR)/mnt $(INITRAMFS_DIR)/tmp $(INITRAMFS_DIR)/usr/bin $(INITRAMFS_DIR)/lib
 	cp user/init.elf $(INITRAMFS_DIR)/bin/init
 	cp user/fbsh.elf $(INITRAMFS_DIR)/bin/sh
 	cp user/forktest.elf $(INITRAMFS_DIR)/bin/forktest
@@ -549,7 +570,10 @@ initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf use
 	cp user/vplay.elf $(INITRAMFS_DIR)/bin/vplay
 	cp user/sbplay.elf $(INITRAMFS_DIR)/bin/sbplay
 	cp user/fbfill.elf $(INITRAMFS_DIR)/bin/fbfill
+	cp user/edit.elf $(INITRAMFS_DIR)/bin/edit
+	cp user/pipetest.elf $(INITRAMFS_DIR)/bin/pipetest
 	cp user/libc/libc.so.1 $(INITRAMFS_DIR)/lib/libc.so.1
+	cp zap-ext-vga16.psf $(INITRAMFS_DIR)/etc/font.psf
 	echo "Welcome to FrostByte (cpio initramfs)" > $(INITRAMFS_DIR)/etc/motd
 	ln -sf /etc/motd $(INITRAMFS_DIR)/motd_link
 	ln -sf /bin/sh $(INITRAMFS_DIR)/usr/bin/sh

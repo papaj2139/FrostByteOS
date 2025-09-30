@@ -412,7 +412,9 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
     //call the FAT16 write function
     int result = fat16_write_file(&file_data->file, buffer, size);
     if (result > 0) {
+    #if DEBUG_ENABLED
         serial_write_string("[FAT16-VFS] Write operation completed\n");
+    #endif
         //update node size to reflect on VFS layer
         if ((uint32_t)node->size < file_data->file.file_size) {
             node->size = file_data->file.file_size;

@@ -4,6 +4,7 @@
 #include "fat16_vfs.h"
 #include "devfs.h"
 #include "procfs.h"
+#include "tmpfs.h"
 
 static void fs_debug(const char* msg) {
 #if (LOG_VFS) || (DEBUG_ENABLED)
@@ -97,6 +98,15 @@ int fs_vfs_init(void) {
         ok = 1;
     } else {
         fs_debug("Failed to register ProcFS with VFS");
+    }
+
+    //initialize and register TmpFS
+    if (tmpfs_init() == 0) {
+        fs_debug("TmpFS initialized");
+        //tmpfs uses a different registration model (direct mount)
+        ok = 1;
+    } else {
+        fs_debug("Failed to initialize TmpFS");
     }
 
     return ok ? 0 : -1;

@@ -20,6 +20,10 @@ int main(int argc, char** argv, char** envp) {
     if (mount("none", "/proc", "procfs") != 0) {
         puts1("[init] mount procfs failed\n");
     }
+    puts1("[init] mounting tmpfs -> /tmp\n");
+    if (mount("none", "/tmp", "tmpfs") != 0) {
+        puts1("[init] mount tmpfs failed\n");
+    }
 
     //reap children and ensure a shell exists
     for (;;) {

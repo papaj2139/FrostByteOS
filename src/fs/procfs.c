@@ -88,7 +88,10 @@ static int procfs_open(vfs_node_t* node, uint32_t flags) {
 static void cpuid_ex(uint32_t leaf, uint32_t subleaf, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
     uint32_t _a=0,_b=0,_c=0,_d=0;
     __asm__ volatile ("cpuid" : "=a"(_a), "=b"(_b), "=c"(_c), "=d"(_d) : "a"(leaf), "c"(subleaf));
-    if (a) *a=_a; if (b) *b=_b; if (c) *c=_c; if (d) *d=_d;
+    if (a) *a=_a;
+    if (b) *b=_b;
+    if (c) *c=_c;
+    if (d) *d=_d;
 }
 
 //trim to token lowercase
@@ -180,7 +183,7 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
         //find first token
         char* t0 = s;
         while (*s && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') s++;
-        char c0 = *s; *s = '\0';
+        *s = '\0';
         s++;
         if (strcmp(t0, "rate") == 0) {
             //parse integer
@@ -501,7 +504,7 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
                 //query ATA device info via helper
                 extern int ata_query_device_info(device_t* dev, uint64_t* start_lba, uint64_t* sectors, int* is_part);
                 uint64_t start = 0, secs = 0; int is_part = 0;
-                if (ata_query_device_info && ata_query_device_info(dev, &start, &secs, &is_part) == 0) {
+                if (ata_query_device_info(dev, &start, &secs, &is_part) == 0) {
                     //compute 1K blocks
                     uint64_t blocks = secs / 2ull;
                     //fake major=8 minor increments for display purposes
@@ -521,7 +524,6 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
             ((uint32_t*)vendor)[1] = d;
             ((uint32_t*)vendor)[2] = c;
             vendor[12] = '\0';
-            uint32_t max_basic = a;
 
             cpuid_ex(1, 0, &a, &b, &c, &d);
             uint32_t stepping = a & 0xF;

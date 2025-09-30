@@ -93,10 +93,6 @@ static int dsp_reset(void) {
     return (v == 0xAA) ? 0 : -1;
 }
 
-static void mixer_write(uint8_t reg, uint8_t val) {
-    outb(g_sb_base + MIXER_ADDR_OFF, reg);
-    outb(g_sb_base + MIXER_DATA_OFF, val);
-}
 static uint8_t mixer_read(uint8_t reg) {
     outb(g_sb_base + MIXER_ADDR_OFF, reg);
     return inb(g_sb_base + MIXER_DATA_OFF);

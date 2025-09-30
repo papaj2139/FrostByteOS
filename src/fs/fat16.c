@@ -1087,8 +1087,10 @@ int fat16_write_file(fat16_file_t* file, const void* buffer, uint32_t size) {
 
 int fat16_create_file(fat16_fs_t* fs, const char* filename) {
     fat16_debug("Attempting to create file:");
+    #if DEBUG_ENABLED
     serial_write_string(filename);
     serial_write_string("\n");
+    #endif
 
     //check if file already exists
     fat16_dir_entry_t existing_entry;

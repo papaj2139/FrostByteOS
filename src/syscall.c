@@ -409,6 +409,14 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_fchmod((int32_t)arg1, (int32_t)arg2);
         case SYS_FCHOWN:
             return sys_fchown((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_RENAME:
+            return sys_rename((const char*)arg1, (const char*)arg2);
+        case SYS_DUP:
+            return sys_dup((int32_t)arg1);
+        case SYS_DUP2:
+            return sys_dup2((int32_t)arg1, (int32_t)arg2);
+        case SYS_PIPE:
+            return sys_pipe((int32_t*)arg1);
         default:
             print("Unknown syscall\n", 0x0F);
             return -1; //ENOSYS = Function not implemented
@@ -440,8 +448,11 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     if (!buf || count == 0) return 0;
     if (!user_range_ok(buf, count, 0)) return -1;
 
-    if (fd == 1 || fd == 2) {
-        //route stdout/stderr to controlling TTY device
+    //special handling for stdout/stderr ONLY if they're not redirected
+    //if fd 1 or 2 has been dup2'd to a filewe should use the file
+    vfs_file_t* maybe_file = fd_get(fd);
+    if ((fd == 1 || fd == 2) && !maybe_file) {
+        //fd 1/2 not redirected, write to TTY
         process_t* curp = process_get_current();
         device_t* dev = (curp) ? curp->tty : NULL;
         int32_t rc;
@@ -452,12 +463,12 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
             int written = tty_write(buf, count);
             rc = (written < 0) ? written : (int32_t)count;
         }
-        //deliver any pending signals for the current process
         signal_check_current();
         return rc;
     }
 
-    vfs_file_t* file = fd_get(fd);
+    //reuse maybe_file if already fetched otherwise get it
+    vfs_file_t* file = maybe_file ? maybe_file : fd_get(fd);
     if (!file) {
         #if LOG_SYSCALL
         serial_write_string("[SYSCALL] Invalid file descriptor\n");
@@ -1709,4 +1720,89 @@ static int32_t sys_mmap_ex(void* uargs_ptr) {
         copied += (uint32_t)r;
     }
     return (int32_t)start;
+}
+
+int32_t sys_rename(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -1;
+
+    char old_abs[VFS_MAX_PATH];
+    char new_abs[VFS_MAX_PATH];
+    if (normalize_user_path(oldpath, old_abs, sizeof(old_abs)) != 0) return -1;
+    if (normalize_user_path(newpath, new_abs, sizeof(new_abs)) != 0) return -1;
+
+    //read old file, create new file, write data, delete old
+    //this is not atomic but works for basic rename functionality
+    vfs_node_t* old_node = vfs_open(old_abs, VFS_FLAG_READ);
+    if (!old_node) return -1;
+
+    //allocate buffer for file content
+    uint32_t size = old_node->size;
+    char* buffer = (char*)kmalloc(size + 1);
+    if (!buffer) {
+        vfs_close(old_node);
+        return -1;
+    }
+
+    //read old file content
+    int r = vfs_read(old_node, 0, size, buffer);
+    vfs_close(old_node);
+    if (r < 0 || (uint32_t)r != size) {
+        kfree(buffer);
+        return -1;
+    }
+
+    //create new file and write content
+    if (vfs_create(new_abs, VFS_FLAG_WRITE) != 0) {
+        kfree(buffer);
+        return -1;
+    }
+
+    vfs_node_t* new_node = vfs_open(new_abs, VFS_FLAG_WRITE);
+    if (!new_node) {
+        kfree(buffer);
+        return -1;
+    }
+
+    int w = vfs_write(new_node, 0, size, buffer);
+    vfs_close(new_node);
+    kfree(buffer);
+
+    if (w < 0 || (uint32_t)w != size) {
+        vfs_unlink(new_abs); //cleanup
+        return -1;
+    }
+
+    //delete old file
+    if (vfs_unlink(old_abs) != 0) {
+        //old file deletion failed but new file exists - partial success
+        return -1;
+    }
+
+    return 0;
+}
+
+int32_t sys_dup(int32_t fd) {
+    return fd_dup(fd);
+}
+
+int32_t sys_dup2(int32_t oldfd, int32_t newfd) {
+    return fd_dup2(oldfd, newfd);
+}
+
+int32_t sys_pipe(int32_t* pipefd) {
+    if (!pipefd) return -1;
+    if (!user_range_ok(pipefd, sizeof(int32_t) * 2, 1)) return -1;
+
+    int32_t kpipefd[2];
+    int r = fd_pipe(kpipefd);
+    if (r != 0) return r;
+
+    if (copy_to_user(pipefd, kpipefd, sizeof(int32_t) * 2) != 0) {
+        //failed to copy to user close the pipes
+        fd_close(kpipefd[0]);
+        fd_close(kpipefd[1]);
+        return -1;
+    }
+
+    return 0;
 }

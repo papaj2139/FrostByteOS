@@ -1,6 +1,7 @@
 #include "fd.h"
 #include "fs/vfs.h"
 #include "process.h"
+#include "mm/heap.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -153,4 +154,185 @@ void fd_close_all_for(process_t* proc) {
             of_drop(of_idx);
         }
     }
+}
+
+int32_t fd_dup(int32_t oldfd) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    int n = (int)(sizeof(cur->fd_table)/sizeof(cur->fd_table[0]));
+    if (oldfd < 0 || oldfd >= n) return -1;
+    int of_idx = cur->fd_table[oldfd];
+    if (of_idx < 0) return -1; //oldfd not open
+    //find a new fd slot
+    int newfd = find_free_fd_slot(cur);
+    if (newfd < 0) return -1;
+    //point newfd to the same open-file and increment ref count
+    cur->fd_table[newfd] = of_idx;
+    if (of_idx >= 0 && of_idx < MAX_OPEN_FILES && open_files[of_idx].node) {
+        open_files[of_idx].ref_count++;
+    }
+    return newfd;
+}
+
+int32_t fd_dup2(int32_t oldfd, int32_t newfd) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    int n = (int)(sizeof(cur->fd_table)/sizeof(cur->fd_table[0]));
+    if (oldfd < 0 || oldfd >= n) return -1;
+    if (newfd < 0 || newfd >= n) return -1;
+    int of_idx = cur->fd_table[oldfd];
+    if (of_idx < 0) return -1; //oldfd not open
+    //if oldfd == newfd return newfd without doing anything (POSIX behavior)
+    if (oldfd == newfd) return newfd;
+    //close newfd if it's currently open
+    if (cur->fd_table[newfd] >= 0) {
+        fd_close(newfd);
+    }
+    //point newfd to the same open-file and increment ref count
+    cur->fd_table[newfd] = of_idx;
+    if (of_idx >= 0 && of_idx < MAX_OPEN_FILES && open_files[of_idx].node) {
+        open_files[of_idx].ref_count++;
+    }
+    return newfd;
+}
+
+//pipe implementation - simple ring buffer
+#define PIPE_BUF_SIZE 4096
+
+typedef struct {
+    char buffer[PIPE_BUF_SIZE];
+    uint32_t read_pos;
+    uint32_t write_pos;
+    uint32_t count; //number of bytes in pipe
+    int write_end_open; //1 if write end is still open
+    int read_end_open;  //1 if read end is still open
+} pipe_t;
+
+//allocate a pipe buffer
+static pipe_t* pipe_alloc(void) {
+    pipe_t* p = (pipe_t*)kmalloc(sizeof(pipe_t));
+    if (!p) return NULL;
+    memset(p->buffer, 0, PIPE_BUF_SIZE);
+    p->read_pos = 0;
+    p->write_pos = 0;
+    p->count = 0;
+    p->write_end_open = 1;
+    p->read_end_open = 1;
+    return p;
+}
+
+//pipe read operation
+static int pipe_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer) {
+    (void)offset; //pipes don't use offset
+    if (!node || !node->private_data || !buffer) return -1;
+    pipe_t* pipe = (pipe_t*)node->private_data;
+    if (size == 0) return 0;
+    //if pipe is empty and write end is closed return EOF
+    if (pipe->count == 0 && !pipe->write_end_open) return 0;
+    //if pipe is empty but write end is open block (for now return 0 blocking would require scheduler support)
+    if (pipe->count == 0) return 0;
+    //read available bytes
+    uint32_t to_read = size < pipe->count ? size : pipe->count;
+    for (uint32_t i = 0; i < to_read; i++) {
+        buffer[i] = pipe->buffer[pipe->read_pos];
+        pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUF_SIZE;
+        pipe->count--;
+    }
+    return (int)to_read;
+}
+
+//pipe write operation
+static int pipe_write(vfs_node_t* node, uint32_t offset, uint32_t size, const char* buffer) {
+    (void)offset;
+    if (!node || !node->private_data || !buffer) return -1;
+    pipe_t* pipe = (pipe_t*)node->private_data;
+    if (size == 0) return 0;
+    //if read end is closed return error (EPIPE)
+    if (!pipe->read_end_open) return -1;
+    //write as much as we can fit
+    uint32_t space = PIPE_BUF_SIZE - pipe->count;
+    uint32_t to_write = size < space ? size : space;
+    for (uint32_t i = 0; i < to_write; i++) {
+        pipe->buffer[pipe->write_pos] = buffer[i];
+        pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUF_SIZE;
+        pipe->count++;
+    }
+    return (int)to_write;
+}
+
+//pipe close operation
+static int pipe_close(vfs_node_t* node) {
+    if (!node || !node->private_data) return -1;
+    pipe_t* pipe = (pipe_t*)node->private_data;
+    //determine if this is read or write end based on flags
+    if (node->flags & VFS_FLAG_READ) {
+        pipe->read_end_open = 0;
+    }
+    if (node->flags & VFS_FLAG_WRITE) {
+        pipe->write_end_open = 0;
+    }
+    //if both ends are closed, free the pipe
+    if (!pipe->read_end_open && !pipe->write_end_open) {
+        kfree(pipe);
+        node->private_data = NULL;
+    }
+    return 0;
+}
+
+static vfs_operations_t pipe_ops = {
+    .open = NULL,
+    .close = pipe_close,
+    .read = pipe_read,
+    .write = pipe_write,
+    .create = NULL,
+    .unlink = NULL,
+    .mkdir = NULL,
+    .rmdir = NULL,
+    .readdir = NULL,
+    .finddir = NULL,
+    .get_size = NULL,
+    .ioctl = NULL,
+    .readlink = NULL,
+    .symlink = NULL,
+    .link = NULL,
+};
+
+int32_t fd_pipe(int32_t pipefd[2]) {
+    process_t* cur = process_get_current();
+    if (!cur || !pipefd) return -1;
+    //allocate pipe buffer
+    pipe_t* pipe = pipe_alloc();
+    if (!pipe) return -1;
+    //create two VFS nodes for read and write ends
+    vfs_node_t* read_node = vfs_create_node("pipe_r", VFS_FILE_TYPE_DEVICE, VFS_FLAG_READ);
+    vfs_node_t* write_node = vfs_create_node("pipe_w", VFS_FILE_TYPE_DEVICE, VFS_FLAG_WRITE);
+    if (!read_node || !write_node) {
+        if (read_node) vfs_destroy_node(read_node);
+        if (write_node) vfs_destroy_node(write_node);
+        kfree(pipe);
+        return -1;
+    }
+    //set up operations and share the same pipe buffer
+    read_node->ops = &pipe_ops;
+    read_node->private_data = pipe;
+    write_node->ops = &pipe_ops;
+    write_node->private_data = pipe;
+    //allocate file descriptors
+    int read_fd = fd_alloc(read_node, VFS_FLAG_READ);
+    if (read_fd < 0) {
+        vfs_destroy_node(read_node);
+        vfs_destroy_node(write_node);
+        kfree(pipe);
+        return -1;
+    }
+    int write_fd = fd_alloc(write_node, VFS_FLAG_WRITE);
+    if (write_fd < 0) {
+        fd_close(read_fd);
+        vfs_destroy_node(write_node);
+        kfree(pipe);
+        return -1;
+    }
+    pipefd[0] = read_fd;
+    pipefd[1] = write_fd;
+    return 0;
 }

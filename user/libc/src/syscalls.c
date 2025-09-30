@@ -61,6 +61,10 @@ static volatile int __dtors_ran = 0;
 #define SYS_FCHMOD         1049
 #define SYS_FCHOWN         1050
 #define SYS_MMAP_EX        1051
+#define SYS_RENAME         1052
+#define SYS_DUP            1053
+#define SYS_DUP2           1054
+#define SYS_PIPE           1055
 
 typedef struct {
     int tv_sec;
@@ -359,4 +363,20 @@ int fchmod(int fd, int mode) {
 
 int fchown(int fd, int uid, int gid) {
     return __fixret(syscall3(SYS_FCHOWN, fd, uid, gid));
+}
+
+int rename(const char* oldpath, const char* newpath) {
+    return __fixret(syscall2(SYS_RENAME, (int)oldpath, (int)newpath));
+}
+
+int dup(int fd) {
+    return __fixret(syscall1(SYS_DUP, fd));
+}
+
+int dup2(int oldfd, int newfd) {
+    return __fixret(syscall2(SYS_DUP2, oldfd, newfd));
+}
+
+int pipe(int pipefd[2]) {
+    return __fixret(syscall1(SYS_PIPE, (int)pipefd));
 }

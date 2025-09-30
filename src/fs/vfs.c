@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include "../libc/stdlib.h"
 #include "../mm/heap.h"
+#include "tmpfs.h"
 
 //toggle to disable strict permission enforcement
 #ifndef VFS_ENFORCE_PERMS
@@ -396,7 +397,8 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
 
     //find filesystem type
     vfs_fs_type_t* fs_type_entry = vfs_find_fs_type(fs_type);
-    if (!fs_type_entry) {
+    int is_tmpfs = (strcmp(fs_type, "tmpfs") == 0);
+    if (!fs_type_entry && !is_tmpfs) {
         vfs_debug("Unknown filesystem type");
         return -1;
     }
@@ -443,21 +445,32 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
     }
 
     //create root node for this filesystem
-    //virtual filesystems (no backing device) are read-only by default
-    uint32_t root_flags = use_physical_fs ? (VFS_FLAG_READ | VFS_FLAG_WRITE) : VFS_FLAG_READ;
-    mount->root = vfs_create_node(mount_point, VFS_FILE_TYPE_DIRECTORY, root_flags);
-    if (!mount->root) {
-        if (fs) kfree(fs);
-        kfree(mount);
-        vfs_debug("Failed to create root node");
-        return -1;
-    }
+    //tmpfs gets its own root node from tmpfs_get_root()
+    if (is_tmpfs) {
+        mount->root = tmpfs_get_root();
+        if (!mount->root) {
+            kfree(mount);
+            vfs_debug("Failed to get tmpfs root");
+            return -1;
+        }
+        mount->root->mount = mount;
+    } else {
+        //virtual filesystems (no backing device) are read-only by default
+        uint32_t root_flags = use_physical_fs ? (VFS_FLAG_READ | VFS_FLAG_WRITE) : VFS_FLAG_READ;
+        mount->root = vfs_create_node(mount_point, VFS_FILE_TYPE_DIRECTORY, root_flags);
+        if (!mount->root) {
+            if (fs) kfree(fs);
+            kfree(mount);
+            vfs_debug("Failed to create root node");
+            return -1;
+        }
 
-    //set up the node with filesystem operations
-    mount->root->ops = fs_type_entry->ops;
-    mount->root->device = dev;
-    mount->root->private_data = use_physical_fs ? (void*)fs : NULL;
-    mount->root->mount = mount;
+        //set up the node with filesystem operations
+        mount->root->ops = fs_type_entry->ops;
+        mount->root->device = dev;
+        mount->root->private_data = use_physical_fs ? (void*)fs : NULL;
+        mount->root->mount = mount;
+    }
     //store device for physical FS NULL for virtual
     mount->mount_device = use_physical_fs ? dev : NULL;
     //keep a copy at the mount level so we can free it on unmount even if

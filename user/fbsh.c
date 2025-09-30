@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <tty.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 static void print(const char* s) {
     fputs(1, s);
@@ -22,6 +23,58 @@ static void chomp(char* b, int n) {
     }
 }
 
+//parse a command line handling >, <, | operators
+//returns number of tokens modifies s in place
+//sets redirect_in redirect_out if found returns pipe position or -1
+static int parse_command(char* s, char** argv, int max, char** redirect_in, char** redirect_out, int* append_mode) {
+    int argc = 0;
+    *redirect_in = NULL;
+    *redirect_out = NULL;
+    *append_mode = 0;
+
+    while (*s && *s <= ' ') s++;
+
+    while (*s && argc < max - 1) {
+        //check for redirection operators
+        if (*s == '>') {
+            *s++ = '\0';
+            if (*s == '>') {
+                *append_mode = 1;
+                s++;
+            }
+            while (*s && *s <= ' ') s++;
+            *redirect_out = s;
+            //find end of filename
+            while (*s && *s > ' ' && *s != '>' && *s != '<' && *s != '|') s++;
+            if (*s) *s++ = '\0';
+            continue;
+        }
+        if (*s == '<') {
+            *s++ = '\0';
+            while (*s && *s <= ' ') s++;
+            *redirect_in = s;
+            while (*s && *s > ' ' && *s != '>' && *s != '<' && *s != '|') s++;
+            if (*s) *s++ = '\0';
+            continue;
+        }
+        if (*s == '|') {
+            //pipe found - don't consume it just return
+            argv[argc] = NULL;
+            return argc;
+        }
+
+        //regular token
+        argv[argc++] = s;
+        while (*s && *s > ' ' && *s != '>' && *s != '<' && *s != '|') s++;
+        if (!*s) break;
+        if (*s == '>' || *s == '<' || *s == '|') continue;
+        *s++ = '\0';
+        while (*s && *s <= ' ') s++;
+    }
+    argv[argc] = NULL;
+    return argc;
+}
+
 static int split_args(char* s, char** argv, int max)
 {
     int argc = 0;
@@ -39,96 +92,203 @@ static int split_args(char* s, char** argv, int max)
     return argc;
 }
 
-static int run_command(char** prog_argv, char** envp)
-{
-    if (!prog_argv || !prog_argv[0]) return -1;
-    const char* cmd = prog_argv[0];
-    static char path[128];
-    //build path safely without relying on strlen/strchr
+//build full path from command name
+static void build_path(const char* cmd, char* path, int pathsize) {
     path[0] = '\0';
-    if (cmd && cmd[0]) {
-        int has_slash = 0;
-        for (const char* t = cmd; *t; ++t) {
-            if (*t == '/') {
-                has_slash = 1;
-                break;
-            }
+    if (!cmd || !cmd[0]) return;
+
+    int has_slash = 0;
+    for (const char* t = cmd; *t; ++t) {
+        if (*t == '/') {
+            has_slash = 1;
+            break;
         }
-        char* p = path;
-        if (!has_slash && cmd[0] != '/') {
-            const char* pref = "/bin/";
-            for (const char* q = pref; *q && (p - path) < (int)sizeof(path) - 1; ++q) {
-                *p++ = *q;
-            }
-        }
-        for (const char* q = cmd; *q && (p - path) < (int)sizeof(path) - 1; ++q) {
+    }
+
+    char* p = path;
+    if (!has_slash && cmd[0] != '/') {
+        const char* pref = "/bin/";
+        for (const char* q = pref; *q && (p - path) < pathsize - 1; ++q) {
             *p++ = *q;
         }
-        *p = '\0';
     }
+    for (const char* q = cmd; *q && (p - path) < pathsize - 1; ++q) {
+        *p++ = *q;
+    }
+    *p = '\0';
+}
+
+//execute command with optional redirection
+static int exec_simple_command(char** argv, char** envp, char* redir_in, char* redir_out, int append) {
+    if (!argv || !argv[0]) return -1;
+
+    char path[128];
+    build_path(argv[0], path, sizeof(path));
     if (path[0] == '\0') {
         print("invalid command\n");
         return -1;
     }
-
-    //ake a stable snapshot of argv so we don't depend on caller stack buffer
-    static char* argv_copy[16];
-    static char argv_buf[256];
-    int copy_ac = 0;
-    char* wp = argv_buf; int left = (int)sizeof(argv_buf);
-    for (int i = 0; prog_argv[i] && i < 16; i++) {
-        const char* src = prog_argv[i];
-        int len = 0; while (src[len] && len < left - 1) len++;
-        if (left <= 1) break;
-        //copy and advance
-        for (int k = 0; k < len; k++) wp[k] = src[k];
-        wp[len] = '\0';
-        argv_copy[i] = wp;
-        wp += len + 1; left -= (len + 1);
-        copy_ac++;
-    }
-    if (copy_ac < 16) argv_copy[copy_ac] = 0; else argv_copy[15] = 0;
-
-    //ready to execute resolved path
 
     int pid = fork();
     if (pid < 0) {
         print("fork failed\n");
         return -1;
     }
+
     if (pid == 0) {
-        //child: build a stable argv vector: argv[0] = path then user args from snapshot argv_copy[1..]
-        static char* exargv[16];
-        int xi = 0;
-        exargv[xi++] = (char*)path;
-        for (int j = 1; argv_copy[j] && xi < 15; j++) {
-            exargv[xi++] = argv_copy[j];
+        //child handle redirections
+        if (redir_in) {
+            int fd = open(redir_in, 0); //O_RDONLY
+            if (fd < 0) {
+                print("Cannot open input file: ");
+                print(redir_in);
+                print("\n");
+                _exit(1);
+            }
+            dup2(fd, 0);
+            close(fd);
         }
-        exargv[xi] = 0;
-        execve(path, exargv, envp);
+
+        if (redir_out) {
+            //for output redirection delete existing file first then create
+            unlink(redir_out); //ignore error if file doesn't exist
+            int fd = creat(redir_out, 0644);
+            if (fd < 0) {
+                print("Cannot create output file: ");
+                print(redir_out);
+                print("\n");
+                _exit(1);
+            }
+            dup2(fd, 1);
+            close(fd);
+        }
+
+        //exec
+        argv[0] = path;
+        execve(path, argv, envp);
         print("exec failed: ");
         print(path);
         print("\n");
         _exit(127);
     }
-    //parent wait
+
+    //parent wait (no status output for redirected commands)
     int status = 0;
     wait(&status);
-    //decode and print child status
-    if (WIFEXITED(status)) {
-        print("[status] exit ");
-        print_dec(WEXITSTATUS(status));
-        print("\n");
-    } else if (WIFSIGNALED(status)) {
-        print("[status] signaled ");
-        print_dec(WTERMSIG(status));
-        print("\n");
-    } else {
-        print("[status] unknown ");
-        print_dec(status);
-        print("\n");
-    }
     return status;
+}
+
+//execute pipeline: cmd1 | cmd2 | cmd3 ...
+static int run_pipeline(char* cmdline, char** envp) {
+    //count pipes
+    int pipe_count = 0;
+    for (char* p = cmdline; *p; p++) {
+        if (*p == '|') pipe_count++;
+    }
+
+    if (pipe_count == 0) {
+        //no pipes simple command with possible redirection
+        char* argv[16];
+        char* redir_in = NULL;
+        char* redir_out = NULL;
+        int append = 0;
+        int argc = parse_command(cmdline, argv, 16, &redir_in, &redir_out, &append);
+        if (argc <= 0) return -1;
+        return exec_simple_command(argv, envp, redir_in, redir_out, append);
+    }
+
+    //pipeline: split by |
+    char* commands[8];
+    int cmd_count = 0;
+    commands[cmd_count++] = cmdline;
+
+    for (char* p = cmdline; *p && cmd_count < 8; p++) {
+        if (*p == '|') {
+            *p = '\0';
+            p++;
+            while (*p && *p <= ' ') p++;
+            if (*p) commands[cmd_count++] = p;
+            p--; //will be incremented by loop
+        }
+    }
+
+    int pipefd[2];
+    int prev_read = -1;
+
+    for (int i = 0; i < cmd_count; i++) {
+        //parse this command
+        char* argv[16];
+        char* redir_in = NULL;
+        char* redir_out = NULL;
+        int append = 0;
+        int argc = parse_command(commands[i], argv, 16, &redir_in, &redir_out, &append);
+        if (argc <= 0) continue;
+
+        //create pipe for all but last command
+        int need_pipe = (i < cmd_count - 1);
+        if (need_pipe) {
+            if (pipe(pipefd) != 0) {
+                print("pipe() failed\n");
+                return -1;
+            }
+        }
+
+        int pid = fork();
+        if (pid < 0) {
+            print("fork failed\n");
+            return -1;
+        }
+
+        if (pid == 0) {
+            //child
+            //redirect input from previous pipe
+            if (prev_read != -1) {
+                dup2(prev_read, 0);
+                close(prev_read);
+            } else if (redir_in) {
+                int fd = open(redir_in, 0);
+                if (fd >= 0) {
+                    dup2(fd, 0);
+                    close(fd);
+                }
+            }
+
+            //redirect output to next pipe or file
+            if (need_pipe) {
+                close(pipefd[0]); //close read end
+                dup2(pipefd[1], 1);
+                close(pipefd[1]);
+            } else if (redir_out) {
+                if (!append) unlink(redir_out); //delete existing for truncate
+                int fd = creat(redir_out, 0644);
+                if (fd >= 0) {
+                    dup2(fd, 1);
+                    close(fd);
+                }
+            }
+
+            //exec
+            char path[128];
+            build_path(argv[0], path, sizeof(path));
+            argv[0] = path;
+            execve(path, argv, envp);
+            _exit(127);
+        }
+
+        //parent
+        if (prev_read != -1) close(prev_read);
+        if (need_pipe) {
+            close(pipefd[1]); //close write end
+            prev_read = pipefd[0]; //save read end for next command
+        }
+    }
+
+    //wait for all children
+    for (int i = 0; i < cmd_count; i++) {
+        wait(NULL);
+    }
+
+    return 0;
 }
 
 int main(int argc, char** argv, char** envp) {
@@ -184,12 +344,14 @@ int main(int argc, char** argv, char** envp) {
             continue;
         }
 
-        //tokenize
-        char* av[16];
-        int ac = split_args(s, av, 16);
-        if (ac <= 0) continue;
+        //check for built-in commands first
+        char* first_word = s;
+        while (*first_word && *first_word <= ' ') first_word++;
+        char* space = first_word;
+        while (*space && *space > ' ') space++;
+        int cmd_len = space - first_word;
 
-        if (strcmp(av[0], "pwd") == 0) {
+        if (cmd_len == 3 && strncmp(first_word, "pwd", 3) == 0) {
             char cwdbuf[256];
             if (getcwd(cwdbuf, sizeof(cwdbuf))) {
                 print(cwdbuf); print("\n");
@@ -198,15 +360,22 @@ int main(int argc, char** argv, char** envp) {
             }
             continue;
         }
-        if (strcmp(av[0], "cd") == 0) {
-            const char* target = (ac > 1) ? av[1] : "/";
+
+        if (cmd_len == 2 && strncmp(first_word, "cd", 2) == 0) {
+            char* target = space;
+            while (*target && *target <= ' ') target++;
+            if (*target == 0) target = "/";
+            //null terminate target
+            char* end = target;
+            while (*end && *end > ' ') end++;
+            *end = '\0';
             if (chdir(target) != 0) {
                 print("cd: failed\n");
             }
             continue;
         }
 
-        //try to execute external command
-        run_command(av, envp);
+        //execute command with pipe/redirect support
+        run_pipeline(s, envp);
     }
 }

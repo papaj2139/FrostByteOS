@@ -3,17 +3,6 @@
 #include <stdio.h>
 #include <errno.h>
 
-static int read_n(int fd, void* buf, int n)
-{
-    char* p = (char*)buf; int got = 0;
-    while (got < n) {
-        int r = read(fd, p + got, n - got);
-        if (r <= 0) return r;
-        got += r;
-    }
-    return got;
-}
-
 static int parse_int(const char* s) {
     int v = 0;
     if (!s) return 0;

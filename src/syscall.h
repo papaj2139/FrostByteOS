@@ -56,6 +56,10 @@
 #define SYS_FCHMOD         1049
 #define SYS_FCHOWN         1050
 #define SYS_MMAP_EX        1051
+#define SYS_RENAME         1052
+#define SYS_DUP            1053
+#define SYS_DUP2           1054
+#define SYS_PIPE           1055
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -126,5 +130,9 @@ int32_t sys_chmod(const char* path, int32_t mode);
 int32_t sys_chown(const char* path, int32_t uid, int32_t gid);
 int32_t sys_fchmod(int32_t fd, int32_t mode);
 int32_t sys_fchown(int32_t fd, int32_t uid, int32_t gid);
+int32_t sys_rename(const char* oldpath, const char* newpath);
+int32_t sys_dup(int32_t fd);
+int32_t sys_dup2(int32_t oldfd, int32_t newfd);
+int32_t sys_pipe(int32_t* pipefd);
 
 #endif

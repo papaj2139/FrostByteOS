@@ -12,10 +12,16 @@ int fbcon_init(void);
 int fbcon_available(void);
 void fbcon_clear_with_attr(unsigned char attr);
 int fbcon_putchar(char c, unsigned char attr);
+//write string with ANSI escape code support
+int fbcon_write(const char* buf, uint32_t size);
 //reload PSF font from /etc/font.psf after VFS is mounted
 int fbcon_reload_font(void);
 //enable (1) or disable (0) the blinking text cursor in framebuffer console
 int fbcon_set_cursor_enabled(int enable);
+//get current cursor position
+void fbcon_get_cursor(int* x, int* y);
+//set cursor position
+void fbcon_set_cursor(int x, int y);
 
 #ifdef __cplusplus
 }
