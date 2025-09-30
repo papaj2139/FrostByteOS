@@ -52,6 +52,7 @@ make CC=i386-elf-gcc
 - Currently only supports BIOS and x86, amd64 and UEFI support will be added in the future.
 - Uses GRUB, will probably create a custom bootloader in the future.
 - Uses ELF32 for binaries
+- Forces VESA 1024x768x32 for the TTY console; will add fallback to standard VGA text mode later via kernel parameters
 
 # TODO
 - Add UEFI support
