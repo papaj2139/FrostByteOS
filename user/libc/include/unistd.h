@@ -58,6 +58,7 @@ int rmdir(const char* path);
 int creat(const char* path, int mode);
 int time(void);
 void* mmap(void* addr, size_t length, int prot, int flags);
+void* mmap_ex(void* addr, size_t length, int prot, int flags, int fd, size_t offset);
 int munmap(void* addr, size_t length);
 int chdir(const char* path);
 char* getcwd(char* buf, size_t size);

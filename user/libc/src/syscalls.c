@@ -60,6 +60,7 @@ static volatile int __dtors_ran = 0;
 #define SYS_CHOWN          1048
 #define SYS_FCHMOD         1049
 #define SYS_FCHOWN         1050
+#define SYS_MMAP_EX        1051
 
 typedef struct {
     int tv_sec;
@@ -213,6 +214,19 @@ int creat(const char* path, int mode) {
 
 void* mmap(void* addr, size_t length, int prot, int flags) {
     int r = syscall4(SYS_MMAP, (int)addr, (int)length, prot, flags);
+    if (r < 0) return (void*)-1;
+    return (void*)(uintptr_t)r;
+}
+
+void* mmap_ex(void* addr, size_t length, int prot, int flags, int fd, size_t offset) {
+    struct mmap_args { int addr, length, prot, flags, fd, offset; } args;
+    args.addr = (int)addr;
+    args.length = (int)length;
+    args.prot = prot;
+    args.flags = flags;
+    args.fd = fd;
+    args.offset = (int)offset;
+    int r = syscall1(SYS_MMAP_EX, (int)&args);
     if (r < 0) return (void*)-1;
     return (void*)(uintptr_t)r;
 }

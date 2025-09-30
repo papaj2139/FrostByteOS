@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include "../kernel/klog.h"
+#include "../kernel/cga.h"
 
 static uint16_t serial_port = SERIAL_COM1_BASE;
 static device_t g_serial_dev;
@@ -27,34 +28,34 @@ static const device_ops_t serial_ops = {
 int serial_init(void) {
     //disable all interrupts
     outb(serial_port + 1, 0x00);
-    
+
     //enable DLAB (set baud rate divisor)
     outb(SERIAL_LINE_COMMAND_PORT(serial_port), SERIAL_LINE_ENABLE_DLAB);
-    
+
     //set divisor to 3 (lo byte) 38400 baud
     outb(SERIAL_DATA_PORT(serial_port), 0x03);
-    outb(serial_port + 1, 0x00);                    
-    
+    outb(serial_port + 1, 0x00);
+
     //8 bits, no parity, one stop bit
     outb(SERIAL_LINE_COMMAND_PORT(serial_port), 0x03);
-    
+
     //enable FIFO, clear them, with 14-byte threshold
     outb(SERIAL_FIFO_COMMAND_PORT(serial_port), 0xC7);
-    
+
     //IRQs enabled, RTS/DSR set (preperation for adding interrupts later)
     outb(SERIAL_MODEM_COMMAND_PORT(serial_port), 0x0B);
-    
+
     //set in loopback mode, test the serial chip
     outb(SERIAL_MODEM_COMMAND_PORT(serial_port), 0x1E);
-    
+
     //test serial chip (send byte 0xAE and check if serial returns same byte)
     outb(SERIAL_DATA_PORT(serial_port), 0xAE);
-    
+
     //check if serial is faulty
     if(inb(SERIAL_DATA_PORT(serial_port)) != 0xAE) {
         return 1; //faulty
     }
-    
+
     //if serial is not faulty set it in normal operation mode
     outb(SERIAL_MODEM_COMMAND_PORT(serial_port), 0x0F);
     return 0; //serial working
@@ -73,10 +74,12 @@ static inline int serial_is_receive_ready(uint16_t com) {
 void serial_write_char(char c) {
     //wait for transmit to be ready
     while (serial_is_transmit_fifo_empty(serial_port) == 0);
-    
+
     //send the character
     outb(SERIAL_DATA_PORT(serial_port), c);
 }
+
+extern int g_console_quiet;
 
 void serial_write_string(const char* str) {
     if (!str) return;
@@ -87,30 +90,35 @@ void serial_write_string(const char* str) {
     }
     //mirror into kernel log
     klog_write(p, n);
+    //optionally mirror to on-screen console unless quiet
+    if (!g_console_quiet) {
+        //print tolerates inline newlines color white
+        print((char*)p, 0x0F);
+    }
 }
 
 void serial_printf(const char* format, ...) {
     va_list args;
     va_start(args, format);
-    
+
     char buffer[1024];
     int pos = 0;
-    
+
     while (*format && pos < (int)(sizeof(buffer) - 1)) {
         if (*format == '%' && *(format + 1)) {
             format++; //skip %
-            
+
             switch (*format) {
                 case 'd': {
                     int val = va_arg(args, int);
                     char num_str[32];
                     int num_pos = 0;
-                    
+
                     if (val < 0) {
                         buffer[pos++] = '-';
                         val = -val;
                     }
-                    
+
                     if (val == 0) {
                         buffer[pos++] = '0';
                     } else {
@@ -131,7 +139,7 @@ void serial_printf(const char* format, ...) {
                     char hex_chars[] = "0123456789abcdef";
                     char hex_str[16];
                     int hex_pos = 0;
-                    
+
                     if (val == 0) {
                         buffer[pos++] = '0';
                     } else {
@@ -172,10 +180,10 @@ void serial_printf(const char* format, ...) {
         }
         format++;
     }
-    
+
     buffer[pos] = '\0';
     serial_write_string(buffer);
-    
+
     va_end(args);
 }
 
@@ -200,9 +208,9 @@ static int serial_dev_write(struct device* d, uint32_t off, const void* buf, uin
     for (uint32_t i = 0; i < sz; i++) serial_write_char(p[i]);
     return (int)sz;
 }
-static int serial_dev_ioctl(struct device* d, uint32_t cmd, void* arg) { 
-    (void)d; (void)cmd; (void)arg; 
-    return -1; 
+static int serial_dev_ioctl(struct device* d, uint32_t cmd, void* arg) {
+    (void)d; (void)cmd; (void)arg;
+    return -1;
 }
 static void serial_dev_cleanup(struct device* d) { (void)d; }
 
@@ -214,9 +222,9 @@ int serial_register_device(void) {
     g_serial_dev.status = DEVICE_STATUS_UNINITIALIZED;
     g_serial_dev.ops = &serial_ops;
     if (device_register(&g_serial_dev) != 0) return -1;
-    if (device_init(&g_serial_dev) != 0) { 
-        device_unregister(g_serial_dev.device_id); 
-        return -1; 
+    if (device_init(&g_serial_dev) != 0) {
+        device_unregister(g_serial_dev.device_id);
+        return -1;
     }
     g_serial_dev.status = DEVICE_STATUS_READY;
     return 0;

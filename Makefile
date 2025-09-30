@@ -21,9 +21,6 @@ boot.o: src/boot.asm
 kernel.o: src/kernel.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-desktop.o: src/desktop.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
 string.o: src/libc/string.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -67,6 +64,12 @@ vga.o: src/gui/vga.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 vga_dev.o: src/drivers/vga_dev.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+fb.o: src/drivers/fb.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+fbcon.o: src/drivers/fbcon.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 idt.o: src/interrupts/idt.c
@@ -147,7 +150,6 @@ user/libc/errno.o: user/libc/src/errno.c
 user/libc/signal.o: user/libc/src/signal.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
-# PIC objects for shared libc
 user/libc/syscalls.pic.o: user/libc/src/syscalls.c
 	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
 
@@ -310,7 +312,6 @@ user/hello_dyn.o: user/hello_dyn.c
 user/hello_dyn.elf: user/hello_dyn.o user/libc/crt0.o user/libc/libc.so.1
 	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/hello_dyn.o -L user/libc -l:libc.so.1 -o $@
 
-# New small utilities
 user/uname.o: user/uname.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -365,6 +366,12 @@ user/which.o: user/which.c
 user/which.elf: user/which.o user/libc/crt0.o user/libc/libc.so.1
 	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/which.o -L user/libc -l:libc.so.1 -o $@
 
+user/clear.o: user/clear.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/clear.elf: user/clear.o user/libc/crt0.o user/libc/libc.so.1
+	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/clear.o -L user/libc -l:libc.so.1 -o $@
+
 user/vplay.o: user/vplay.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -376,6 +383,12 @@ user/sbplay.o: user/sbplay.c
 
 user/sbplay.elf: user/sbplay.o user/libc/crt0.o user/libc/libc.so.1
 	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/sbplay.o -L user/libc -l:libc.so.1 -o $@
+
+user/fbfill.o: user/fbfill.c
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+user/fbfill.elf: user/fbfill.o user/libc/crt0.o user/libc/libc.so.1
+	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/fbfill.o -L user/libc -l:libc.so.1 -o $@
 
 user/chmod.o: user/chmod.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
@@ -479,15 +492,15 @@ process.o: src/process.c
 process_asm.o: src/process_asm.asm
 	$(ASM) $(ASMFLAGS) $< -o $@
 
-$(KERNEL): boot.o kernel.o desktop.o string.o stdlib.o io.o font.o \
+$(KERNEL): boot.o kernel.o string.o stdlib.o io.o font.o \
            keyboard.o mouse.o tty.o serial.o sb16.o pc_speaker.o timer.o rtc.o ata.o \
-           vga.o vga_dev.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
+           vga.o vga_dev.o fb.o fbcon.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
            syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o devfs.o procfs.o fd.o initramfs.o initramfs_cpio.o \
            pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o \
            acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o uaccess.o elf.o dynlink.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf user/ldd.elf user/dltest.elf user/hello_dyn.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/vplay.elf user/sbplay.elf user/libc/libc.so.1
+initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf user/ldd.elf user/dltest.elf user/hello_dyn.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/clear.elf user/vplay.elf user/sbplay.elf user/fbfill.elf user/libc/libc.so.1
 	rm -rf $(INITRAMFS_DIR) initramfs.cpio
 	mkdir -p $(INITRAMFS_DIR)/bin $(INITRAMFS_DIR)/etc $(INITRAMFS_DIR)/dev $(INITRAMFS_DIR)/proc $(INITRAMFS_DIR)/mnt $(INITRAMFS_DIR)/usr/bin $(INITRAMFS_DIR)/lib
 	cp user/init.elf $(INITRAMFS_DIR)/bin/init
@@ -532,8 +545,10 @@ initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf use
 	cp user/wc.elf $(INITRAMFS_DIR)/bin/wc
 	cp user/hd.elf $(INITRAMFS_DIR)/bin/hd
 	cp user/which.elf $(INITRAMFS_DIR)/bin/which
+	cp user/clear.elf $(INITRAMFS_DIR)/bin/clear
 	cp user/vplay.elf $(INITRAMFS_DIR)/bin/vplay
 	cp user/sbplay.elf $(INITRAMFS_DIR)/bin/sbplay
+	cp user/fbfill.elf $(INITRAMFS_DIR)/bin/fbfill
 	cp user/libc/libc.so.1 $(INITRAMFS_DIR)/lib/libc.so.1
 	echo "Welcome to FrostByte (cpio initramfs)" > $(INITRAMFS_DIR)/etc/motd
 	ln -sf /etc/motd $(INITRAMFS_DIR)/motd_link

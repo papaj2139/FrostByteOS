@@ -55,6 +55,7 @@
 #define SYS_CHOWN          1048
 #define SYS_FCHMOD         1049
 #define SYS_FCHOWN         1050
+#define SYS_MMAP_EX        1051
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80

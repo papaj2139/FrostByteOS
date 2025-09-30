@@ -49,4 +49,19 @@ int keyboard_device_write(device_t* device, uint32_t offset, const void* buffer,
 int keyboard_device_ioctl(device_t* device, uint32_t cmd, void* arg);
 void keyboard_device_cleanup(device_t* device);
 
+//input event for /dev/input/kbd0
+//type: 1=press, 0=release, 2=repeat
+//code: ASCII in low 8-bit for printable keys extended keys as 0xE0xx
+//time_ms: milliseconds since boot (approx)
+typedef struct {
+    uint32_t time_ms;
+    uint16_t code;
+    uint8_t type;
+    uint8_t reserved;
+} kbd_input_event_t;
+
+//fill buffer with up to max_events events if blocking!=0 block until at least one event
+//returns number of events copied
+int kbd_input_read_events(kbd_input_event_t* out, uint32_t max_events, int blocking);
+
 #endif

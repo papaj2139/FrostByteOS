@@ -22,6 +22,8 @@ void move_cursor(uint16_t row, uint16_t col);
 int putchar_term(char c, unsigned char colour);
 void put_char_at(char c, uint8_t attr, int x, int y);
 uint16_t get_line_length(uint16_t row);
+//disable the VGA hardware text cursor (text mode)
+void disable_cursor(void);
 
 //helpers for text placement and screen fill
 void cga_print_at(const char* str, unsigned char attr, unsigned int x, unsigned int y);

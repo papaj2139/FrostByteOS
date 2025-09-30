@@ -4,6 +4,8 @@
 #include "../mm/heap.h"
 #include "../libc/string.h"
 #include "../kernel/klog.h"
+#include "../drivers/keyboard.h"
+#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include <stddef.h>
 
@@ -15,6 +17,9 @@ typedef enum {
     DEVFS_NODE_RANDOM,
     DEVFS_NODE_URANDOM,
     DEVFS_NODE_DEVICE, //generic device backed by device_manager
+    DEVFS_NODE_INPUT_DIR,
+    DEVFS_NODE_INPUT_KBD0,
+    DEVFS_NODE_INPUT_MOUSE,
 } devfs_node_kind_t;
 
 typedef struct {
@@ -69,6 +74,20 @@ static int devfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* bu
     devfs_priv_t* p = (devfs_priv_t*)node->private_data;
     if (!p) return -1;
     switch (p->kind) {
+        case DEVFS_NODE_INPUT_KBD0: {
+            if (size < sizeof(kbd_input_event_t)) return 0;
+            uint32_t max = size / sizeof(kbd_input_event_t);
+            int n = kbd_input_read_events((kbd_input_event_t*)buffer, max, 1);
+            if (n <= 0) return 0;
+            return n * (int)sizeof(kbd_input_event_t);
+        }
+        case DEVFS_NODE_INPUT_MOUSE: {
+            if (size < sizeof(mouse_input_event_t)) return 0;
+            uint32_t max = size / sizeof(mouse_input_event_t);
+            int n = mouse_input_read_events((mouse_input_event_t*)buffer, max, 1);
+            if (n <= 0) return 0;
+            return n * (int)sizeof(mouse_input_event_t);
+        }
         case DEVFS_NODE_NULL:
             return 0; //EOF
         case DEVFS_NODE_ZERO:
@@ -141,29 +160,29 @@ static int devfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const c
     }
 }
 
-static int devfs_create(vfs_node_t* parent, const char* name, uint32_t flags) { 
-    (void)parent; (void)name; (void)flags; 
-    return -1; 
+static int devfs_create(vfs_node_t* parent, const char* name, uint32_t flags) {
+    (void)parent; (void)name; (void)flags;
+    return -1;
 }
 
-static int devfs_unlink(vfs_node_t* node) { 
-    (void)node; 
-    return -1; 
+static int devfs_unlink(vfs_node_t* node) {
+    (void)node;
+    return -1;
 }
 
-static int devfs_mkdir(vfs_node_t* parent, const char* name, uint32_t flags) { 
-    (void)parent; (void)name; (void)flags; 
-    return -1; 
+static int devfs_mkdir(vfs_node_t* parent, const char* name, uint32_t flags) {
+    (void)parent; (void)name; (void)flags;
+    return -1;
 }
 
-static int devfs_rmdir(vfs_node_t* node) { 
-    (void)node; 
-    return -1; 
+static int devfs_rmdir(vfs_node_t* node) {
+    (void)node;
+    return -1;
 }
 
-static int devfs_get_size(vfs_node_t* node) { 
-    (void)node; 
-    return 0; 
+static int devfs_get_size(vfs_node_t* node) {
+    (void)node;
+    return 0;
 }
 
 static int devfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) {
@@ -181,9 +200,9 @@ static vfs_node_t* devfs_make_node(const char* name, uint32_t type, devfs_node_k
     n->mount = parent ? parent->mount : NULL;
     n->parent = parent;
     devfs_priv_t* p = (devfs_priv_t*)kmalloc(sizeof(devfs_priv_t));
-    if (!p) { 
-        vfs_destroy_node(n); 
-        return NULL; 
+    if (!p) {
+        vfs_destroy_node(n);
+        return NULL;
     }
     p->kind = kind; p->dev = dev;
     n->private_data = p;
@@ -192,20 +211,34 @@ static vfs_node_t* devfs_make_node(const char* name, uint32_t type, devfs_node_k
 
 static int devfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
     if (!node || !out) return -1;
+    devfs_priv_t* p = (devfs_priv_t*)node->private_data;
+    if (p && p->kind == DEVFS_NODE_INPUT_DIR) {
+        if (index == 0) {
+            *out = devfs_make_node("kbd0", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_INPUT_KBD0, NULL, node);
+            return *out ? 0 : -1;
+        }
+        if (index == 1) {
+            *out = devfs_make_node("mouse", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_INPUT_MOUSE, NULL, node);
+            return *out ? 0 : -1;
+        }
+        return -1;
+    }
     //built-ins first
-    if (index == 0) { 
-        *out = devfs_make_node("null", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_NULL, NULL, node); 
-        return *out ? 0 : -1; 
+    if (!node || !out) return -1;
+    //built-ins first
+    if (index == 0) {
+        *out = devfs_make_node("null", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_NULL, NULL, node);
+        return *out ? 0 : -1;
     }
-    if (index == 1) { 
-        *out = devfs_make_node("zero", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_ZERO, NULL, node); 
-        return *out ? 0 : -1; 
+    if (index == 1) {
+        *out = devfs_make_node("zero", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_ZERO, NULL, node);
+        return *out ? 0 : -1;
     }
-    if (index == 2) { 
-        *out = devfs_make_node("kmsg", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_KMSG, NULL, node); 
-        return *out ? 0 : -1; 
+    if (index == 2) {
+        *out = devfs_make_node("kmsg", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_KMSG, NULL, node);
+        return *out ? 0 : -1;
     }
-    if (index == 3) { 
+    if (index == 3) {
         *out = devfs_make_node("random", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_RANDOM, NULL, node);
         return *out ? 0 : -1;
     }
@@ -213,8 +246,12 @@ static int devfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
         *out = devfs_make_node("urandom", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_URANDOM, NULL, node);
         return *out ? 0 : -1;
     }
+    if (index == 5) {
+        *out = devfs_make_node("input", VFS_FILE_TYPE_DIRECTORY, DEVFS_NODE_INPUT_DIR, NULL, node);
+        return *out ? 0 : -1;
+    }
     //enumerate devices from device manager
-    uint32_t di = index - 5;
+    uint32_t di = index - 6;
     device_t* dev = NULL;
     if (device_enumerate(di, &dev) != 0 || !dev) return -1;
     *out = devfs_make_node(dev->name, VFS_FILE_TYPE_DEVICE, DEVFS_NODE_DEVICE, dev, node);
@@ -223,24 +260,41 @@ static int devfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
 
 static int devfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) {
     if (!node || !name || !out) return -1;
-    if (strcmp(name, "null") == 0) { 
-        *out = devfs_make_node("null", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_NULL, NULL, node); 
-        return *out ? 0 : -1; 
+    devfs_priv_t* p = (devfs_priv_t*)node->private_data;
+    if (p && p->kind == DEVFS_NODE_INPUT_DIR) {
+        if (strcmp(name, "kbd0") == 0) {
+            *out = devfs_make_node("kbd0", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_INPUT_KBD0, NULL, node);
+            return *out ? 0 : -1;
+        }
+        if (strcmp(name, "mouse") == 0) {
+            *out = devfs_make_node("mouse", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_INPUT_MOUSE, NULL, node);
+            return *out ? 0 : -1;
+        }
+        return -1;
     }
-    if (strcmp(name, "zero") == 0) { 
-        *out = devfs_make_node("zero", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_ZERO, NULL, node); 
+    if (!node || !name || !out) return -1;
+    if (strcmp(name, "null") == 0) {
+        *out = devfs_make_node("null", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_NULL, NULL, node);
         return *out ? 0 : -1;
     }
-    if (strcmp(name, "kmsg") == 0) { 
-        *out = devfs_make_node("kmsg", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_KMSG, NULL, node); 
-        return *out ? 0 : -1; 
+    if (strcmp(name, "zero") == 0) {
+        *out = devfs_make_node("zero", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_ZERO, NULL, node);
+        return *out ? 0 : -1;
     }
-    if (strcmp(name, "random") == 0) { 
-        *out = devfs_make_node("random", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_RANDOM, NULL, node); 
-        return *out ? 0 : -1; 
+    if (strcmp(name, "kmsg") == 0) {
+        *out = devfs_make_node("kmsg", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_KMSG, NULL, node);
+        return *out ? 0 : -1;
+    }
+    if (strcmp(name, "random") == 0) {
+        *out = devfs_make_node("random", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_RANDOM, NULL, node);
+        return *out ? 0 : -1;
     }
     if (strcmp(name, "urandom") == 0) {
         *out = devfs_make_node("urandom", VFS_FILE_TYPE_DEVICE, DEVFS_NODE_URANDOM, NULL, node);
+        return *out ? 0 : -1;
+    }
+    if (strcmp(name, "input") == 0) {
+        *out = devfs_make_node("input", VFS_FILE_TYPE_DIRECTORY, DEVFS_NODE_INPUT_DIR, NULL, node);
         return *out ? 0 : -1;
     }
     //lookup device by name

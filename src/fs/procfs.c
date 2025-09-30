@@ -8,6 +8,7 @@
 #include "../gui/vga.h"
 #include "../drivers/vga_dev.h"
 #include "../drivers/timer.h"
+#include "../drivers/sb16.h"
 #include "../kernel/kshutdown.h"
 #include "../kernel/kreboot.h"
 #include "../interrupts/irq.h"
@@ -15,6 +16,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "../drivers/sb16.h"
+#include "../kernel/cga.h"
+#include "../drivers/fbcon.h"
 
 typedef enum {
     PROCFS_NODE_ROOT = 0,
@@ -37,6 +40,8 @@ typedef enum {
     PROCFS_NODE_INTERRUPTS,
     PROCFS_NODE_PARTITIONS,
     PROCFS_NODE_SB16,
+    PROCFS_NODE_FB0,
+    PROCFS_NODE_CONSOLE,
 } procfs_node_kind_t;
 
 typedef struct {
@@ -67,6 +72,8 @@ static const procfs_root_entry_t g_procfs_root_entries[] = {
     { "rescan",  PROCFS_NODE_RESCAN,          VFS_FILE_TYPE_FILE },
     { "partitions", PROCFS_NODE_PARTITIONS,   VFS_FILE_TYPE_FILE },
     { "sb16",    PROCFS_NODE_SB16,            VFS_FILE_TYPE_FILE },
+    { "fb0",     PROCFS_NODE_FB0,             VFS_FILE_TYPE_FILE },
+    { "console", PROCFS_NODE_CONSOLE,         VFS_FILE_TYPE_FILE },
     { "self",    PROCFS_NODE_DIR_SELF,        VFS_FILE_TYPE_DIRECTORY },
 };
 
@@ -157,8 +164,7 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
         return (int)size;
     }
     if (p->kind == PROCFS_NODE_SB16) {
-        //accept commands: "rate <hz>" "speaker on" "speaker off"
-        //note: it parses up to the first whitespace-delimited token
+        //accepts rate <hz>, speaker on|off, volume <0-100>, mute on|off, pause, resume, stop
         char line[64];
         if (size >= sizeof(line)) size = sizeof(line) - 1;
         memcpy(line, buffer, size);
@@ -188,8 +194,7 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
             return sb16_set_rate((uint16_t)val) == 0 ? (int)size : -1;
         } else if (strcmp(t0, "speaker") == 0) {
             while (*s == ' ' || *s == '\t') s++;
-            char* t1 = s;
-            while (*s && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') s++;
+            char* t1 = s; while (*s && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') s++;
             char save = *s; *s = '\0';
             if (strcmp(t1, "on") == 0) {
                 sb16_speaker_on();
@@ -199,8 +204,35 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
                 sb16_speaker_off();
                 return (int)size;
             }
+            (void)save; return -1;
+        } else if (strcmp(t0, "volume") == 0) {
+            while (*s == ' ' || *s == '\t') s++;
+            int val = 0;
+            while (*s >= '0' && *s <= '9') {
+                val = val * 10 + (*s - '0');
+                s++;
+            }
+            return sb16_set_volume(val) == 0 ? (int)size : -1;
+        } else if (strcmp(t0, "mute") == 0) {
+            while (*s == ' ' || *s == '\t') s++;
+            char* t1 = s; while (*s && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') s++;
+            char save = *s; *s = '\0';
+            if (strcmp(t1, "on") == 0) {
+                sb16_set_mute(1);
+                return (int)size;
+            }
+            if (strcmp(t1, "off") == 0) {
+                sb16_set_mute(0);
+                return (int)size;
+            }
             (void)save;
             return -1;
+        } else if (strcmp(t0, "pause") == 0) {
+            sb16_pause(); return (int)size;
+        } else if (strcmp(t0, "resume") == 0) {
+            sb16_resume(); return (int)size;
+        } else if (strcmp(t0, "stop") == 0) {
+            sb16_stop(); return (int)size;
         } else {
             return -1;
         }
@@ -210,6 +242,39 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
         extern void ata_rescan_partitions(void);
         ata_rescan_partitions();
         return (int)size;
+    }
+    if (p->kind == PROCFS_NODE_CONSOLE) {
+        //supports clear, cursor on, cursor off
+        char cmd[32];
+        procfs_copy_trim_lower(cmd, sizeof(cmd), buffer, size);
+        if (cmd[0] == '\0') return 0;
+        if (strcmp(cmd, "clear") == 0) {
+            cga_clear_with_attr(0x0F);
+            return (int)size;
+        } else if (strcmp(cmd, "quiet on") == 0 || strcmp(cmd, "silence on") == 0) {
+            extern int g_console_quiet;
+            g_console_quiet = 1;
+            return (int)size;
+        } else if (strcmp(cmd, "quiet off") == 0 || strcmp(cmd, "silence off") == 0) {
+            extern int g_console_quiet;
+            g_console_quiet = 0;
+            return (int)size;
+        } else if (strcmp(cmd, "cursor off") == 0) {
+            if (fbcon_available() == 1) {
+                (void)fbcon_set_cursor_enabled(0);
+            } else {
+                disable_cursor();
+            }
+            return (int)size;
+        } else if (strcmp(cmd, "cursor on") == 0) {
+            if (fbcon_available() == 1) {
+                (void)fbcon_set_cursor_enabled(1);
+            } else {
+                enable_cursor(14, 15);
+            }
+            return (int)size;
+        }
+        return -1;
     }
     return -1;
 }
@@ -227,6 +292,7 @@ static vfs_node_t* procfs_make_node(const char* name, uint32_t type, procfs_node
     if (kind == PROCFS_NODE_VGA_CTRL || kind == PROCFS_NODE_RESCAN) flags = VFS_FLAG_WRITE; //control is write-only
     if (kind == PROCFS_NODE_POWER) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read capabilities write to control
     if (kind == PROCFS_NODE_TTY) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //read current write to switch
+    if (kind == PROCFS_NODE_CONSOLE) flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //console control
     vfs_node_t* n = vfs_create_node(name, type, flags);
     if (!n) return NULL;
     n->ops = &procfs_ops;
@@ -579,14 +645,36 @@ static int procfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* b
                              "capabilities: poweroff reboot halt\nstate: on\n");
             break;
         }
+        case PROCFS_NODE_FB0: {
+            //expose framebuffer info if present
+            extern int fb_get_info(uint8_t** out_virt, uint32_t* out_w, uint32_t* out_h, uint32_t* out_bpp, uint32_t* out_pitch);
+            uint8_t* v; uint32_t w,h,bpp,pitch;
+            if (fb_get_info(&v, &w, &h, &bpp, &pitch) == 0) {
+                len += ksnprintf(tmp + len, sizeof(tmp) - len,
+                                 "width: %u\nheight: %u\nbpp: %u\npitch: %u\n",
+                                 (unsigned)w, (unsigned)h, (unsigned)bpp, (unsigned)pitch);
+            } else {
+                len += ksnprintf(tmp + len, sizeof(tmp) - len, "unavailable\n");
+            }
+            break;
+        }
         case PROCFS_NODE_SB16: {
             uint16_t rate = sb16_get_rate();
             int spk = sb16_is_speaker_on();
             uint8_t irq = sb16_get_irq();
             uint8_t dma = sb16_get_dma8();
+            int vol = sb16_get_volume();
+            int muted = sb16_get_mute();
+            uint32_t q = sb16_get_queued();
+            uint32_t ur = sb16_get_underruns();
+            int playing = sb16_is_playing();
+            int paused = sb16_is_paused();
             len += ksnprintf(tmp + len, sizeof(tmp) - len,
-                             "rate: %u\nspeaker: %s\nirq: %u\ndma8: %u\n",
-                             (unsigned)rate, spk ? "on" : "off", (unsigned)irq, (unsigned)dma);
+                             "rate: %u\nspeaker: %s\nvolume: %d\nmute: %s\nirq: %u\ndma8: %u\nplaying: %s\npaused: %s\nqueued_bytes: %u\nunderruns: %u\nmode: mono\nbits: 8\n",
+                             (unsigned)rate, spk ? "on" : "off", vol, muted ? "on" : "off",
+                             (unsigned)irq, (unsigned)dma,
+                             playing ? "yes" : "no", paused ? "yes" : "no",
+                             (unsigned)q, (unsigned)ur);
             break;
         }
         default: return -1;

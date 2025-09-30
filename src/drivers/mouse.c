@@ -3,18 +3,45 @@
 #include "../interrupts/irq.h"
 #include "../interrupts/pic.h"
 #include "../device_manager.h"
+#include "timer.h"
 #include <string.h>
 
 //IRQ12-driven PS/2 mouse handler with packet ring buffer
-typedef struct { 
-    int8_t b[3]; 
+typedef struct {
+    int8_t b[3];
 } mouse_pkt_t;
 static volatile mouse_pkt_t pktbuf[16];
 static volatile uint8_t pkt_head = 0, pkt_tail = 0;
 
-static inline int pkt_empty(void) { 
-    return pkt_head == pkt_tail; 
+///dev/input/mouse event queue
+#define MOUSE_IEV_CAP 128
+static volatile mouse_input_event_t ievq[MOUSE_IEV_CAP];
+static volatile uint8_t iev_head = 0, iev_tail = 0;
+static volatile uint8_t last_button_state = 0; //track button state for press/release detection
+
+static inline int pkt_empty(void) {
+    return pkt_head == pkt_tail;
 }
+
+static inline int iev_empty(void) {
+    return iev_head == iev_tail;
+}
+
+static inline void iev_push(mouse_input_event_t* e) {
+    uint8_t next = (uint8_t)((iev_head + 1) & (MOUSE_IEV_CAP - 1));
+    if (next == iev_tail) return; //drop on overflow
+    ievq[iev_head] = *e;
+    iev_head = next;
+}
+
+static inline mouse_input_event_t iev_pop(void) {
+    mouse_input_event_t e = (mouse_input_event_t){0};
+    if (iev_empty()) return e;
+    e = ievq[iev_tail];
+    iev_tail = (uint8_t)((iev_tail + 1) & (MOUSE_IEV_CAP - 1));
+    return e;
+}
+
 static inline void pkt_push(int8_t b0, int8_t b1, int8_t b2) {
     uint8_t next = (uint8_t)((pkt_head + 1) & 15);
     if (next != pkt_tail) {
@@ -22,6 +49,44 @@ static inline void pkt_push(int8_t b0, int8_t b1, int8_t b2) {
         pktbuf[pkt_head].b[1] = b1;
         pktbuf[pkt_head].b[2] = b2;
         pkt_head = next;
+    }
+
+    //also generate input events for /dev/input/mouse
+    uint32_t hz = timer_get_frequency();
+    uint32_t t = (uint32_t)timer_get_ticks();
+    uint32_t ms = (hz ? (t * 1000u) / hz : t * 10u);
+
+    uint8_t buttons = (uint8_t)b0 & 0x07; //bits 0-2 = left, right, middle
+    int16_t dx = (int16_t)b1;
+    int16_t dy = (int16_t)b2;
+
+    //generate button press/release events
+    uint8_t changed = buttons ^ last_button_state;
+    for (int i = 0; i < 3; i++) {
+        uint8_t mask = (uint8_t)(1 << i);
+        if (changed & mask) {
+            mouse_input_event_t e;
+            e.time_ms = ms;
+            e.rel_x = 0;
+            e.rel_y = 0;
+            e.button = mask;
+            e.type = (buttons & mask) ? 1 : 0; //1=press 0=release
+            e.reserved = 0;
+            iev_push(&e);
+        }
+    }
+    last_button_state = buttons;
+
+    //generate motion event if there's movement
+    if (dx != 0 || dy != 0) {
+        mouse_input_event_t e;
+        e.time_ms = ms;
+        e.rel_x = dx;
+        e.rel_y = dy;
+        e.type = 2; //motion
+        e.button = 0;
+        e.reserved = 0;
+        iev_push(&e);
     }
 }
 
@@ -108,13 +173,13 @@ device_t* mouse_create_device(void) {
     mouse_device.private_data = NULL;
     mouse_device.ops = &mouse_ops;
     mouse_device.next = NULL;
-    
+
     return &mouse_device;
 }
 
 int mouse_device_init(device_t* device) {
     (void)device; //unused for now
-    
+
     //mouse is already initialized by mouse_init()
     //just verify it's working
     return 0; //success
@@ -123,18 +188,18 @@ int mouse_device_init(device_t* device) {
 int mouse_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size) {
     (void)device; //unused
     (void)offset; //unused for mouse
-    
+
     if (!buffer || size < 3) {
         return -1; //buffer too small for mouse packet
     }
-    
+
     int8_t* packet_buffer = (int8_t*)buffer;
-    
+
     //read available mouse packet
     if (mouse_poll_packet(packet_buffer)) {
         return 3; //return bytes read (3 bytes per mouse packet)
     }
-    
+
     return 0; //no packet available
 }
 
@@ -143,14 +208,14 @@ int mouse_device_write(device_t* device, uint32_t offset, const void* buffer, ui
     (void)offset;
     (void)buffer;
     (void)size;
-    
+
     //mouse is input-only device
     return -1;
 }
 
 int mouse_device_ioctl(device_t* device, uint32_t cmd, void* arg) {
     (void)device;
-    
+
     //mouse-specific ioctl commands
     switch (cmd) {
         case 0x01: //MOUSE_IOCTL_GET_PACKET_COUNT
@@ -169,7 +234,7 @@ int mouse_device_ioctl(device_t* device, uint32_t cmd, void* arg) {
         default:
             break;
     }
-    
+
     return -1; //unknown command
 }
 
@@ -184,19 +249,37 @@ int mouse_register_device(void) {
     if (!mouse_dev) {
         return -1;
     }
-    
+
     //register with device manager first
     if (device_register(mouse_dev) != 0) {
         mouse_device_cleanup(mouse_dev);
         return -1;
     }
-    
+
     //then initialize through device manager
     if (device_init(mouse_dev) != 0) {
         //cleanup on failure
         device_unregister(mouse_dev->device_id);
         return -1;
     }
-    
+
     return 0;
+}
+
+//read input events for /dev/input/mouse
+int mouse_input_read_events(mouse_input_event_t* out, uint32_t max_events, int blocking) {
+    if (!out || max_events == 0) return 0;
+
+    uint32_t count = 0;
+    while (count < max_events) {
+        if (iev_empty()) {
+            if (!blocking || count > 0) break;
+            //blocking mode wait for at least one event
+            __asm__ volatile ("hlt");
+            continue;
+        }
+        out[count] = iev_pop();
+        count++;
+    }
+    return (int)count;
 }

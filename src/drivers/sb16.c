@@ -4,6 +4,7 @@
 #include "../interrupts/irq.h"
 #include "../interrupts/pic.h"
 #include "../mm/vmm.h"
+#include "../mm/heap.h"
 #include "serial.h"
 #include <string.h>
 
@@ -36,6 +37,21 @@ static uint8_t  g_dma8_ch = 1;   //default 8-bit DMA channel
 static uint16_t g_rate    = 22050; //default sample rate
 static volatile int g_irq_block_done = 0;
 static int g_speaker_enabled = 0;
+
+//software mixer controls
+static int g_volume = 100; //0..100
+static int g_muted = 0;
+
+//streaming ring buffer
+#define SB16_RING_CAP (64*1024)
+static uint8_t*  g_ring = NULL;
+static uint32_t  g_ring_cap = 0;
+static volatile uint32_t g_ring_head = 0; //write pos
+static volatile uint32_t g_ring_tail = 0; //read pos
+static volatile uint32_t g_ring_fill = 0;
+static volatile int g_playing = 0;
+static volatile int g_paused = 0;
+static volatile uint32_t g_underruns = 0;
 
 static device_t g_sb_dev;
 
@@ -119,12 +135,20 @@ static void detect_irq_dma(void) {
     else g_dma8_ch = 1; //fallback
 }
 
+//forward
+static void sb16_kick_locked(void);
+
 //IRQ handler acknowledge SB16 8-bit DMA interrupt and signal completion
 static void sb16_irq_handler(void) {
     //acknowledge read status then data to clear 8-bit IRQ
     (void)inb(g_sb_base + DSP_RSTAT_OFF);
     (void)inb(g_sb_base + DSP_READ_OFF);
     g_irq_block_done = 1;
+    //continue streaming
+    g_playing = 0;
+    if (!g_paused && g_ring_fill > 0) {
+        sb16_kick_locked();
+    }
 }
 
 //program DMA channel 1 for 8-bit playback from physical address
@@ -155,29 +179,19 @@ static void dma8_program_ch1(uint32_t phys, uint16_t len) {
     outb(DMA1_MASK_REG, 0x01);
 }
 
-//play one 8-bit block via single-cycle DMA wait for IRQ to complete
-static int sb16_play_block(uint32_t phys, uint16_t len) {
+//start one 8-bit block via single-cycle DMA (non-blocking)
+static int sb16_start_block(uint32_t phys, uint16_t len) {
     if (len == 0) return 0;
-    //program DMA for channel 1 only
     if (g_dma8_ch != 1) {
-        //rn in this basic driver force channel 1 setup other channels not implemented
         g_dma8_ch = 1;
     }
     dma8_program_ch1(phys, len);
-
-    //set sample rate and start 8-bit single-cycle DMA playback (command 0x14 length-1 low high)
     dsp_set_rate(g_rate);
     (void)dsp_write_wait(0x14);
     uint16_t cnt = (uint16_t)(len - 1);
     (void)dsp_write_wait((uint8_t)(cnt & 0xFF));
     (void)dsp_write_wait((uint8_t)((cnt >> 8) & 0xFF));
-
-    //wait for IRQ to signal completion
-    g_irq_block_done = 0;
-    //busy-wait with HLT to avoid burning CPU timer or this IRQ will wake
-    while (!g_irq_block_done) {
-        __asm__ volatile ("hlt");
-    }
+    g_playing = 1;
     return 0;
 }
 
@@ -215,9 +229,70 @@ uint8_t sb16_get_dma8(void) {
     return g_dma8_ch;
 }
 
+int sb16_set_volume(int vol01_100) {
+    if (vol01_100 < 0) vol01_100 = 0;
+    if (vol01_100 > 100) vol01_100 = 100;
+    g_volume = vol01_100;
+    return 0;
+}
+
+int sb16_get_volume(void) {
+    return g_volume;
+}
+
+void sb16_set_mute(int on) {
+    g_muted = on ? 1 : 0;
+}
+
+int sb16_get_mute(void) {
+    return g_muted;
+}
+
+void sb16_pause(void) {
+    g_paused = 1;
+}
+
+void sb16_resume(void) {
+    g_paused = 0;
+    if (!g_playing && g_ring_fill > 0) sb16_kick_locked();
+}
+
+void sb16_stop(void) {
+    g_paused = 1;
+    g_playing = 0;
+    uint32_t flags;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(flags)); g_ring_head = g_ring_tail = g_ring_fill = 0;
+    if (flags & 0x200) __asm__ volatile ("sti");
+    sb16_speaker_off();
+}
+
+int sb16_is_playing(void) {
+    return g_playing;
+}
+
+int sb16_is_paused(void) {
+    return g_paused;
+}
+
+uint32_t sb16_get_queued(void) {
+    return g_ring_fill;
+}
+
+uint32_t sb16_get_underruns(void) {
+    return g_underruns;
+}
+
 //device ops
 static int sb16_dev_init(struct device* d) {
     (void)d;
+    //allocate ring buffer once
+    if (!g_ring) {
+        g_ring = (uint8_t*)kmalloc(SB16_RING_CAP);
+        if (!g_ring) return -1;
+        g_ring_cap = SB16_RING_CAP;
+        g_ring_head = g_ring_tail = g_ring_fill = 0;
+        g_playing = 0; g_paused = 0; g_underruns = 0;
+    }
     //reset DSP and verify
     if (dsp_reset() != 0) {
         serial_write_string("[SB16] DSP reset failed\n");
@@ -237,12 +312,33 @@ static int sb16_dev_init(struct device* d) {
     return 0;
 }
 
-static int sb16_dev_read(struct device* d, uint32_t off, void* buf, uint32_t sz) {
-    (void)d;
-    (void)off;
-    (void)buf;
-    (void)sz;
-    return -1; // not supported
+static int sb16_dev_read(struct device* d, uint32_t off, void* buf, uint32_t sz) { (void)d; (void)off; (void)buf; (void)sz; return -1; }
+
+//start next DMA block from ring (assumes interrupts disabled or IRQ context)
+static void sb16_kick_locked(void) {
+    if (g_paused || g_playing) return;
+    if (g_ring_fill == 0) {
+        g_underruns++;
+        return;
+    }
+    uint32_t tail = g_ring_tail;
+    uint32_t to_play = g_ring_fill;
+    if (to_play > 4096u) to_play = 4096u;
+    uint32_t vaddr = (uint32_t)(g_ring + tail);
+    uint32_t phys = vmm_get_physical_addr(vaddr);
+    if (!phys) {
+        g_underruns++;
+        return;
+    }
+    uint32_t next64k = (phys & 0xFFFF0000u) + 0x10000u;
+    uint32_t remain64k = (next64k > phys) ? (next64k - phys) : 0x10000u;
+    if (to_play > remain64k) to_play = remain64k;
+    uint32_t ring_tail_to_end = g_ring_cap - tail;
+    if (to_play > ring_tail_to_end) to_play = ring_tail_to_end;
+    if (sb16_start_block(phys, (uint16_t)to_play) == 0) {
+        g_ring_tail = (g_ring_tail + to_play) % g_ring_cap;
+        g_ring_fill -= to_play;
+    }
 }
 
 static int sb16_dev_write(struct device* d, uint32_t off, const void* buf, uint32_t sz) {
@@ -250,27 +346,44 @@ static int sb16_dev_write(struct device* d, uint32_t off, const void* buf, uint3
     (void)off;
     if (!buf || sz == 0) return 0;
 
-    uint32_t pos = 0;
-    while (pos < sz) {
-        //physical address of current chunk
-        uint32_t vaddr = (uint32_t)buf + pos;
-        uint32_t phys  = vmm_get_physical_addr(vaddr);
-        if (!phys) return (int)pos; //can't translate so stop
-
-        //limit chunk to 64KiB boundary and 65535 max
-        uint32_t max = sz - pos;
-        if (max > 65535u) max = 65535u;
-        uint32_t next_boundary = (phys & 0xFFFF0000u) + 0x10000u;
-        uint32_t remain_in_64k = (next_boundary > phys) ? (next_boundary - phys) : 0x10000u;
-        if (max > remain_in_64k) max = remain_in_64k;
-
-        //play this block
-        if (sb16_play_block(phys, (uint16_t)max) != 0) {
-            return (int)pos; //error - return bytes consumed so far
+    const uint8_t* p = (const uint8_t*)buf;
+    uint32_t written = 0;
+    while (written < sz) {
+        while (g_ring_fill == g_ring_cap) {
+            __asm__ volatile ("hlt");
         }
-        pos += (uint32_t)max;
+        uint32_t space = g_ring_cap - g_ring_fill;
+        uint32_t head = g_ring_head;
+        uint32_t to_end = g_ring_cap - head;
+        uint32_t chunk = sz - written;
+        if (chunk > space) chunk = space;
+        if (chunk > to_end) chunk = to_end;
+        for (uint32_t i = 0; i < chunk; i++) {
+            uint8_t s = p[written + i];
+            if (g_muted || g_volume == 0) {
+                g_ring[head + i] = 128;
+            } else if (g_volume >= 100) {
+                g_ring[head + i] = s;
+            } else {
+                int centered = (int)s - 128;
+                int scaled = (centered * g_volume) / 100;
+                int out = 128 + scaled;
+                if (out < 0) out = 0;
+                if (out > 255) out = 255;
+                g_ring[head + i] = (uint8_t)out;
+            }
+        }
+        uint32_t flags;
+        __asm__ volatile ("pushf; pop %0; cli" : "=r"(flags));
+        g_ring_head = (g_ring_head + chunk) % g_ring_cap;
+        g_ring_fill += chunk;
+        if (!g_paused && !g_playing) {
+            sb16_kick_locked();
+        }
+        if (flags & 0x200) __asm__ volatile ("sti");
+        written += chunk;
     }
-    return (int)sz;
+    return (int)written;
 }
 
 static int sb16_dev_ioctl(struct device* d, uint32_t cmd, void* arg) {

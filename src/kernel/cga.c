@@ -3,6 +3,9 @@
 #include <string.h>
 #include <stdint.h>
 #include "../io.h"
+#include "../drivers/fbcon.h"
+#include "../kernel/klog.h"
+extern int g_console_quiet;
 
 #define VID_MEM ((unsigned char*)0xB8000)
 
@@ -35,6 +38,7 @@ static void scroll_if_needed(void){
 }
 
 void cga_clear_with_attr(unsigned char attr){
+    if (fbcon_available()) { fbcon_clear_with_attr(attr); return; }
     for (unsigned int j = 0; j < SCREEN_WIDTH * SCREEN_HEIGHT; j++) {
         VID_MEM[j * 2] = ' ';
         VID_MEM[j * 2 + 1] = attr;
@@ -60,6 +64,9 @@ void cga_print_at(const char* str, unsigned char attr, unsigned int x, unsigned 
 }
 
 int putchar_term(char c, unsigned char colour) {
+    if (fbcon_available()) {
+        return fbcon_putchar(c, colour);
+    }
     if (c == '\n') {
         cursor_x = 0;
         cursor_y++;
@@ -91,6 +98,10 @@ int putchar_term(char c, unsigned char colour) {
 }
 
 void print(char* msg, unsigned char colour){
+    if (!msg) return;
+    //always mirror to klog for later retrieval via /dev/kmsg
+    klog_write(msg, strlen(msg));
+    if (g_console_quiet) return; //suppress on-screen if quiet
     int i = 0;
     while(msg[i] != '\0'){
         char c = msg[i++];
@@ -113,6 +124,12 @@ void move_cursor(uint16_t row, uint16_t col){
     outb(0x3D5,(uint8_t)((pos >> 8) & 0xFF));
     cursor_y = (uint8_t)row;
     cursor_x = (uint8_t)col;
+}
+
+void disable_cursor(void){
+    // Disable text mode cursor by setting bit 5 of Cursor Start register
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, 0x20);
 }
 
 uint16_t get_line_length(uint16_t row){

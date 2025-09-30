@@ -2,13 +2,13 @@
 #include <string.h>
 #include <stdio.h>
 
-static void puts1(const char* s) { 
-    fputs(1, s); 
+static void puts1(const char* s) {
+    fputs(1, s);
 }
 
 int main(int argc, char** argv, char** envp) {
-    (void)argc; 
-    (void)argv; 
+    (void)argc;
+    (void)argv;
     (void)envp;
 
     //mount core virtual filesystems

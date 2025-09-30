@@ -88,18 +88,70 @@ int main(int argc, char** argv) {
         close(fd); return 1;
     }
 
-    //switch to 13h if not already (player assumes chunky 1 byte per pixel)
-    int pv = open("/proc/vga", 1);
-    if (pv >= 0) {
-        fputs(pv, "13h");
-        close(pv);
+    //prefer framebuffer when available (VESA) read fb info first
+    int use_fb = 0;
+    unsigned fb_w=0, fb_h=0, fb_bpp=0, fb_pitch=0;
+    int vfd = -1;
+    int pfb = open("/proc/fb0", 0);
+    if (pfb >= 0) {
+        char ibuf[128]; int r = read(pfb, ibuf, sizeof(ibuf)-1);
+        if (r > 0) {
+            ibuf[r] = '\0';
+            //naive parse width/height/bpp/pitch lines
+            unsigned vals[4] = {0,0,0,0};
+            const char* keys[4] = {"width:", "height:", "bpp:", "pitch:"};
+            for (int k = 0; k < 4; k++) {
+                const char* p = strstr(ibuf, keys[k]);
+                if (p) {
+                    p += strlen(keys[k]);
+                    while (*p==' ') p++;
+                    unsigned v=0;
+                    while (*p>='0'&&*p<='9'){
+                        v=v*10+(*p-'0');
+                        p++;
+                    }
+                    vals[k]=v;
+                }
+            }
+            fb_w=vals[0];
+            fb_h=vals[1];
+            fb_bpp=vals[2];
+            fb_pitch=vals[3];
+            if (fb_w && fb_h && (fb_bpp==16 || fb_bpp==24 || fb_bpp==32) && fb_pitch) use_fb = 1;
+        }
+        close(pfb);
     }
 
-    int vfd = open("/dev/vga0", 1);
-    if (vfd < 0) {
-        fprintf(2, "vplay: cannot open /dev/vga0\n");
-        close(fd);
-        return 1;
+    if (use_fb) {
+        vfd = open("/dev/fb0", 1);
+        if (vfd < 0) use_fb = 0;
+    }
+
+    //if using framebuffer map it for direct access else fall back to ioctl/write paths
+    unsigned fb_size = fb_pitch * fb_h;
+    unsigned char* fbmap = 0;
+    if (use_fb) {
+        void* mp = mmap_ex(0, fb_size, PROT_READ|PROT_WRITE, 0, vfd, 0);
+        if (mp != (void*)-1) {
+            fbmap = (unsigned char*)mp;
+            //pre-clear once
+            memset(fbmap, 0, fb_size);
+        }
+    }
+
+    if (!use_fb) {
+        //switch to 13h if not already (player assumes chunky 1 byte per pixel)
+        int pv = open("/proc/vga", 1);
+        if (pv >= 0) {
+            write(pv, "13h", 3);
+            close(pv);
+        }
+        vfd = open("/dev/vga0", 1);
+        if (vfd < 0) {
+            fprintf(2, "vplay: cannot open /dev/vga0\n");
+            close(fd);
+            return 1;
+        }
     }
 
     static unsigned char frame[640*480];
@@ -126,21 +178,67 @@ int main(int argc, char** argv) {
             if (r < nbytes) {
                 for (int k = r; k < nbytes; k++) bitbuf[k] = 0;
             }
-            //expand to 0/15
+            //expand to 0/255 (for framebuffer path this maps to white for VGA 13h we'll treat 255 as bright)
             int pi = 0;
             for (int b = 0; b < nbytes; b++) {
                 unsigned char v = bitbuf[b];
                 for (int bit = 0; bit < 8 && pi < need; bit++) {
-                    frame[pi++] = (v & (1u << bit)) ? 15 : 0;
+                    frame[pi++] = (v & (1u << bit)) ? 255 : 0;
                 }
             }
         }
 
-        //write full frame driver fast-path ignores offset for full-frame writes
-        int wr = write(vfd, frame, (unsigned)need);
-        if (wr < 0) {
-            fprintf(2, "vplay: write error\n");
-            break;
+        if (!use_fb) {
+            // VGA path: write paletted bytes
+            int wr = write(vfd, frame, (unsigned)need);
+            if (wr < 0) { fprintf(2, "vplay: write error\n"); break; }
+        } else {
+            unsigned eff_w = (w < fb_w) ? w : fb_w;
+            unsigned eff_h = (h < fb_h) ? h : fb_h;
+            if (fbmap) {
+                //direct draw into mapped FB convert gray8 to native per row
+                for (unsigned y = 0; y < eff_h; y++) {
+                    unsigned char* dst = fbmap + y * fb_pitch;
+                    if (fb_bpp == 32) {
+                        uint32_t* p32 = (uint32_t*)dst;
+                        for (unsigned x = 0; x < eff_w; x++) {
+                            unsigned v = frame[y*w + x];
+                            uint32_t c = (v << 16) | (v << 8) | v;
+                            p32[x] = c;
+                        }
+                    } else if (fb_bpp == 24) {
+                        for (unsigned x = 0; x < eff_w; x++) {
+                            unsigned v = frame[y*w + x];
+                            unsigned off = x*3; dst[off+0] = v; dst[off+1] = v; dst[off+2] = v;
+                        }
+                    } else if (fb_bpp == 16) {
+                        uint16_t* p16 = (uint16_t*)dst;
+                        for (unsigned x = 0; x < eff_w; x++) {
+                            unsigned v = frame[y*w + x];
+                            uint16_t c = (uint16_t)(((v>>3)<<11)|((v>>2)<<5)|((v>>3)<<0));
+                            p16[x] = c;
+                        }
+                    }
+                }
+            } else {
+                //fallback FB ioctl blit
+                struct fb_blit_args {
+                    unsigned x,y,w,h,src_pitch,flags;
+                    const void* src;
+                } a;
+                a.x = 0;
+                a.y = 0;
+                a.w = eff_w;
+                a.h = eff_h;
+                a.src_pitch = w;
+                a.flags = 1;
+                a.src = frame;
+                int rc = ioctl(vfd, 1, &a);
+                if (rc < 0) {
+                    fprintf(2, "vplay: fb ioctl blit failed\n");
+                    break;
+                }
+            }
         }
         total++;
         nanosleep(&ts, 0);
@@ -149,12 +247,7 @@ int main(int argc, char** argv) {
     if (vfd >= 0) close(vfd);
     close(fd);
 
-    //return to text mode for convenience
-    pv = open("/proc/vga", 1);
-    if (pv >= 0) {
-        fputs(pv, "text");
-        close(pv);
-    }
+    //do not force text mode leave mode as-is
 
     return 0;
 }

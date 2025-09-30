@@ -23,6 +23,9 @@
 #include "kernel/signal.h"
 #include "kernel/uaccess.h"
 #include "kernel/dynlink.h"
+#include "drivers/fb.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
 
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
@@ -65,6 +68,16 @@ typedef struct {
     uint32_t tv_usec;
 } timeval32_t;
 
+//for fd backed mmap
+typedef struct {
+    uint32_t addr;
+    uint32_t length;
+    uint32_t prot;
+    uint32_t flags;
+    int32_t  fd;
+    uint32_t offset; // byte offset
+} mmap_ex_args_t;
+
 //external assembly handler
 extern void syscall_handler_asm(void);
 
@@ -87,8 +100,9 @@ static int is_leap(unsigned y) {
     return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
 }
 
-//forward declaration
+//forward declarations
 static int normalize_user_path(const char* in, char* out, size_t outsz);
+static int32_t sys_mmap_ex(void* uargs_ptr);
 
 int32_t sys_chdir(const char* path) {
     if (!path) return -1;
@@ -337,6 +351,8 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_readdir_fd((int32_t)arg1, arg2, (char*)arg3, arg4, (uint32_t*)arg5);
         case SYS_MMAP:
             return sys_mmap(arg1, arg2, arg3, arg4);
+        case SYS_MMAP_EX:
+            return sys_mmap_ex((void*)arg1);
         case SYS_MUNMAP:
             return sys_munmap(arg1, arg2);
         case SYS_TIME:
@@ -452,29 +468,52 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Writing to file via VFS\n");
     #endif
-    //bounce buffer from user to kernel for filesystem/device writes
-    int bytes_written = -1;
-    char* kbuf = (char*)kmalloc(count);
-    if (kbuf) {
-        if (copy_from_user(kbuf, buf, count) == 0) {
-            int r = vfs_write(file->node, file->offset, count, kbuf);
-            if (r >= 0) {
-                file->offset += r;
-                bytes_written = r;
-            } else {
-                bytes_written = r;
-            }
+    //bounce buffer in manageable chunks to avoid large contiguous allocations
+    const uint32_t CHUNK = 65536; //64 KiB
+    uint32_t remaining = count;
+    int total_written = 0;
+    while (remaining > 0) {
+        uint32_t this_chunk = remaining > CHUNK ? CHUNK : remaining;
+        char* kbuf = (char*)kmalloc(this_chunk);
+        if (!kbuf) {
+            //out of memory: if nothing written yet report error else return partial
+            total_written = (total_written > 0) ? total_written : -1;
+            break;
         }
+        if (copy_from_user(kbuf, buf + total_written, this_chunk) != 0) {
+            kfree(kbuf);
+            total_written = (total_written > 0) ? total_written : -1;
+            break;
+        }
+        int r = vfs_write(file->node, file->offset, this_chunk, kbuf);
         kfree(kbuf);
+        if (r <= 0) {
+            if (r < 0 && total_written == 0) total_written = r; //propagate error if nothing written
+            break;
+        }
+        file->offset += r;
+        total_written += r;
+        if ((uint32_t)r < this_chunk) {
+            //short write stop here
+            break;
+        }
+        remaining -= (uint32_t)r;
+        //allow pending signals to be processed between chunks
+        signal_check_current();
+    }
+    //for device nodes reset the file offset after each write syscall so each
+    //subsequent write starts fresh (useful for streaming devices like /dev/fb0)
+    if (file && file->node && file->node->type == VFS_FILE_TYPE_DEVICE) {
+        file->offset = 0;
     }
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Write completed, bytes: ");
-    serial_printf("%d", bytes_written);
+    serial_printf("%d", total_written);
     serial_write_string("\n");
     #endif
-    //check signals
+    //signal check
     signal_check_current();
-    return bytes_written;
+    return total_written;
 }
 
 int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
@@ -1574,4 +1613,100 @@ int32_t sys_waitpid(int32_t pid, int32_t* status, int32_t options) {
         parent->state = PROC_SLEEPING;
         schedule();
     }
+}
+
+//fd-backed mmap (extended)
+static uint32_t mmap_prot_to_flags(uint32_t prot) {
+    uint32_t f = PAGE_PRESENT | PAGE_USER;
+    if (prot & PROT_WRITE) f |= PAGE_WRITABLE;
+    return f;
+}
+
+static int32_t sys_mmap_ex(void* uargs_ptr) {
+    if (!uargs_ptr) return -1;
+    mmap_ex_args_t a = {0};
+    if (!user_range_ok(uargs_ptr, sizeof(mmap_ex_args_t), 0)) return -1;
+    if (copy_from_user(&a, uargs_ptr, sizeof(a)) != 0) return -1;
+    if (a.length == 0) return -1;
+
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory) return -1;
+
+    uint32_t len = (a.length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint32_t flags = a.flags;
+    uint32_t prot = a.prot;
+
+    //choose address
+    uint32_t start = 0;
+    if ((flags & MAP_FIXED) && a.addr) {
+        start = a.addr;
+    } else {
+        start = mmap_find_free_region(cur->page_directory, len, 0);
+        if (!start) return -1;
+    }
+
+    if (a.fd < 0) {
+        //anonymous mapping: allocate pages
+        for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+            uint32_t phys = pmm_alloc_page();
+            if (!phys) return -1;
+            if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) return -1;
+            //zero page via temp map
+            const uint32_t TMP = 0x00A00000 + off; //simplistic scratch reused immediately
+            if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+                memset((void*)TMP, 0, PAGE_SIZE);
+                vmm_unmap_page_nofree(TMP);
+            }
+        }
+        return (int32_t)start;
+    }
+
+    //fd-backed mapping
+    vfs_file_t* file = fd_get(a.fd);
+    if (!file || !file->node) return -1;
+
+    //device special case map /dev/fb0 into user address space with no copy
+    if (file->node->type == VFS_FILE_TYPE_DEVICE && strcmp(file->node->name, "fb0") == 0) {
+        uint8_t* fbv = 0;
+        uint32_t w=0,h=0,bpp=0,pitch=0;
+        if (fb_get_info(&fbv, &w, &h, &bpp, &pitch) != 0 || !fbv) return -1;
+        uint32_t fb_size = pitch * h;
+        uint32_t off = a.offset;
+        if (off >= fb_size) return -1;
+        uint32_t map_len = (len > (fb_size - off)) ? (fb_size - off) : len;
+        //map page-by-page from kernel fb virtual to user range
+        for (uint32_t o = 0; o < map_len; o += PAGE_SIZE) {
+            uint32_t kva = (uint32_t)fbv + off + o;
+            uint32_t phys = vmm_get_physical_addr(kva);
+            if (!phys) return -1;
+            if (vmm_map_page_in_directory(cur->page_directory, start + o, phys, mmap_prot_to_flags(prot)) != 0) return -1;
+        }
+        return (int32_t)start;
+    }
+
+    //regular file: allocate pages and read file bytes into mapping
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        uint32_t phys = pmm_alloc_page();
+        if (!phys) return -1;
+        if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) return -1;
+        //temp map for zeroing and staging
+        const uint32_t TMP = 0x00B00000; //fixed temp VA
+        if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+            memset((void*)TMP, 0, PAGE_SIZE);
+            vmm_unmap_page_nofree(TMP);
+        }
+    }
+    //read file content into user mapping in chunks
+    const uint32_t CHUNK = 4096;
+    uint32_t copied = 0;
+    while (copied < len) {
+        char kbuf[CHUNK];
+        int r = vfs_read(file->node, a.offset + copied, CHUNK, kbuf);
+        if (r <= 0) break;
+        if (copy_to_user((void*)(start + copied), kbuf, (size_t)r) != 0) {
+            break;
+        }
+        copied += (uint32_t)r;
+    }
+    return (int32_t)start;
 }

@@ -10,12 +10,15 @@ void process_timer_tick(void);
 
 static volatile uint64_t g_ticks = 0;
 static uint32_t g_hz = 0;
+static void (*g_timer_cb)(void) = 0;
 
 static void timer_irq_handler(void) {
     g_ticks++;
     
     //call process manager timer tick for scheduling
     process_timer_tick();
+    // optional callback
+    if (g_timer_cb) g_timer_cb();
 }
 
 void timer_init(uint32_t frequency) {
@@ -39,4 +42,8 @@ uint64_t timer_get_ticks(void) {
 
 uint32_t timer_get_frequency(void) {
     return g_hz;
+}
+
+void timer_register_callback(void (*cb)(void)) {
+    g_timer_cb = cb;
 }

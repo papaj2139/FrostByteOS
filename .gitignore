@@ -13,3 +13,4 @@ initramfs_root/
 *.so.*
 *.vga
 *.raw
+*.psf

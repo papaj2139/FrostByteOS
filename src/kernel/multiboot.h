@@ -25,19 +25,31 @@ typedef struct multiboot_info {
     uint32_t mem_lower;      //4
     uint32_t mem_upper;      //8
     uint32_t boot_device;    //12
-    uint32_t cmdline;        //16
+    uint32_t cmdline;        //16 (phys addr)
     uint32_t mods_count;     //20
     uint32_t mods_addr;      //24
     uint32_t syms[4];        //28..43 (either a.out or ELF)
     uint32_t mmap_length;    //44
     uint32_t mmap_addr;      //48
-    //ignore remaining firleds for now
+    //VBE fields (Multiboot v1 present if flags bit 11 set)
+    uint32_t drives_length;  //52 (unused)
+    uint32_t drives_addr;    //56 (unused)
+    uint32_t config_table;   //60 (unused)
+    uint32_t boot_loader_name; //64 (unused)
+    uint32_t apm_table;      //68 (unused)
+    uint32_t vbe_control_info; //72 phys addr
+    uint32_t vbe_mode_info;    //76 phys addr
+    uint16_t vbe_mode;         //80
+    uint16_t vbe_interface_seg; //82
+    uint16_t vbe_interface_off; //84
+    uint16_t vbe_interface_len; //86
 } __attribute__((packed)) multiboot_info_t;
 
 //multiboot info flags bits
 #define MBI_FLAG_MEM     (1u << 0)   //mem_lower/mem_upper valid
 #define MBI_FLAG_MMAP    (1u << 6)   //mmap_* valid
 #define MBI_FLAG_MODS    (1u << 3)   //modules info valid
+#define MBI_FLAG_VBE     (1u << 11)  //VBE info present (vbe_* fields valid)
 
 //multiboot module descriptor located at mods_addr when MBI_FLAG_MODS is set
 typedef struct multiboot_module {
