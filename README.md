@@ -41,7 +41,7 @@ make CC=i386-elf-gcc
 - 6MB of ram minimum
 - An IA-32 or amd64 CPU
 - PS/2 keyboard and (optional) mouse
-- VGA-capable GPU
+- VESA-capable GPU
 - (optional) an IDE hard drive
 
 
