@@ -15,7 +15,7 @@ If you encunter any issues please open an issue ticket or email **frostbyte.oper
 **recommended to build on Linux (I personally use Mint so i'm not too sure about other distros) but any other unix-like, e.x freeBSD, mac osx will work**
 ## Command
 ```bash
-git clone https://github.com/FrostByte-OS/FrostByteOS.git
+git clone https://github.com/FrostByteOS-project/FrostByteOS.git
 cd FrostByteOS
 make
 ```
