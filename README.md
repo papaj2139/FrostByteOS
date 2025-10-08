@@ -49,9 +49,6 @@ make CC=i386-elf-gcc
 
 
 # Notes
-- The execution path by default is /bin/init -> /bin/forktest` (to change it to just execute /bin/sh directly change the filename in init.asm, altho forktest does exec /bin/sh anyway)
-- /bin/init just calls exec /bin/forktest will expand later
-- Fork() syscall is the WORST thing in this codebase; in general the process manager IS SO unstable its unimaginable
 - Currently only supports BIOS and x86, amd64 and UEFI support will be added in the future.
 - Uses GRUB, will probably create a custom bootloader in the future.
 - Uses ELF32 for binaries
@@ -62,8 +59,7 @@ make CC=i386-elf-gcc
 - Add USB support
 - Improve scheduler
 - ATAPI support
-- SATA and AHCI support
-- PCI/PCIE detection
+- PCIE detection
 
 # Credits
 Special thanks to:
