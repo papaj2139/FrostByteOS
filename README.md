@@ -18,7 +18,7 @@ THis repo will only contain the kernel and init system,standard C library,coreut
 **recommended to build on Linux (I personally use Mint so i'm not too sure about other distros) but any other unix-like, e.x freeBSD, mac osx will work**
 ## Command
 ```bash
-git clone https://github.com/FrostByte-OS/FrostByteOS.git
+git clone https://github.com/FrostByteOS-project/FrostByteOS.git
 cd FrostByteOS
 make
 ```
@@ -44,8 +44,8 @@ make CC=i386-elf-gcc
 - 6MB of ram minimum
 - An IA-32 or amd64 CPU
 - PS/2 keyboard and (optional) mouse
-- VGA-capable GPU
-- (optional) an IDE or SATA hard drive
+- VESA-capable GPU
+- (optional) an IDE hard drive
 
 
 # Notes
