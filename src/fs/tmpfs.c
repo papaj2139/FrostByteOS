@@ -21,8 +21,6 @@ typedef struct tmpfs_entry {
     uint32_t gid;
 } tmpfs_entry_t;
 
-static tmpfs_entry_t* g_tmpfs_root = NULL;
-
 //find entry in directory by name
 static tmpfs_entry_t* tmpfs_find_entry(tmpfs_entry_t* dir, const char* name) {
     if (!dir || dir->type != VFS_FILE_TYPE_DIRECTORY || !name) return NULL;
@@ -236,31 +234,33 @@ static vfs_operations_t tmpfs_ops = {
 };
 
 int tmpfs_init(void) {
-    //create root entry
-    g_tmpfs_root = (tmpfs_entry_t*)kmalloc(sizeof(tmpfs_entry_t));
-    if (!g_tmpfs_root) return -1;
-    
-    memset(g_tmpfs_root, 0, sizeof(tmpfs_entry_t));
-    strncpy(g_tmpfs_root->name, "tmpfs_root", TMPFS_MAX_NAME - 1);
-    g_tmpfs_root->type = VFS_FILE_TYPE_DIRECTORY;
-    g_tmpfs_root->mode = 0777;
-    g_tmpfs_root->uid = 0;
-    g_tmpfs_root->gid = 0;
-    
+    //tmpfs is instance-based so no global init needed
     return 0;
 }
 
 vfs_node_t* tmpfs_get_root(void) {
-    if (!g_tmpfs_root) return NULL;
+    //create a new tmpfs instance for each mount
+    tmpfs_entry_t* new_root = (tmpfs_entry_t*)kmalloc(sizeof(tmpfs_entry_t));
+    if (!new_root) return NULL;
+    
+    memset(new_root, 0, sizeof(tmpfs_entry_t));
+    strncpy(new_root->name, "tmpfs_root", TMPFS_MAX_NAME - 1);
+    new_root->type = VFS_FILE_TYPE_DIRECTORY;
+    new_root->mode = 0777;
+    new_root->uid = 0;
+    new_root->gid = 0;
     
     vfs_node_t* root = vfs_create_node("tmp", VFS_FILE_TYPE_DIRECTORY, 0);
-    if (!root) return NULL;
+    if (!root) {
+        kfree(new_root);
+        return NULL;
+    }
     
     root->ops = &tmpfs_ops;
-    root->private_data = g_tmpfs_root;
-    root->mode = g_tmpfs_root->mode;
-    root->uid = g_tmpfs_root->uid;
-    root->gid = g_tmpfs_root->gid;
+    root->private_data = new_root;
+    root->mode = new_root->mode;
+    root->uid = new_root->uid;
+    root->gid = new_root->gid;
     
     return root;
 }

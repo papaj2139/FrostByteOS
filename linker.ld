@@ -2,9 +2,9 @@ ENTRY(start)
 
 PHDRS
 {
-    text   PT_LOAD FLAGS(4 | 1);     /* PF_R | PF_X */
-    rodata PT_LOAD FLAGS(4);         /* PF_R       */
-    data   PT_LOAD FLAGS(4 | 2);     /* PF_R | PF_W */
+    text   PT_LOAD FLAGS(4 | 1);     /*PF_R | PF_X*/
+    rodata PT_LOAD FLAGS(4);         /*PF_R*/
+    data   PT_LOAD FLAGS(4 | 2);     /*PF_R | PF_W*/
 }
 
 SECTIONS

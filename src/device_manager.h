@@ -22,7 +22,7 @@ typedef enum {
     DEVICE_SUBTYPE_MOUSE,        //mouse input
     DEVICE_SUBTYPE_STORAGE_ATA,  //ATA storage
     DEVICE_SUBTYPE_STORAGE_USB,  //USB storage
-    DEVICE_SUBTYPE_NETWORK_ETH,  //Ethernet network
+    DEVICE_SUBTYPE_NETWORK_ETH,  //ethernet network
     DEVICE_SUBTYPE_NETWORK_WIFI, //WiFi network
 } device_subtype_t;
 

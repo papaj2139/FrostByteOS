@@ -4,6 +4,7 @@
 #include "../interrupts/pic.h"
 #include "../device_manager.h"
 #include "timer.h"
+#include "../process.h"
 #include <string.h>
 
 //IRQ12-driven PS/2 mouse handler with packet ring buffer
@@ -18,6 +19,7 @@ static volatile uint8_t pkt_head = 0, pkt_tail = 0;
 static volatile mouse_input_event_t ievq[MOUSE_IEV_CAP];
 static volatile uint8_t iev_head = 0, iev_tail = 0;
 static volatile uint8_t last_button_state = 0; //track button state for press/release detection
+static wait_queue_t mouse_waitq;
 
 static inline int pkt_empty(void) {
     return pkt_head == pkt_tail;
@@ -32,6 +34,7 @@ static inline void iev_push(mouse_input_event_t* e) {
     if (next == iev_tail) return; //drop on overflow
     ievq[iev_head] = *e;
     iev_head = next;
+    wait_queue_wake_all(&mouse_waitq);
 }
 
 static inline mouse_input_event_t iev_pop(void) {
@@ -40,6 +43,10 @@ static inline mouse_input_event_t iev_pop(void) {
     e = ievq[iev_tail];
     iev_tail = (uint8_t)((iev_tail + 1) & (MOUSE_IEV_CAP - 1));
     return e;
+}
+
+int mouse_input_has_events(void) {
+    return !iev_empty();
 }
 
 static inline void pkt_push(int8_t b0, int8_t b1, int8_t b2) {
@@ -138,6 +145,7 @@ void mouse_init(void) {
     irq_install_handler(12, mouse_irq_handler);
     pic_clear_mask(2);   //cascade for slave PIC
     pic_clear_mask(12);  //mouse IRQ
+    wait_queue_init(&mouse_waitq);
 }
 
 int mouse_poll_packet(int8_t out_bytes[3]) {
@@ -275,7 +283,7 @@ int mouse_input_read_events(mouse_input_event_t* out, uint32_t max_events, int b
         if (iev_empty()) {
             if (!blocking || count > 0) break;
             //blocking mode wait for at least one event
-            __asm__ volatile ("hlt");
+            process_wait_on(&mouse_waitq);
             continue;
         }
         out[count] = iev_pop();

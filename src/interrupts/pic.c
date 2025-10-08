@@ -64,3 +64,11 @@ void pic_clear_mask(uint8_t irq) {
     value = inb(port) & ~(1 << irq);
     outb(port, value);
 }
+
+//disable PIC completely (mask all interrupts)
+//used when switching to APIC
+void pic_disable(void) {
+    //mask all interrupts on both PICs
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+}

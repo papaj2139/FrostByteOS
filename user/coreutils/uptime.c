@@ -18,7 +18,8 @@ static int read_file(const char* path, char* buf, int bufsz) {
 }
 
 int main(int argc, char** argv) {
-    (void)argc; (void)argv;
+    (void)argc; 
+    (void)argv;
     char buf[64];
     if (read_file("/proc/uptime", buf, sizeof(buf)) < 0) {
         fprintf(2, "uptime: cannot read /proc/uptime\n");

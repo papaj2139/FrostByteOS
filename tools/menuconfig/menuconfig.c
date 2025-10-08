@@ -31,6 +31,7 @@ static option_t g_options[] = {
     {"FAT16_USE_READAHEAD", 0, 1, 0, 0},
     {"FAT16_READAHEAD_THRESHOLD_BYTES", 1, 1, 0, 2048},
 };
+
 static char** read_lines(const char* path, int* out_count) {
     *out_count = 0;
     FILE* f = fopen(path, "r");
@@ -227,7 +228,7 @@ int main(void)
                 dirty = 1;
             }
         } else if ((ch == '+' || ch == KEY_RIGHT) && g_options[sel].is_numeric && g_options[sel].editable) {
-            g_options[sel].num_value += 128; // coarse step
+            g_options[sel].num_value += 128; //coarse step
             if (g_options[sel].num_value < 0) g_options[sel].num_value = 0;
             dirty = 1;
         } else if ((ch == '-' || ch == KEY_LEFT) && g_options[sel].is_numeric && g_options[sel].editable) {

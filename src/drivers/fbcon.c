@@ -9,6 +9,7 @@
 static uint8_t* fb = 0;
 static uint32_t fb_w=0, fb_h=0, fb_bpp=0, fb_pitch=0;
 static int ready = 0;
+static int enabled = 1; //console output enabled by default
 static int cur_x = 0, cur_y = 0; //character coords
 static int ch_w = 8;
 static int ch_h = 16; //default 8x16
@@ -284,7 +285,7 @@ void fbcon_clear_with_attr(unsigned char attr) {
 }
 
 int fbcon_putchar(char c, unsigned char attr) {
-    if (!ready) return 0;
+    if (!ready || !enabled) return 0;
     //erase old cursor if visible
     fbcon_cursor_erase_if_drawn();
     if (c == '\n') {
@@ -369,7 +370,6 @@ static void fbcon_process_csi(char final_char) {
     }
 
     int cols = (int)(fb_w / ch_w);
-    int rows = (int)(fb_h / ch_h);
 
     //cursor movement: ESC[<row>;<col>H or ESC[<row>;<col>f
     if (final_char == 'H' || final_char == 'f') {
@@ -392,7 +392,6 @@ static void fbcon_process_csi(char final_char) {
     if (final_char == 'K') {
         //clear line to end
         fbcon_cursor_erase_if_drawn();
-        int px = cur_x * ch_w;
         int py = cur_y * ch_h;
         for (int x = cur_x; x < cols; x++) {
             int xp = x * ch_w;
@@ -415,7 +414,7 @@ static void fbcon_process_csi(char final_char) {
 }
 
 int fbcon_write(const char* buf, uint32_t size) {
-    if (!ready || !buf || size == 0) return 0;
+    if (!ready || !enabled || !buf || size == 0) return 0;
 
     for (uint32_t i = 0; i < size; i++) {
         char c = buf[i];
@@ -480,4 +479,15 @@ int fbcon_write(const char* buf, uint32_t size) {
     }
 
     return (int)size;
+}
+
+void fbcon_set_enabled(int enable) {
+    if (!ready) return;
+    if (enable) {
+        enabled = 1;
+    } else {
+        //disable console output - erase cursor if visible
+        fbcon_cursor_erase_if_drawn();
+        enabled = 0;
+    }
 }

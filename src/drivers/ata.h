@@ -52,7 +52,8 @@ typedef struct {
     uint16_t control_port;
     uint8_t drive_select; //ATA_DRIVE_MASTER or ATA_DRIVE_SLAVE
     int is_slave;
-    uint64_t total_sectors; //capacity in 512-byte sectors (from IDENTIFY LBA48 or LBA28)
+    uint64_t total_sectors; //capacity in sectors (from IDENTIFY LBA48 or LBA28)
+    uint32_t sector_size;   //actual sector size in bytes (typically 512 or 4096)
 } ata_device_data_t;
 
 //function declarations

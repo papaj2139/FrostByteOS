@@ -18,7 +18,7 @@ static int read_file(const char* path, char* buf, int bufsz) {
 }
 
 static unsigned parse_pages(const char* line) {
-    // find first number in the line
+    //find first number in the line
     const char* p = line;
     while (*p && (*p < '0' || *p > '9')) p++;
     unsigned v = 0;

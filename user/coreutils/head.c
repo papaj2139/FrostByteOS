@@ -14,7 +14,10 @@ static int parse_n(const char* s) {
 int main(int argc, char** argv) {
     int n = 10; int ai = 1;
     if (ai < argc && argv[ai] && strcmp(argv[ai], "-n") == 0) {
-        if (ai + 1 >= argc) { fprintf(2, "Usage: head [-n N] <file>\n"); return 1; }
+        if (ai + 1 >= argc) { 
+            fprintf(2, "Usage: head [-n N] <file>\n"); 
+            return 1; 
+        }
         int t = parse_n(argv[ai+1]);
         if (t <= 0) {
             fprintf(2, "head: invalid N\n");

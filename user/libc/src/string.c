@@ -88,3 +88,49 @@ char* strstr(const char* haystack, const char* needle) {
     }
     return 0;
 }
+
+char* strtok(char* str, const char* delim) {
+    static char* last = 0;
+    if (str) last = str;
+    if (!last) return 0;
+    
+    //skip leading delimiters
+    while (*last) {
+        int is_delim = 0;
+        for (const char* d = delim; *d; d++) {
+            if (*last == *d) {
+                is_delim = 1;
+                break;
+            }
+        }
+        if (!is_delim) break;
+        last++;
+    }
+    
+    if (!*last) {
+        last = 0;
+        return 0;
+    }
+    
+    char* token = last;
+    
+    //find end of token
+    while (*last) {
+        int is_delim = 0;
+        for (const char* d = delim; *d; d++) {
+            if (*last == *d) {
+                is_delim = 1;
+                break;
+            }
+        }
+        if (is_delim) {
+            *last = '\0';
+            last++;
+            return token;
+        }
+        last++;
+    }
+    
+    last = 0;
+    return token;
+}

@@ -22,6 +22,8 @@ int fbcon_set_cursor_enabled(int enable);
 void fbcon_get_cursor(int* x, int* y);
 //set cursor position
 void fbcon_set_cursor(int x, int y);
+//enable (1) or disable (0) console output completely
+void fbcon_set_enabled(int enable);
 
 #ifdef __cplusplus
 }

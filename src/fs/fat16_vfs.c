@@ -53,8 +53,11 @@ typedef struct {
 } fat16_file_private_t;
 
 //FAT16 directory private data
+//NOTE: the magic number is used to distinguish between filesystem_t* and fat16_dir_private_t*
+//in mount->root->private_data since VFS mounting initially stores filesystem_t* there
+//but after the first open() call it gets replaced with fat16_dir_private_t*
 typedef struct {
-    uint32_t magic;             //magic number to identify this struct
+    uint32_t magic;             //magic number to identify this struct (FAT16_DIR_PRIVATE_MAGIC)
     fat16_fs_t* fs;
     uint16_t first_cluster;     //0 for root directory otherwise cluster of directory
     uint32_t current_sector;
@@ -73,7 +76,10 @@ static void fat16v_entry_make_name(const fat16_dir_entry_t* entry, char* name_ou
     memcpy(name, entry->filename, 8);
     name[8] = '\0';
     //trim spaces
-    for (int j = 7; j >= 0; j--) { if (name[j] == ' ') name[j] = '\0'; else break; }
+    for (int j = 7; j >= 0; j--) {
+        if (name[j] == ' ') name[j] = '\0';
+        else break;
+    }
     strncpy(name_out, name, outsz-1);
     name_out[outsz-1] = '\0';
     if (entry->extension[0] != ' ') {
@@ -310,8 +316,10 @@ static int fat16_vfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char
 
     fat16_fs_t* fs;
     void* pdata = node->mount->root->private_data;
-    //HACK determine the type of the pointer by checking for our dir_data magic numbe
-    //this is needed cuz the VFS design uses one pointer for two types
+    //hack:
+    //determine the type of pointer using magic number pattern
+    //VFS stores filesystem_t* initially but after first open() it's fat16_dir_private_t*
+    //the magic number lets us safely distinguish which type we have
     if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
         fs = ((fat16_dir_private_t*)pdata)->fs;
     } else {
@@ -691,4 +699,35 @@ static int fat16_vfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) {
     (void)arg;
 
     return -1;
+}
+
+//create root VFS node for mounted FAT16 filesystem
+vfs_node_t* fat16_get_root(void* mount_data) {
+    if (!mount_data) return NULL;
+
+    fat16_fs_t* fs = (fat16_fs_t*)mount_data;
+
+    vfs_node_t* root = vfs_create_node("fat16_root", VFS_FILE_TYPE_DIRECTORY, 0);
+    if (!root) return NULL;
+
+    //set up private data with magic number for proper type detection
+    fat16_dir_private_t* root_data = (fat16_dir_private_t*)kmalloc(sizeof(fat16_dir_private_t));
+    if (!root_data) {
+        vfs_destroy_node(root);
+        return NULL;
+    }
+
+    memset(root_data, 0, sizeof(fat16_dir_private_t));
+    root_data->magic = FAT16_DIR_PRIVATE_MAGIC;
+    root_data->fs = fs;
+    root_data->first_cluster = 0; //root directory
+    root_data->entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+    root_data->root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+    root_data->sectors_per_cluster = fs->boot_sector.sectors_per_cluster;
+
+    root->private_data = root_data;
+    root->ops = &fat16_vfs_ops;
+    root->mode = 0755;
+
+    return root;
 }

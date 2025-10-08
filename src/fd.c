@@ -7,14 +7,17 @@
 
 static vfs_file_t open_files[MAX_OPEN_FILES];
 
+static vfs_operations_t pipe_ops;
+
 //allocate an open-file slot (global) return index or -1
-static int32_t of_alloc(vfs_node_t* node, uint32_t flags) {
+static int32_t of_alloc(vfs_node_t* node, uint32_t flags, uint32_t append) {
     for (int32_t i = 0; i < MAX_OPEN_FILES; i++) {
         if (open_files[i].node == NULL) {
             open_files[i].node = node;
             open_files[i].offset = 0;
             open_files[i].flags = flags;
             open_files[i].ref_count = 1;
+            open_files[i].append = append;
             return i;
         }
     }
@@ -58,14 +61,15 @@ void fd_init(void) {
         open_files[i].offset = 0;
         open_files[i].flags = 0;
         open_files[i].ref_count = 0;
+        open_files[i].append = 0;
     }
 }
 
 //allocate a CURRENT-process-local fd and bind it to a freshly created open-file object
-int32_t fd_alloc(vfs_node_t* node, uint32_t flags) {
+int32_t fd_alloc(vfs_node_t* node, uint32_t flags, uint32_t append) {
     process_t* cur = process_get_current();
     if (!cur || !node) return -1;
-    int of_idx = of_alloc(node, flags);
+    int of_idx = of_alloc(node, flags, append);
     if (of_idx < 0) {
         //no global slot close node
         vfs_close(node);
@@ -118,7 +122,7 @@ void fd_init_process_stdio(process_t* proc) {
         //not available yet leave as unbound (syscalls will fallback for stdio)
         return;
     }
-    int of_idx = of_alloc(tty, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    int of_idx = of_alloc(tty, VFS_FLAG_READ | VFS_FLAG_WRITE, 0);
     if (of_idx < 0) {
         vfs_close(tty);
         return;
@@ -206,6 +210,9 @@ typedef struct {
     uint32_t count; //number of bytes in pipe
     int write_end_open; //1 if write end is still open
     int read_end_open;  //1 if read end is still open
+    //wait queues
+    wait_queue_t r_wait; //readers wait here for data
+    wait_queue_t w_wait; //writers wait here for space or reader
 } pipe_t;
 
 //allocate a pipe buffer
@@ -218,6 +225,8 @@ static pipe_t* pipe_alloc(void) {
     p->count = 0;
     p->write_end_open = 1;
     p->read_end_open = 1;
+    wait_queue_init(&p->r_wait);
+    wait_queue_init(&p->w_wait);
     return p;
 }
 
@@ -229,7 +238,7 @@ static int pipe_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buf
     if (size == 0) return 0;
     //if pipe is empty and write end is closed return EOF
     if (pipe->count == 0 && !pipe->write_end_open) return 0;
-    //if pipe is empty but write end is open block (for now return 0 blocking would require scheduler support)
+    // if empty and writer open, caller should block in syscall layer
     if (pipe->count == 0) return 0;
     //read available bytes
     uint32_t to_read = size < pipe->count ? size : pipe->count;
@@ -237,6 +246,10 @@ static int pipe_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buf
         buffer[i] = pipe->buffer[pipe->read_pos];
         pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUF_SIZE;
         pipe->count--;
+    }
+    //wake up one writer if space became available
+    if (to_read > 0) {
+        wait_queue_wake_one(&pipe->w_wait);
     }
     return (int)to_read;
 }
@@ -257,6 +270,10 @@ static int pipe_write(vfs_node_t* node, uint32_t offset, uint32_t size, const ch
         pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUF_SIZE;
         pipe->count++;
     }
+    // wake up a reader if any data became available
+    if (to_write > 0) {
+        wait_queue_wake_one(&pipe->r_wait);
+    }
     return (int)to_write;
 }
 
@@ -267,11 +284,15 @@ static int pipe_close(vfs_node_t* node) {
     //determine if this is read or write end based on flags
     if (node->flags & VFS_FLAG_READ) {
         pipe->read_end_open = 0;
+        //wake writers so they can observe closed reader
+        wait_queue_wake_all(&pipe->w_wait);
     }
     if (node->flags & VFS_FLAG_WRITE) {
         pipe->write_end_open = 0;
+        //wake readers to signal EOF
+        wait_queue_wake_all(&pipe->r_wait);
     }
-    //if both ends are closed, free the pipe
+    //if both ends are closed free the pipe
     if (!pipe->read_end_open && !pipe->write_end_open) {
         kfree(pipe);
         node->private_data = NULL;
@@ -318,14 +339,14 @@ int32_t fd_pipe(int32_t pipefd[2]) {
     write_node->ops = &pipe_ops;
     write_node->private_data = pipe;
     //allocate file descriptors
-    int read_fd = fd_alloc(read_node, VFS_FLAG_READ);
+    int read_fd = fd_alloc(read_node, VFS_FLAG_READ, 0);
     if (read_fd < 0) {
         vfs_destroy_node(read_node);
         vfs_destroy_node(write_node);
         kfree(pipe);
         return -1;
     }
-    int write_fd = fd_alloc(write_node, VFS_FLAG_WRITE);
+    int write_fd = fd_alloc(write_node, VFS_FLAG_WRITE, 0);
     if (write_fd < 0) {
         fd_close(read_fd);
         vfs_destroy_node(write_node);
@@ -335,4 +356,39 @@ int32_t fd_pipe(int32_t pipefd[2]) {
     pipefd[0] = read_fd;
     pipefd[1] = write_fd;
     return 0;
+}
+
+int fd_pipe_is_node(vfs_node_t* node) {
+    if (!node) return 0;
+    return node->ops == &pipe_ops;
+}
+
+static inline pipe_t* node_as_pipe(vfs_node_t* node) {
+    if (!node) return NULL;
+    return (pipe_t*)node->private_data;
+}
+
+int fd_pipe_can_read(vfs_node_t* node) {
+    pipe_t* p = node_as_pipe(node);
+    if (!p) return 0;
+    return (p->count > 0) || (!p->write_end_open);
+}
+
+int fd_pipe_can_write(vfs_node_t* node) {
+    pipe_t* p = node_as_pipe(node);
+    if (!p) return 0;
+    if (!p->read_end_open) return 0; //writing will error
+    return (p->count < PIPE_BUF_SIZE);
+}
+
+void fd_pipe_wait_readable(vfs_node_t* node) {
+    pipe_t* p = node_as_pipe(node);
+    if (!p) return;
+    process_wait_on(&p->r_wait);
+}
+
+void fd_pipe_wait_writable(vfs_node_t* node) {
+    pipe_t* p = node_as_pipe(node);
+    if (!p) return;
+    process_wait_on(&p->w_wait);
 }

@@ -80,15 +80,33 @@ int main(int argc, char** argv) {
     }
     const char* a = argv[1];
     if (!strcmp(a, "div0")) { do_div0(); }
-    else if (!strcmp(a, "int3") || !strcmp(a, "breakpoint")) { do_breakpoint(); }
-    else if (!strcmp(a, "overflow") || !strcmp(a, "into")) { do_overflow(); }
-    else if (!strcmp(a, "bound")) { do_bound(); }
-    else if (!strcmp(a, "ud") || !strcmp(a, "ud2") || !strcmp(a, "ill") || !strcmp(a, "invalid")) { do_invalid_opcode(); }
-    else if (!strcmp(a, "gpf") || !strcmp(a, "gp") || !strcmp(a, "general")) { do_gpf(); }
-    else if (!strcmp(a, "page") || !strcmp(a, "pf") || !strcmp(a, "segv")) { do_pagefault(); }
-    else if (!strcmp(a, "x87") || !strcmp(a, "fpe") || !strcmp(a, "fdiv0")) { do_x87_fpe(); }
-    else if (!strcmp(a, "ac") || !strcmp(a, "align") || !strcmp(a, "alignment")) { do_align_check(); }
-    else if (!strcmp(a, "debug") || !strcmp(a, "int1") || !strcmp(a, "trap")) { do_debug(); }
+    else if (!strcmp(a, "int3") || !strcmp(a, "breakpoint")) { 
+        do_breakpoint(); 
+    }
+    else if (!strcmp(a, "overflow") || !strcmp(a, "into")) { 
+        do_overflow(); 
+    }
+    else if (!strcmp(a, "bound")) { 
+        do_bound(); 
+    }
+    else if (!strcmp(a, "ud") || !strcmp(a, "ud2") || !strcmp(a, "ill") || !strcmp(a, "invalid")) { 
+        do_invalid_opcode(); 
+    }
+    else if (!strcmp(a, "gpf") || !strcmp(a, "gp") || !strcmp(a, "general")) { 
+        do_gpf(); 
+    }
+    else if (!strcmp(a, "page") || !strcmp(a, "pf") || !strcmp(a, "segv")) { 
+        do_pagefault(); 
+    }
+    else if (!strcmp(a, "x87") || !strcmp(a, "fpe") || !strcmp(a, "fdiv0")) { 
+        do_x87_fpe(); 
+    }
+    else if (!strcmp(a, "ac") || !strcmp(a, "align") || !strcmp(a, "alignment")) { 
+        do_align_check(); 
+    }
+    else if (!strcmp(a, "debug") || !strcmp(a, "int1") || !strcmp(a, "trap")) { 
+        do_debug(); 
+    }
     else {
         usage(argv[0]);
         return 1;

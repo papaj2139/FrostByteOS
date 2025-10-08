@@ -20,6 +20,11 @@
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
 
+//lseek whence values
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
 typedef struct {
     int tv_sec;
     int tv_nsec;
@@ -40,6 +45,7 @@ int open(const char* path, int flags);
 int close(int fd);
 int getpid(void);
 int sleep(unsigned int seconds);
+int usleep(unsigned int usec);
 int fork(void);
 int execve(const char* path, char* const argv[], char* const envp[]);
 int wait(int* status);
@@ -56,7 +62,6 @@ int unlink(const char* path);
 int mkdir(const char* path, int mode);
 int rmdir(const char* path);
 int creat(const char* path, int mode);
-int time(void);
 void* mmap(void* addr, size_t length, int prot, int flags);
 void* mmap_ex(void* addr, size_t length, int prot, int flags, int fd, size_t offset);
 int munmap(void* addr, size_t length);
@@ -73,6 +78,10 @@ int getuid(void);
 int geteuid(void);
 int getgid(void);
 int getegid(void);
+int setuid(int uid);
+int setgid(int gid);
+int seteuid(int euid);
+int setegid(int egid);
 int umask(int newmask);
 int chown(const char* path, int uid, int gid);
 int dlopen(const char* path, int flags);
@@ -82,6 +91,8 @@ int rename(const char* oldpath, const char* newpath);
 int dup(int fd);
 int dup2(int oldfd, int newfd);
 int pipe(int pipefd[2]);
+int lseek(int fd, int offset, int whence);
+int fcntl(int fd, int cmd, ...);
 
 #ifdef __cplusplus
 }

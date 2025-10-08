@@ -12,7 +12,7 @@ void fd_init(void);
 
 //allocate a descriptor for the CURRENT process for the given node/flags
 //returns the process-local fd number on success or -1 on failure
-int32_t fd_alloc(vfs_node_t* node, uint32_t flags);
+int32_t fd_alloc(vfs_node_t* node, uint32_t flags, uint32_t append);
 
 //lookup a process-local fd for the CURRENT process and return the open-file object
 //returns NULL if fd is invalid or closed for the current process
@@ -44,5 +44,12 @@ int32_t fd_dup2(int32_t oldfd, int32_t newfd);
 //pipefd[0] = read end, pipefd[1] = write end
 //returns 0 on success or -1 on failure
 int32_t fd_pipe(int32_t pipefd[2]);
+
+//pipe helpers (valid only for pipe-backed vfs nodes)
+int fd_pipe_is_node(vfs_node_t* node);
+int fd_pipe_can_read(vfs_node_t* node);   //>0 data available or writer closed
+int fd_pipe_can_write(vfs_node_t* node);  //space available and reader open
+void fd_pipe_wait_readable(vfs_node_t* node);
+void fd_pipe_wait_writable(vfs_node_t* node);
 
 #endif

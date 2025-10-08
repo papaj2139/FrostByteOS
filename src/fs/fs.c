@@ -2,6 +2,8 @@
 #include "../drivers/serial.h"
 #include "../debug.h"
 #include "fat16_vfs.h"
+#include "fat32.h"
+#include "fat32_vfs.h"
 #include "devfs.h"
 #include "procfs.h"
 #include "tmpfs.h"
@@ -34,13 +36,31 @@ int fs_init(filesystem_t* fs, device_t* device) {
         return -1;
     }
 
-    fs_debug("Valid boot signature found, attempting FAT16 detection");
-
-    //now try FAT16 detection
-    if (fat16_init(&fs->fs_data.fat16, device) == 0) {
-        fs->type = FS_TYPE_FAT16;
-        fs_debug("FAT16 filesystem mounted");
-        return 0;
+    //check if FAT32 or FAT16 by examining root_entry_count
+    //FAT32 has root_entry_count == 0, FAT16 has it > 0
+    uint16_t root_entries = (uint16_t)boot_sector[17] | ((uint16_t)boot_sector[18] << 8);
+    uint16_t fat_size_16 = (uint16_t)boot_sector[22] | ((uint16_t)boot_sector[23] << 8);
+    
+    if (root_entries == 0 && fat_size_16 == 0) {
+        //likely FAT32 (root_entries=0 and fat_size_16=0 are FAT32 indicators)
+        fs_debug("Detected FAT32 filesystem");
+        void* mount_data = NULL;
+        if (fat32_mount(device, &mount_data) == 0) {
+            fs->type = FS_TYPE_FAT32;
+            fs->fs_data.fat32_mount = mount_data;
+            fs_debug("FAT32 filesystem mounted");
+            return 0;
+        }
+        fs_debug("FAT32 mount failed");
+    } else {
+        //try FAT16
+        fs_debug("Attempting FAT16 detection");
+        if (fat16_init(&fs->fs_data.fat16, device) == 0) {
+            fs->type = FS_TYPE_FAT16;
+            fs_debug("FAT16 filesystem mounted");
+            return 0;
+        }
+        fs_debug("FAT16 mount failed");
     }
 
     fs->type = FS_TYPE_NONE;
@@ -82,6 +102,19 @@ int fs_vfs_init(void) {
         ok = 1;
     } else {
         fs_debug("Failed to register FAT16 with VFS");
+    }
+    
+    //initialize and register FAT32
+    if (fat32_init() == 0) {
+        fs_debug("FAT32 initialized");
+        if (vfs_register_fs("fat32", &fat32_vfs_ops) == 0) {
+            fs_debug("FAT32 registered with VFS");
+            ok = 1;
+        } else {
+            fs_debug("Failed to register FAT32 with VFS");
+        }
+    } else {
+        fs_debug("Failed to initialize FAT32");
     }
 
     //register DevFS

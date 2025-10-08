@@ -21,16 +21,16 @@ _start:
     inc ecx                 ;argc + 1 (for argv NULL)
     shl ecx, 2              ;(argc + 1) * 4
     add ecx, ebx            ;envp = &argv[argc + 1]
-    ; push args for main and run ctors before calling main
-    push ecx                ; envp
-    push ebx                ; argv
-    push eax                ; argc
+    ;push args for main and run ctors before calling main
+    push ecx                ;envp
+    push ebx                ;argv
+    push eax                ;argc
     call __libc_run_ctors
     call main
     add esp, 12
     ;return value in eax
-    ; run dtors before exiting
-    push eax                ; preserve exit code
+    ;run dtors before exiting
+    push eax                ;preserve exit code
     call __libc_run_dtors
     pop eax
     push eax

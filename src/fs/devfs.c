@@ -40,6 +40,8 @@ static int devfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out);
 static int devfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out);
 static int devfs_get_size(vfs_node_t* node);
 static int devfs_ioctl(vfs_node_t* node, uint32_t request, void* arg);
+static int devfs_poll_can_read(vfs_node_t* node);
+static int devfs_poll_can_write(vfs_node_t* node);
 
 vfs_operations_t devfs_ops = {
     .open = devfs_open,
@@ -54,11 +56,18 @@ vfs_operations_t devfs_ops = {
     .finddir = devfs_finddir,
     .get_size = devfs_get_size,
     .ioctl = devfs_ioctl,
+    .poll_can_read = devfs_poll_can_read,
+    .poll_can_write = devfs_poll_can_write,
 };
 
 
 static int devfs_open(vfs_node_t* node, uint32_t flags) {
     (void)node; (void)flags; return 0;
+}
+
+static int devfs_poll_can_write(vfs_node_t* node) {
+    (void)node;
+    return 1;
 }
 
 static int devfs_close(vfs_node_t* node) {
@@ -84,7 +93,8 @@ static int devfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* bu
         case DEVFS_NODE_INPUT_MOUSE: {
             if (size < sizeof(mouse_input_event_t)) return 0;
             uint32_t max = size / sizeof(mouse_input_event_t);
-            int n = mouse_input_read_events((mouse_input_event_t*)buffer, max, 1);
+            //use non-blocking reads (blocking=0) for better performance
+            int n = mouse_input_read_events((mouse_input_event_t*)buffer, max, 0);
             if (n <= 0) return 0;
             return n * (int)sizeof(mouse_input_event_t);
         }
@@ -191,6 +201,20 @@ static int devfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) {
         return device_ioctl(p->dev, request, arg);
     }
     return -1;
+}
+
+static int devfs_poll_can_read(vfs_node_t* node) {
+    if (!node) return 0;
+    devfs_priv_t* p = (devfs_priv_t*)node->private_data;
+    if (!p) return 0;
+    switch (p->kind) {
+        case DEVFS_NODE_INPUT_KBD0:
+            return kbd_input_has_events();
+        case DEVFS_NODE_INPUT_MOUSE:
+            return mouse_input_has_events();
+        default:
+            return 0;
+    }
 }
 
 static vfs_node_t* devfs_make_node(const char* name, uint32_t type, devfs_node_kind_t kind, device_t* dev, vfs_node_t* parent) {

@@ -19,4 +19,4 @@ int raise(int sig);
 }
 #endif
 
-#endif // LIBC_SIGNAL_H
+#endif

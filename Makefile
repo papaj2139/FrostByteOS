@@ -4,14 +4,16 @@ CC = i686-elf-gcc
 CFLAGS = -m32 -std=gnu99 -ffreestanding -O2 -Wall -Wextra -Isrc/libc -Isrc -fno-stack-protector
 ASM = nasm
 ASMFLAGS = -f elf32
+AR = i686-elf-ar
 USER_CC = i686-elf-gcc
-USER_CFLAGS = -m32 -ffreestanding -Os -Wall -Wextra -fno-stack-protector -fno-omit-frame-pointer -nostdlib -Iuser/libc/include
+USER_LD = i686-elf-ld
+USER_CFLAGS = -m32 -ffreestanding -Os -Wall -Wextra -fno-stack-protector -fno-omit-frame-pointer -nostdlib
 USER_PIC_CFLAGS = $(USER_CFLAGS)
 LDFLAGS = -m32 -nostdlib -T linker.ld
-USER_LIBC_OBJS := user/libc/crt0.o user/libc/syscalls.o user/libc/string.o user/libc/stdio.o user/libc/errno.o user/libc/signal.o user/libc/stdlib.o
+USER_LIBC_DIR := user/libc
+USER_LIBUSER_DIR := user/libuser
 INITRAMFS_DIR := initramfs_root
-#VERY soon this will get horendously long and complex find a better solution maybe just a wildcard?
-.PHONY: all clean run iso menuconfig
+.PHONY: all clean run iso menuconfig tests
 
 all: iso
 
@@ -58,6 +60,15 @@ rtc.o: src/drivers/rtc.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 ata.o: src/drivers/ata.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+pci.o: src/drivers/pci.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+ahci.o: src/drivers/ahci.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+apic.o: src/drivers/apic.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 vga.o: src/gui/vga.c
@@ -114,10 +125,19 @@ device_manager.o: src/device_manager.c
 fat16.o: src/fs/fat16.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+fat32.o: src/fs/fat32.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 fs.o: src/fs/fs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 vfs.o: src/fs/vfs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+fat16_vfs.o: src/fs/fat16_vfs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+fat32_vfs.o: src/fs/fat32_vfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 devfs.o: src/fs/devfs.c
@@ -133,339 +153,6 @@ initramfs_cpio.o: src/fs/initramfs_cpio.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 initramfs.o: src/fs/initramfs.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-user/libc/crt0.o: user/libc/crt0.asm
-	$(ASM) $(ASMFLAGS) $< -o $@
-
-user/libc/syscalls.o: user/libc/src/syscalls.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/libc/string.o: user/libc/src/string.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/libc/stdio.o: user/libc/src/stdio.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/libc/errno.o: user/libc/src/errno.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/libc/signal.o: user/libc/src/signal.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/libc/stdlib.o: user/libc/src/stdlib.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/libc/syscalls.pic.o: user/libc/src/syscalls.c
-	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
-
-user/libc/string.pic.o: user/libc/src/string.c
-	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
-
-user/libc/stdio.pic.o: user/libc/src/stdio.c
-	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
-
-user/libc/errno.pic.o: user/libc/src/errno.c
-	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
-
-user/libc/signal.pic.o: user/libc/src/signal.c
-	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
-
-user/libc/stdlib.pic.o: user/libc/src/stdlib.c
-	$(USER_CC) $(USER_PIC_CFLAGS) -c $< -o $@
-
-user/libc/libc.so.1: user/libc/syscalls.pic.o user/libc/string.pic.o user/libc/stdio.pic.o user/libc/errno.pic.o user/libc/signal.pic.o user/libc/stdlib.pic.o
-	i686-elf-ld -shared -m elf_i386 -nostdlib -soname libc.so.1 $^ -o $@
-
-user/init.o: user/init.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/forktest.o: user/forktest.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/fbsh.o: user/fbsh.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/init.elf: user/init.o $(USER_LIBC_OBJS) user.ld
-	i686-elf-ld -m elf_i386 -nostdlib -T user.ld $(USER_LIBC_OBJS) user/init.o -o $@
-
-user/forktest.elf: user/forktest.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/forktest.o -L user/libc -l:libc.so.1 -o $@
-
-user/fbsh.elf: user/fbsh.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/fbsh.o -L user/libc -l:libc.so.1 -o $@
-
-user/mount.o: user/mount.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/mount.elf: user/mount.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/mount.o -L user/libc -l:libc.so.1 -o $@
-
-user/ls.o: user/ls.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/ls.elf: user/ls.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/ls.o -L user/libc -l:libc.so.1 -o $@
-
-user/echo.o: user/echo.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/echo.elf: user/echo.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/echo.o -L user/libc -l:libc.so.1 -o $@
-
-user/cat.o: user/cat.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/cat.elf: user/cat.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/cat.o -L user/libc -l:libc.so.1 -o $@
-
-user/touch.o: user/touch.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/touch.elf: user/touch.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/touch.o -L user/libc -l:libc.so.1 -o $@
-
-user/mkdir.o: user/mkdir.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/mkdir.elf: user/mkdir.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/mkdir.o -L user/libc -l:libc.so.1 -o $@
-
-user/write.o: user/write.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/write.elf: user/write.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/write.o -L user/libc -l:libc.so.1 -o $@
-
-user/kill.o: user/kill.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/kill.elf: user/kill.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/kill.o -L user/libc -l:libc.so.1 -o $@
-
-user/ln.o: user/ln.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/ln.elf: user/ln.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/ln.o -L user/libc -l:libc.so.1 -o $@
-
-user/ps.o: user/ps.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/ps.elf: user/ps.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/ps.o -L user/libc -l:libc.so.1 -o $@
-
-user/mkfat16.o: user/mkfat16.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/mkfat16.elf: user/mkfat16.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/mkfat16.o -L user/libc -l:libc.so.1 -o $@
-
-user/lsblk.o: user/lsblk.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/lsblk.elf: user/lsblk.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/lsblk.o -L user/libc -l:libc.so.1 -o $@
-
-user/partmk.o: user/partmk.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/partmk.elf: user/partmk.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/partmk.o -L user/libc -l:libc.so.1 -o $@
-
-user/crash.o: user/crash.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/crash.elf: user/crash.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/crash.o -L user/libc -l:libc.so.1 -o $@
-
-user/waitshow.o: user/waitshow.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/waitshow.elf: user/waitshow.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/waitshow.o -L user/libc -l:libc.so.1 -o $@
-
-user/ldd.o: user/ldd.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/ldd.elf: user/ldd.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/ldd.o -L user/libc -l:libc.so.1 -o $@
-
-user/true.o: user/true.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/true.elf: user/true.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/true.o -L user/libc -l:libc.so.1 -o $@
-
-user/false.o: user/false.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/false.elf: user/false.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/false.o -L user/libc -l:libc.so.1 -o $@
-
-user/sleep.o: user/sleep.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/sleep.elf: user/sleep.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/sleep.o -L user/libc -l:libc.so.1 -o $@
-
-user/dltest.o: user/dltest.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/dltest.elf: user/dltest.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/dltest.o -L user/libc -l:libc.so.1 -o $@
-
-user/hello_dyn.o: user/hello_dyn.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/hello_dyn.elf: user/hello_dyn.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/hello_dyn.o -L user/libc -l:libc.so.1 -o $@
-
-user/uname.o: user/uname.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/uname.elf: user/uname.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/uname.o -L user/libc -l:libc.so.1 -o $@
-
-user/uptime.o: user/uptime.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/uptime.elf: user/uptime.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/uptime.o -L user/libc -l:libc.so.1 -o $@
-
-user/free.o: user/free.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/free.elf: user/free.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/free.o -L user/libc -l:libc.so.1 -o $@
-
-user/env.o: user/env.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/env.elf: user/env.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/env.o -L user/libc -l:libc.so.1 -o $@
-
-user/yes.o: user/yes.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/yes.elf: user/yes.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/yes.o -L user/libc -l:libc.so.1 -o $@
-
-user/head.o: user/head.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/head.elf: user/head.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/head.o -L user/libc -l:libc.so.1 -o $@
-
-user/wc.o: user/wc.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/wc.elf: user/wc.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/wc.o -L user/libc -l:libc.so.1 -o $@
-
-user/hd.o: user/hd.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/hd.elf: user/hd.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/hd.o -L user/libc -l:libc.so.1 -o $@
-
-user/which.o: user/which.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/which.elf: user/which.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/which.o -L user/libc -l:libc.so.1 -o $@
-
-user/clear.o: user/clear.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/clear.elf: user/clear.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/clear.o -L user/libc -l:libc.so.1 -o $@
-
-user/vplay.o: user/vplay.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/vplay.elf: user/vplay.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/vplay.o -L user/libc -l:libc.so.1 -o $@
-
-user/sbplay.o: user/sbplay.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/sbplay.elf: user/sbplay.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/sbplay.o -L user/libc -l:libc.so.1 -o $@
-
-user/fbfill.o: user/fbfill.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/fbfill.elf: user/fbfill.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/fbfill.o -L user/libc -l:libc.so.1 -o $@
-
-user/edit.o: user/edit.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/edit.elf: user/edit.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/edit.o -L user/libc -l:libc.so.1 -o $@
-
-user/pipetest.o: user/pipetest.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/pipetest.elf: user/pipetest.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/pipetest.o -L user/libc -l:libc.so.1 -o $@
-
-user/chmod.o: user/chmod.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/chmod.elf: user/chmod.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/chmod.o -L user/libc -l:libc.so.1 -o $@
-
-user/chown.o: user/chown.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/chown.elf: user/chown.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/chown.o -L user/libc -l:libc.so.1 -o $@
-
-user/stat.o: user/stat.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/stat.elf: user/stat.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/stat.o -L user/libc -l:libc.so.1 -o $@
-
-user/whoami.o: user/whoami.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/whoami.elf: user/whoami.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/whoami.o -L user/libc -l:libc.so.1 -o $@
-
-user/id.o: user/id.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/id.elf: user/id.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/id.o -L user/libc -l:libc.so.1 -o $@
-
-user/pwd.o: user/pwd.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/pwd.elf: user/pwd.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/pwd.o -L user/libc -l:libc.so.1 -o $@
-
-user/cp.o: user/cp.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/cp.elf: user/cp.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/cp.o -L user/libc -l:libc.so.1 -o $@
-
-user/mv.o: user/mv.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/mv.elf: user/mv.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/mv.o -L user/libc -l:libc.so.1 -o $@
-
-user/rm.o: user/rm.c
-	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
-
-user/rm.elf: user/rm.o user/libc/crt0.o user/libc/libc.so.1
-	i686-elf-ld -m elf_i386 -nostdlib -e _start -rpath=/lib --enable-new-dtags user/libc/crt0.o user/rm.o -L user/libc -l:libc.so.1 -o $@
-
-fat16_vfs.o: src/fs/fat16_vfs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 fd.o: src/fd.c
@@ -510,23 +197,85 @@ paging_asm.o: src/mm/paging_asm.asm
 process.o: src/process.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+scheduler.o: src/scheduler.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 process_asm.o: src/process_asm.asm
 	$(ASM) $(ASMFLAGS) $< -o $@
 
+shm.o: src/ipc/shm.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+socket.o: src/ipc/socket.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(KERNEL): boot.o kernel.o string.o stdlib.o io.o font.o \
-           keyboard.o mouse.o tty.o serial.o sb16.o pc_speaker.o timer.o rtc.o ata.o \
-           vga.o vga_dev.o fb.o fbcon.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
-           syscall.o syscall_asm.o device_manager.o fat16.o fs.o vfs.o fat16_vfs.o devfs.o procfs.o tmpfs.o fd.o initramfs.o initramfs_cpio.o \
-           pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o \
-           acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o uaccess.o elf.o dynlink.o
+		   keyboard.o mouse.o tty.o serial.o sb16.o pc_speaker.o timer.o rtc.o ata.o pci.o ahci.o apic.o \
+		   vga.o vga_dev.o fb.o fbcon.o idt.o irq.o pic.o isr.o isr_c.o gdt.o gdt_asm.o tss.o \
+		   syscall.o syscall_asm.o device_manager.o fat16.o fat32.o fs.o vfs.o fat16_vfs.o fat32_vfs.o devfs.o procfs.o tmpfs.o fd.o initramfs.o initramfs_cpio.o \
+		   pmm.o vmm.o heap.o paging_asm.o process.o process_asm.o scheduler.o \
+		   acpi.o cga.o panic.o klog.o kreboot.o kshutdown.o signal.o uaccess.o elf.o dynlink.o shm.o socket.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/lsblk.elf user/partmk.elf user/crash.elf user/waitshow.elf user/ldd.elf user/dltest.elf user/hello_dyn.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/clear.elf user/vplay.elf user/sbplay.elf user/fbfill.elf user/edit.elf user/pipetest.elf user/libc/libc.so.1
+.PHONY: user_libc user_libuser user_libs user_coreutils user_frostywm user_desktop user_apps userspace
+
+user_libc:
+	$(MAKE) -C $(USER_LIBC_DIR) CC=$(USER_CC) AS=$(ASM) AR=$(AR) CFLAGS="$(USER_CFLAGS) -Iinclude" PIC_CFLAGS="$(USER_PIC_CFLAGS) -Iinclude" ASMFLAGS="$(ASMFLAGS)"
+
+user_libuser:
+	$(MAKE) -C $(USER_LIBUSER_DIR) CC=$(USER_CC) LD=$(USER_LD) AR=$(AR) CFLAGS="$(USER_CFLAGS) -I../libc/include -Iinclude" PIC_CFLAGS="$(USER_PIC_CFLAGS) -I../libc/include -Iinclude"
+
+user_libs: user_libc user_libuser
+
+user_frostyinit: user_libs
+	$(MAKE) -C user/FrostyInit USER_CC=$(USER_CC) USER_LD=$(USER_LD) USER_CFLAGS="$(USER_CFLAGS) -I../libc/include -I../libuser/include"
+
+user_coreutils: user_libs
+	$(MAKE) -C user/coreutils USER_CC=$(USER_CC) USER_LD=$(USER_LD) USER_CFLAGS="$(USER_CFLAGS) -I../libc/include -I../libuser/include" USER_LDFLAGS="-m elf_i386 -nostdlib -dynamic-linker /lib/libc.so.1 -e _start -rpath=/lib --enable-new-dtags"
+
+user_frostywm: user_libs
+	$(MAKE) -C user/frostywm USER_CC=$(USER_CC) USER_LD=$(USER_LD) USER_CFLAGS="$(USER_CFLAGS) -I../libc/include -I../libuser/include -I." USER_LDFLAGS="-m elf_i386 -nostdlib -dynamic-linker /lib/libc.so.1 -e _start -rpath=/lib --enable-new-dtags"
+
+user_desktop: user_frostywm
+	$(MAKE) -C user/desktop USER_CC=$(USER_CC) USER_LD=$(USER_LD) USER_CFLAGS="$(USER_CFLAGS) -I../libc/include -I../libuser/include -I../frostywm" USER_LDFLAGS="-m elf_i386 -nostdlib -dynamic-linker /lib/libc.so.1 -e _start -rpath=/lib --enable-new-dtags"
+
+user_apps: user_libs
+	$(MAKE) -C user USER_CC=$(USER_CC) USER_LD=$(USER_LD) USER_CFLAGS="$(USER_CFLAGS) -Ilibc/include -Ilibuser/include" USER_LDFLAGS="-m elf_i386 -nostdlib -dynamic-linker /lib/libc.so.1 -e _start -rpath=/lib --enable-new-dtags"
+
+userspace: user_libs user_frostyinit user_coreutils user_frostywm user_desktop user_apps
+
+tests: user_libs
+	$(MAKE) -C tests USER_CC=$(USER_CC) USER_LD=$(USER_LD)
+
+user/init.elf: user/libc/libc.a user/libuser/libuser.a
+	$(MAKE) -C user/FrostyInit USER_CC=$(USER_CC) USER_LD=$(USER_LD) USER_CFLAGS="$(USER_CFLAGS) -I../libc/include -I../libuser/include"
+
+user/libc/libc.a:
+	$(MAKE) -C user/libc CC=$(USER_CC) AS=$(ASM) AR=$(AR) \
+	CFLAGS="$(USER_CFLAGS) -Iinclude" PIC_CFLAGS="$(USER_PIC_CFLAGS) -Iinclude" ASMFLAGS="$(ASMFLAGS)" static
+
+user/libc/libc.so.1:
+	$(MAKE) -C user/libc CC=$(USER_CC) AS=$(ASM) AR=$(AR) \
+	CFLAGS="$(USER_CFLAGS) -Iinclude" PIC_CFLAGS="$(USER_PIC_CFLAGS) -Iinclude" ASMFLAGS="$(ASMFLAGS)" shared
+
+user/libuser/libuser.a:
+	$(MAKE) -C user/libuser CC=$(USER_CC) LD=$(USER_LD) AR=$(AR) \
+	CFLAGS="$(USER_CFLAGS) -I../libc/include -Iinclude" PIC_CFLAGS="$(USER_PIC_CFLAGS) -I../libc/include -Iinclude" static
+
+user/libuser/libuser.so.1:
+	$(MAKE) -C user/libuser CC=$(USER_CC) LD=$(USER_LD) AR=$(AR) \
+	CFLAGS="$(USER_CFLAGS) -I../libc/include -Iinclude" PIC_CFLAGS="$(USER_PIC_CFLAGS) -I../libc/include -Iinclude" shared
+
+user/%.elf: user/libc/libc.so.1 user/libuser/libuser.so.1
+	$(MAKE) -C user USER_CC=$(USER_CC) USER_LD=$(USER_LD) \
+	USER_CFLAGS="$(USER_CFLAGS) -Ilibc/include -Ilibuser/include" \
+	USER_LDFLAGS="-m elf_i386 -nostdlib -dynamic-linker /lib/libc.so.1 -e _start -rpath=/lib --enable-new-dtags" $(@F)
+
+initramfs.cpio: userspace user/init.elf user/fbsh.elf user/login.elf user/useradd.elf user/passwd.elf user/su.elf user/getent.elf user/mount.elf user/ls.elf user/echo.elf user/cat.elf user/touch.elf user/mkdir.elf user/write.elf user/kill.elf user/ln.elf user/ps.elf user/mkfat16.elf user/mkfat32.elf user/lsblk.elf user/partmk.elf user/crash.elf user/ldd.elf user/chmod.elf user/chown.elf user/stat.elf user/whoami.elf user/id.elf user/pwd.elf user/cp.elf user/mv.elf user/rm.elf user/true.elf user/false.elf user/sleep.elf user/uname.elf user/uptime.elf user/free.elf user/env.elf user/yes.elf user/head.elf user/wc.elf user/hd.elf user/which.elf user/clear.elf user/vplay.elf user/sbplay.elf user/fbfill.elf user/edit.elf user/dd.elf user/frostyde.elf user/frostyde_wm.elf user/frostywm.elf user/libc/libc.so.1 user/libuser/libuser.so.1
 	rm -rf $(INITRAMFS_DIR) initramfs.cpio
 	mkdir -p $(INITRAMFS_DIR)/bin $(INITRAMFS_DIR)/etc $(INITRAMFS_DIR)/dev $(INITRAMFS_DIR)/proc $(INITRAMFS_DIR)/mnt $(INITRAMFS_DIR)/tmp $(INITRAMFS_DIR)/usr/bin $(INITRAMFS_DIR)/lib
 	cp user/init.elf $(INITRAMFS_DIR)/bin/init
 	cp user/fbsh.elf $(INITRAMFS_DIR)/bin/sh
-	cp user/forktest.elf $(INITRAMFS_DIR)/bin/forktest
 	cp user/mount.elf $(INITRAMFS_DIR)/bin/mount
 	cp user/ls.elf $(INITRAMFS_DIR)/bin/ls
 	cp user/echo.elf $(INITRAMFS_DIR)/bin/echo
@@ -538,13 +287,11 @@ initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf use
 	cp user/ln.elf $(INITRAMFS_DIR)/bin/ln
 	cp user/ps.elf $(INITRAMFS_DIR)/bin/ps
 	cp user/mkfat16.elf $(INITRAMFS_DIR)/bin/mkfat16
+	cp user/mkfat32.elf $(INITRAMFS_DIR)/bin/mkfat32
 	cp user/lsblk.elf $(INITRAMFS_DIR)/bin/lsblk
 	cp user/partmk.elf $(INITRAMFS_DIR)/bin/partmk
 	cp user/crash.elf $(INITRAMFS_DIR)/bin/crash
-	cp user/waitshow.elf $(INITRAMFS_DIR)/bin/waitshow
 	cp user/ldd.elf $(INITRAMFS_DIR)/bin/ldd
-	cp user/dltest.elf $(INITRAMFS_DIR)/bin/dltest
-	cp user/hello_dyn.elf $(INITRAMFS_DIR)/bin/hello-dyn
 	cp user/chmod.elf $(INITRAMFS_DIR)/bin/chmod
 	cp user/chown.elf $(INITRAMFS_DIR)/bin/chown
 	cp user/stat.elf $(INITRAMFS_DIR)/bin/stat
@@ -571,10 +318,21 @@ initramfs.cpio: user/init.elf user/forktest.elf user/fbsh.elf user/mount.elf use
 	cp user/sbplay.elf $(INITRAMFS_DIR)/bin/sbplay
 	cp user/fbfill.elf $(INITRAMFS_DIR)/bin/fbfill
 	cp user/edit.elf $(INITRAMFS_DIR)/bin/edit
-	cp user/pipetest.elf $(INITRAMFS_DIR)/bin/pipetest
+	cp user/dd.elf $(INITRAMFS_DIR)/bin/dd
+	cp user/login.elf $(INITRAMFS_DIR)/bin/login
+	cp user/useradd.elf $(INITRAMFS_DIR)/bin/useradd
+	cp user/passwd.elf $(INITRAMFS_DIR)/bin/passwd
+	cp user/su.elf $(INITRAMFS_DIR)/bin/su
+	cp user/getent.elf $(INITRAMFS_DIR)/bin/getent
 	cp user/libc/libc.so.1 $(INITRAMFS_DIR)/lib/libc.so.1
-	cp zap-ext-vga16.psf $(INITRAMFS_DIR)/etc/font.psf
+	cp user/libuser/libuser.so.1 $(INITRAMFS_DIR)/lib/libuser.so.1
+	cp user/frostyde_wm.elf $(INITRAMFS_DIR)/bin/frostyde_wm
+	cp user/frostywm.elf $(INITRAMFS_DIR)/bin/frostywm
+	mkdir -p $(INITRAMFS_DIR)/tmp
 	echo "Welcome to FrostByte (cpio initramfs)" > $(INITRAMFS_DIR)/etc/motd
+	echo "root::0:0:root:/root:/bin/sh" > $(INITRAMFS_DIR)/etc/passwd
+	echo "root::0:" > $(INITRAMFS_DIR)/etc/group
+	mkdir -p $(INITRAMFS_DIR)/root $(INITRAMFS_DIR)/home
 	ln -sf /etc/motd $(INITRAMFS_DIR)/motd_link
 	ln -sf /bin/sh $(INITRAMFS_DIR)/usr/bin/sh
 	cd $(INITRAMFS_DIR) && find . | cpio -o -H newc > ../initramfs.cpio
@@ -584,7 +342,7 @@ iso: $(KERNEL) initramfs.cpio
 	cp $(KERNEL) isodir/boot/
 	cp boot/grub/grub.cfg isodir/boot/grub/
 	cp initramfs.cpio isodir/boot/initramfs.cpio
-	grub-mkrescue -o $(ISO_NAME) isodir
+	grub2-mkrescue -o $(ISO_NAME) isodir
 
 run: iso disk.img
 	qemu-system-i386 -cdrom $(ISO_NAME)
@@ -615,4 +373,10 @@ menuconfig: $(MENUCONFIG_BIN)
 	@$(MENUCONFIG_BIN)
 
 clean:
-	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir $(INITRAMFS_DIR) initramfs.cpio user/*.o user/*.elf $(MENUCONFIG_BIN)
+	rm -rf *.o $(KERNEL) $(ISO_NAME) isodir $(INITRAMFS_DIR) initramfs.cpio user/*.o user/*.elf $(MENUCONFIG_BIN) *.so.*
+	$(MAKE) -C user/libc clean || true
+	$(MAKE) -C user/libuser clean || true
+	$(MAKE) -C user/coreutils clean || true
+	$(MAKE) -C user/frostywm clean || true
+	$(MAKE) -C user/desktop clean || true
+	$(MAKE) -C user clean || true

@@ -1,6 +1,8 @@
 #ifndef _KERNEL_STDINT_H
 #define _KERNEL_STDINT_H
 
+#include <stddef.h>
+
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -12,5 +14,7 @@ typedef int                int32_t;
 typedef long long          int64_t;
 
 typedef unsigned int       uintptr_t;
+typedef unsigned long long uintmax_t;
+typedef long long          intmax_t;
 
 #endif

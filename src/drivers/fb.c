@@ -1,4 +1,5 @@
 #include "fb.h"
+#include "fbcon.h"
 #include "../mm/vmm.h"
 #include "../mm/heap.h"
 #include <string.h>
@@ -83,6 +84,15 @@ static int fb_dev_ioctl(struct device* d, uint32_t cmd, void* arg) {
             return 0;
         }
         return -1;
+    }
+    if (cmd == FB_IOCTL_SET_CONSOLE) {
+        //enable/disable console output
+        int enable = 0;
+        if (arg) {
+            enable = *((int*)arg);
+        }
+        fbcon_set_enabled(enable);
+        return 0;
     }
     return -1;
 }

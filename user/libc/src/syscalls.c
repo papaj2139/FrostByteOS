@@ -1,8 +1,14 @@
 #include <stddef.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/shm.h>
+#include <sys/select.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <fcntl.h>
 
 //forward decls for ctor/dtor runners
 void __libc_run_ctors(void);
@@ -65,6 +71,22 @@ static volatile int __dtors_ran = 0;
 #define SYS_DUP            1053
 #define SYS_DUP2           1054
 #define SYS_PIPE           1055
+#define SYS_SETUID         1056
+#define SYS_SETGID         1057
+#define SYS_SETEUID        1058
+#define SYS_SETEGID        1059
+#define SYS_LSEEK          1060
+#define SYS_SOCKET         1061
+#define SYS_BIND           1062
+#define SYS_LISTEN         1063
+#define SYS_ACCEPT         1064
+#define SYS_CONNECT        1065
+#define SYS_SHMGET         1066
+#define SYS_SHMAT          1067
+#define SYS_SHMDT          1068
+#define SYS_SHMCTL         1069
+#define SYS_SELECT         1070
+#define SYS_FCNTL          1071
 
 typedef struct {
     int tv_sec;
@@ -141,6 +163,13 @@ int getpid(void) {
 
 int sleep(unsigned int seconds) {
     return __fixret(syscall1(SYS_SLEEP, (int)seconds));
+}
+
+int usleep(unsigned int usec) {
+    timespec32_t req;
+    req.tv_sec = usec / 1000000;
+    req.tv_nsec = (usec % 1000000) * 1000;
+    return __fixret(syscall2(SYS_NANOSLEEP, (int)&req, 0));
 }
 
 int fork(void) {
@@ -239,8 +268,18 @@ int munmap(void* addr, size_t length) {
     return __fixret(syscall2(SYS_MUNMAP, (int)addr, (int)length));
 }
 
-int time(void) {
-    return __fixret(syscall0(SYS_TIME));
+time_t time(time_t* tloc) {
+    int r = syscall0(SYS_TIME);
+    if (r < 0) {
+        __fixret(r);
+        return (time_t)-1;
+    }
+
+    time_t now = (time_t)r;
+    if (tloc) {
+        *tloc = now;
+    }
+    return now;
 }
 
 int chdir(const char* path) {
@@ -379,4 +418,79 @@ int dup2(int oldfd, int newfd) {
 
 int pipe(int pipefd[2]) {
     return __fixret(syscall1(SYS_PIPE, (int)pipefd));
+}
+
+int setuid(int uid) {
+    return __fixret(syscall1(SYS_SETUID, uid));
+}
+
+int setgid(int gid) {
+    return __fixret(syscall1(SYS_SETGID, gid));
+}
+
+int seteuid(int euid) {
+    return __fixret(syscall1(SYS_SETEUID, euid));
+}
+
+int setegid(int egid) {
+    return __fixret(syscall1(SYS_SETEGID, egid));
+}
+
+int lseek(int fd, int offset, int whence) {
+    return __fixret(syscall3(SYS_LSEEK, fd, offset, whence));
+}
+
+int socket(int domain, int type, int protocol) {
+    return __fixret(syscall3(SYS_SOCKET, domain, type, protocol));
+}
+
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    return __fixret(syscall3(SYS_BIND, sockfd, (int)addr, (int)addrlen));
+}
+
+int listen(int sockfd, int backlog) {
+    return __fixret(syscall2(SYS_LISTEN, sockfd, backlog));
+}
+
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    return __fixret(syscall3(SYS_ACCEPT, sockfd, (int)addr, (int)addrlen));
+}
+
+int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    return __fixret(syscall3(SYS_CONNECT, sockfd, (int)addr, (int)addrlen));
+}
+
+int shmget(key_t key, size_t size, int shmflg) {
+    return __fixret(syscall3(SYS_SHMGET, (int)key, (int)size, shmflg));
+}
+
+void *shmat(int shmid, const void *shmaddr, int shmflg) {
+    int ret = syscall3(SYS_SHMAT, shmid, (int)shmaddr, shmflg);
+    //error range is -4095 to -1
+    //any value >= 0xFFFFF001 (-4095) is an error
+    if ((unsigned int)ret >= 0xFFFFF001) {
+        errno = -(ret);
+        return (void*)-1;
+    }
+    return (void*)ret;
+}
+
+int shmdt(const void *shmaddr) {
+    return __fixret(syscall1(SYS_SHMDT, (int)shmaddr));
+}
+
+int shmctl(int shmid, int cmd, struct shmid_ds *buf) {
+    return __fixret(syscall3(SYS_SHMCTL, shmid, cmd, (int)buf));
+}
+
+int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout) {
+    return __fixret(syscall5(SYS_SELECT, nfds, (int)readfds, (int)writefds, (int)exceptfds, (int)timeout));
+}
+
+int fcntl(int fd, int cmd, ...) {
+    va_list args;
+    va_start(args, cmd);
+    int arg = va_arg(args, int);
+    va_end(args);
+    return __fixret(syscall3(SYS_FCNTL, fd, cmd, arg));
 }

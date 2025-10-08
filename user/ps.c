@@ -50,17 +50,25 @@ int main(int argc, char** argv, char** envp) {
         char cmdline[256];
         //status
         {
-            char* p = path; const char* a = "/proc/"; while (*a && (p - path) < (int)sizeof(path)-1) *p++ = *a++;
-            const char* b = name; while (*b && (p - path) < (int)sizeof(path)-1) *p++ = *b++;
-            const char* c = "/status"; while (*c && (p - path) < (int)sizeof(path)-1) *p++ = *c++;
+            char* p = path;
+            const char* a = "/proc/";
+            while (*a && (p - path) < (int)sizeof(path)-1) *p++ = *a++;
+            const char* b = name;
+            while (*b && (p - path) < (int)sizeof(path)-1) *p++ = *b++;
+            const char* c = "/status";
+            while (*c && (p - path) < (int)sizeof(path)-1) *p++ = *c++;
             *p = '\0';
             if (read_file(path, status, sizeof(status)) < 0) continue;
         }
         //cmdline
         {
-            char* p = path; const char* a = "/proc/"; while (*a && (p - path) < (int)sizeof(path)-1) *p++ = *a++;
-            const char* b = name; while (*b && (p - path) < (int)sizeof(path)-1) *p++ = *b++;
-            const char* c = "/cmdline"; while (*c && (p - path) < (int)sizeof(path)-1) *p++ = *c++;
+            char* p = path;
+            const char* a = "/proc/";
+            while (*a && (p - path) < (int)sizeof(path)-1) *p++ = *a++;
+            const char* b = name; 
+            while (*b && (p - path) < (int)sizeof(path)-1) *p++ = *b++;
+            const char* c = "/cmdline"; 
+            while (*c && (p - path) < (int)sizeof(path)-1) *p++ = *c++;
             *p = '\0';
             if (read_file(path, cmdline, sizeof(cmdline)) < 0) cmdline[0] = '\0';
         }

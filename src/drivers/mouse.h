@@ -27,6 +27,7 @@ typedef struct {
 //fill buffer with up to max_events events if blocking!=0 block until at least one event
 //returns number of events copied
 int mouse_input_read_events(mouse_input_event_t* out, uint32_t max_events, int blocking);
+int mouse_input_has_events(void);
 
 //device manager integration
 device_t* mouse_create_device(void);

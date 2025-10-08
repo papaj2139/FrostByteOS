@@ -87,17 +87,11 @@ static int build_user_stack(page_directory_t new_dir,
                             uint32_t new_stack_phys,
                             char* const argv[], char* const envp[],
                             uint32_t* out_esp) {
-    (void)new_dir; //unused stack page is mapped via kernel temp mapping
+    (void)new_dir; //we'll build into a kernel buffer then copy to the stack page
     const uint32_t ustack_va = ustack_top - 0x1000;
-    const uint32_t temp_kmap = 0x00800000;
-
-    //map stack page into kernel temporarily and zero it
-    uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-    if (vmm_map_page(temp_kmap, new_stack_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        if (eflags_save & 0x200) __asm__ volatile ("sti");
-        return -1;
-    }
-    memset((void*)temp_kmap, 0, PAGE_SIZE);
+    char* kpage = (char*)kmalloc(PAGE_SIZE);
+    if (!kpage) return -1;
+    memset(kpage, 0, PAGE_SIZE);
 
     //count argc/envc
     int argc = 0;
@@ -129,8 +123,7 @@ static int build_user_stack(page_directory_t new_dir,
     uint32_t envp_vec_bytes = 4u * ((uint32_t)envc + 1u);
     //plus one word for argc
     if (strings_size + argv_vec_bytes + envp_vec_bytes + 4u + 16u > 4096u) {
-        vmm_unmap_page_nofree(temp_kmap);
-        if (eflags_save & 0x200) __asm__ volatile ("sti");
+        kfree(kpage);
         return -1;
     }
 
@@ -145,7 +138,7 @@ static int build_user_stack(page_directory_t new_dir,
         const char* s = envp[i];
         uint32_t len = (uint32_t)strlen(s) + 1;
         sp -= len;
-        memcpy((void*)(temp_kmap + (sp - ustack_va)), s, len);
+        memcpy((void*)(kpage + (sp - ustack_va)), s, len);
         envp_user[i] = sp;
     }
     //copy argv strings
@@ -153,7 +146,7 @@ static int build_user_stack(page_directory_t new_dir,
         const char* s = argv[i];
         uint32_t len = (uint32_t)strlen(s) + 1;
         sp -= len;
-        memcpy((void*)(temp_kmap + (sp - ustack_va)), s, len);
+        memcpy((void*)(kpage + (sp - ustack_va)), s, len);
         argv_user[i] = sp;
     }
 
@@ -171,24 +164,29 @@ static int build_user_stack(page_directory_t new_dir,
 
     //fill argv vector
     for (uint32_t i = 0; i < (uint32_t)argc; i++) {
-        *(uint32_t*)(temp_kmap + (argv_vec_va - ustack_va) + i * 4u) = argv_user[i];
+        *(uint32_t*)(kpage + (argv_vec_va - ustack_va) + i * 4u) = argv_user[i];
     }
-    *(uint32_t*)(temp_kmap + (argv_vec_va - ustack_va) + (uint32_t)argc * 4u) = 0; //NULL
+    *(uint32_t*)(kpage + (argv_vec_va - ustack_va) + (uint32_t)argc * 4u) = 0; //NULL
 
     //fill envp vector
     for (uint32_t i = 0; i < (uint32_t)envc; i++) {
-        *(uint32_t*)(temp_kmap + (envp_vec_va - ustack_va) + i * 4u) = envp_user[i];
+        *(uint32_t*)(kpage + (envp_vec_va - ustack_va) + i * 4u) = envp_user[i];
     }
-    *(uint32_t*)(temp_kmap + (envp_vec_va - ustack_va) + (uint32_t)envc * 4u) = 0; //NULL
+    *(uint32_t*)(kpage + (envp_vec_va - ustack_va) + (uint32_t)envc * 4u) = 0; //NULL
 
     //write argc at esp0
-    *(uint32_t*)(temp_kmap + (esp0 - ustack_va)) = (uint32_t)argc;
+    *(uint32_t*)(kpage + (esp0 - ustack_va)) = (uint32_t)argc;
 
     if (argv_user) kfree(argv_user);
     if (envp_user) kfree(envp_user);
 
-    vmm_unmap_page_nofree(temp_kmap);
-    if (eflags_save & 0x200) __asm__ volatile ("sti");
+    //commit the built page to the physical stack page via temp mapping
+    uint32_t saved_entry = 0;
+    void* va = vmm_map_temp_page(new_stack_phys, &saved_entry);
+    if (!va) { kfree(kpage); return -1; }
+    memcpy(va, kpage, PAGE_SIZE);
+    vmm_unmap_temp_page(saved_entry);
+    kfree(kpage);
 
     *out_esp = esp0;
     return 0;
@@ -279,25 +277,21 @@ int elf_load_into_process(const char* pathname, struct process* proc,
                 return -1;
             }
 
-            uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-            const uint32_t TMP = 0x00800000;
-            if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-                if (eflags_save & 0x200) __asm__ volatile ("sti");
-                vfs_close(node); return -1;
-            }
-            memset((void*)TMP, 0, PAGE_SIZE);
+            uint32_t saved_entry_ = 0;
+            void* tmpva_ = vmm_map_temp_page(phys, &saved_entry_);
+            if (!tmpva_) { vfs_close(node); return -1; }
+            memset(tmpva_, 0, PAGE_SIZE);
             uint32_t page_data_start = 0;
             if (va < ph.p_vaddr) page_data_start = ph.p_vaddr - va;
             if (file_remaining > 0) {
                 uint32_t to_copy = PAGE_SIZE - page_data_start;
                 if (to_copy > file_remaining) to_copy = file_remaining;
-                int rr = vfs_read(node, ph.p_offset + file_cursor, to_copy, (char*)(TMP + page_data_start));
+                int rr = vfs_read(node, ph.p_offset + file_cursor, to_copy, (char*)((uint8_t*)tmpva_ + page_data_start));
                 (void)rr;
                 file_remaining -= to_copy;
                 file_cursor += to_copy;
             }
-            vmm_unmap_page_nofree(TMP);
-            if (eflags_save & 0x200) __asm__ volatile ("sti");
+            vmm_unmap_temp_page(saved_entry_);
         }
     }
 
@@ -437,13 +431,10 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
             }
 
             //temp map in kernel to zero and copy segment bytes
-            uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-            const uint32_t TMP = 0x00800000; //same temp mapping as elsewhere
-            if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-                if (eflags_save & 0x200) __asm__ volatile ("sti");
-                vfs_close(node); return -1;
-            }
-            memset((void*)TMP, 0, PAGE_SIZE);
+            uint32_t saved_entry_pg = 0;
+            void* tmp = vmm_map_temp_page(phys, &saved_entry_pg);
+            if (!tmp) { vfs_close(node); vmm_destroy_directory(new_dir); return -1; }
+            memset(tmp, 0, PAGE_SIZE);
 
             //compute copy region within this page
             uint32_t page_data_start = 0;
@@ -452,31 +443,37 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
                 uint32_t to_copy = PAGE_SIZE - page_data_start;
                 if (to_copy > file_remaining) to_copy = file_remaining;
                 //read from file into temp mapping at correct offset
-                int rr = vfs_read(node, ph.p_offset + file_cursor, to_copy, (char*)(TMP + page_data_start));
+                int rr = vfs_read(node, ph.p_offset + file_cursor, to_copy, (char*)((uint8_t*)tmp + page_data_start));
                 (void)rr; //in practice rr==to_copy if OK
                 file_remaining -= to_copy;
                 file_cursor += to_copy;
             }
-
-            vmm_unmap_page_nofree(TMP);
-            if (eflags_save & 0x200) __asm__ volatile ("sti");
+            vmm_unmap_temp_page(saved_entry_pg);
         }
     }
 
     //duplicate argv/envp into kernel memory first (user pointers may be invalidated during exec)
-    int argc = 0; if (argv) { while (argv[argc]) argc++; }
-    int envc = 0; if (envp) { while (envp[envc]) envc++; }
+    int argc = 0; 
+    if (argv) { 
+        while (argv[argc]) argc++;
+    }
+    int envc = 0; 
+    if (envp) { 
+        while (envp[envc]) envc++;
+    }
     char** kargv = NULL; char** kenvp = NULL;
     if (argc > 0) {
         kargv = (char**)kmalloc(sizeof(char*) * (uint32_t)(argc + 1));
-        if (!kargv) {
-            vfs_close(node);
-            return -1;
-        }
+        if (!kargv) { vfs_close(node); return -1; }
         for (int i = 0; i < argc; i++) {
             size_t len = strlen(argv[i]);
             char* s = (char*)kmalloc(len + 1);
             if (!s) {
+                //free previously allocated argv strings and array
+                for (int j = 0; j < i; j++) { 
+                    if (kargv[j]) kfree(kargv[j]); 
+                }
+                kfree(kargv);
                 vfs_close(node);
                 return -1;
             }
@@ -487,14 +484,32 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
     }
     if (envc > 0) {
         kenvp = (char**)kmalloc(sizeof(char*) * (uint32_t)(envc + 1));
-        if (!kenvp) {
-            vfs_close(node);
-            return -1;
+        if (!kenvp) { 
+            vfs_close(node); 
+            if (kargv) { 
+                for (int j=0;j<argc;j++){ 
+                    if (kargv[j]) kfree(kargv[j]); 
+                } 
+                kfree(kargv);
+            } 
+            return -1; 
         }
         for (int i = 0; i < envc; i++) {
             size_t len = strlen(envp[i]);
             char* s = (char*)kmalloc(len + 1);
             if (!s) {
+                //free already duplicated env strings
+                for (int j = 0; j < i; j++) { 
+                    if (kenvp[j]) kfree(kenvp[j]);
+                }
+                kfree(kenvp);
+                //free argv duplicates too
+                if (kargv) { 
+                    for (int j=0;j<argc;j++){ 
+                        if (kargv[j]) kfree(kargv[j]); 
+                    } 
+                    kfree(kargv); 
+                }
                 vfs_close(node);
                 return -1;
             }
@@ -519,6 +534,9 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
 
     uint32_t new_esp = 0;
     if (build_user_stack(new_dir, ustack_top, new_stack_top_phys, (char* const*)kargv, (char* const*)kenvp, &new_esp) != 0) {
+        //free duplicated argv/envp before returning
+        if (kargv) { for (int i=0;i<argc;i++){ if (kargv[i]) kfree(kargv[i]); } kfree(kargv); }
+        if (kenvp) { for (int i=0;i<envc;i++){ if (kenvp[i]) kfree(kenvp[i]); } kfree(kenvp); }
         vfs_close(node);
         return -1;
     }
@@ -603,31 +621,42 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
     }
 
     {
-        const uint32_t TMP = 0x00800000;
-        uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-        if (vmm_map_page(TMP, new_stack_top_phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
+        uint32_t saved_entry_dbg = 0;
+        void* tmp = vmm_map_temp_page(new_stack_top_phys, &saved_entry_dbg);
+        if (tmp) {
         #if LOG_ELF
             const uint32_t ustack_va = ustack_top - 0x1000;
-            uint32_t argc_dbg = *(uint32_t*)(TMP + (new_esp - ustack_va));
-            uint32_t argv0_ptr = *(uint32_t*)(TMP + (new_esp - ustack_va + 4));
+            uint32_t argc_dbg = *(uint32_t*)((uint8_t*)tmp + (new_esp - ustack_va));
+            uint32_t argv0_ptr = *(uint32_t*)((uint8_t*)tmp + (new_esp - ustack_va + 4));
             serial_write_string("[ELF] stack argc=\n");
             serial_printf("%d", (int)argc_dbg);
             serial_write_string(" argv0_ptr=0x\n");
             serial_printf("%x", argv0_ptr);
             serial_write_string("\n");
             if (argv0_ptr) {
-                const char* s0 = (const char*)(TMP + (argv0_ptr - ustack_va));
+                const char* s0 = (const char*)((uint8_t*)tmp + (argv0_ptr - ustack_va));
                 serial_write_string("[ELF] stack argv0=\"\n");
                 serial_write_string(s0);
                 serial_write_string("\"\n");
                 }
         #endif
-            vmm_unmap_page_nofree(TMP);
+            vmm_unmap_temp_page(saved_entry_dbg);
         }
-        if (eflags_save & 0x200) __asm__ volatile ("sti");
     }
 
     vfs_close(node);
+
+    //prepare cmdline then free duplicated argv/envp
+    char cmdline0[PROCESS_NAME_MAX]; cmdline0[0] = '\0';
+    if (kargv && kargv[0]) {
+        strncpy(cmdline0, kargv[0], sizeof(cmdline0) - 1);
+        cmdline0[sizeof(cmdline0) - 1] = '\0';
+    } else if (pathname) {
+        strncpy(cmdline0, pathname, sizeof(cmdline0) - 1);
+        cmdline0[sizeof(cmdline0) - 1] = '\0';
+    }
+    if (kargv) { for (int i=0;i<argc;i++){ if (kargv[i]) kfree(kargv[i]); } kfree(kargv); }
+    if (kenvp) { for (int i=0;i<envc;i++){ if (kenvp[i]) kfree(kenvp[i]); } kfree(kenvp); }
 
     //swap process address space and jump
     process_t* cur = process_get_current();
@@ -643,13 +672,8 @@ int elf_execve(const char* pathname, char* const argv[], char* const envp[]) {
 
     //record argv[0] for /proc/<pid>/cmdline (fallback to pathname)
     cur->cmdline[0] = '\0';
-    if (kargv && kargv[0]) {
-        strncpy(cur->cmdline, kargv[0], sizeof(cur->cmdline) - 1);
-        cur->cmdline[sizeof(cur->cmdline) - 1] = '\0';
-    } else if (pathname) {
-        strncpy(cur->cmdline, pathname, sizeof(cur->cmdline) - 1);
-        cur->cmdline[sizeof(cur->cmdline) - 1] = '\0';
-    }
+    strncpy(cur->cmdline, cmdline0, sizeof(cur->cmdline) - 1);
+    cur->cmdline[sizeof(cur->cmdline) - 1] = '\0';
 
     //switch to new directory and destroy the old one (if not kernel)
     vmm_switch_directory(new_dir);

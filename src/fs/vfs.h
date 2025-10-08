@@ -42,6 +42,8 @@ struct vfs_operations {
     int (*readlink)(vfs_node_t* node, char* buf, uint32_t bufsize);
     int (*symlink)(vfs_node_t* parent, const char* name, const char* target);
     int (*link)(vfs_node_t* parent, const char* name, vfs_node_t* src); //hard link
+    int (*poll_can_read)(vfs_node_t* node);
+    int (*poll_can_write)(vfs_node_t* node);
 };
 
 //permission mode bits (subset of POSIX)
@@ -50,7 +52,7 @@ struct vfs_operations {
 #define S_IWUSR 0200
 #define S_IXUSR 0100
 #define S_IRGRP 0040
-#define S_IWGRP 0020
+#define S_IWGRP 0020    
 #define S_IXGRP 0010
 #define S_IROTH 0004
 #define S_IWOTH 0002
@@ -91,6 +93,7 @@ typedef struct {
     uint32_t offset;            //current position in file
     uint32_t flags;             //access flags
     uint32_t ref_count;         //reference count
+    uint32_t append;            //append mode flag (O_APPEND)
 } vfs_file_t;
 
 //function declarations

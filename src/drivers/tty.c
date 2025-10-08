@@ -60,11 +60,14 @@ int tty_read_mode(char* buf, uint32_t size, uint32_t mode) {
                 if (pos > 0) {
                     pos--;
                     if (mode & TTY_MODE_ECHO) {
-                        one[0] = '\b';
-                        //use force version to bypass quiet flag
+                        //erase the character visually: backspace, space, backspace
                         if (fbcon_available()) {
                             fbcon_putchar('\b', 0x0F);
+                            fbcon_putchar(' ', 0x0F);
+                            fbcon_putchar('\b', 0x0F);
                         } else {
+                            putchar_term_force('\b', 0x0F);
+                            putchar_term_force(' ', 0x0F);
                             putchar_term_force('\b', 0x0F);
                         }
                     }

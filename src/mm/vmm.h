@@ -27,18 +27,18 @@ int vmm_unmap_page_nofree(uint32_t virtual_addr);
 uint32_t vmm_get_physical_addr(uint32_t virtual_addr);
 void vmm_switch_directory(page_directory_t directory);
 page_directory_t vmm_create_directory(void);
-void vmm_destroy_directory(page_directory_t directory);
 int vmm_map_page_in_directory(page_directory_t directory, uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags);
 void vmm_map_kernel_space(page_directory_t directory);
 page_directory_t vmm_get_kernel_directory(void);
 page_directory_t vmm_get_current_directory(void);
 void vmm_destroy_directory(page_directory_t directory);
-
+void* vmm_map_temp_page(uint32_t phys_addr, uint32_t* saved_entry_out);
+void vmm_unmap_temp_page(uint32_t saved_entry);
+int vmm_unmap_page_in_directory(page_directory_t directory, uint32_t virtual_addr);
 
 //kernel memory layout
 #define KERNEL_VIRTUAL_BASE 0xC0000000
 #define KERNEL_HEAP_START   0xC0400000
-#define KERNEL_HEAP_END     0xCFFFFFFF
 #define USER_VIRTUAL_START  0x00400000
 #define USER_VIRTUAL_END    0xBFFFFFFF
 

@@ -14,7 +14,10 @@
 #include "drivers/timer.h"
 #include "drivers/rtc.h"
 #include "drivers/ata.h"
+#include "drivers/pci.h"
+#include "drivers/ahci.h"
 #include "drivers/sb16.h"
+#include "drivers/apic.h"
 #include "syscall.h"
 #include "interrupts/gdt.h"
 #include "interrupts/tss.h"
@@ -30,6 +33,8 @@
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "process.h"
+#include "ipc/shm.h"
+#include "ipc/socket.h"
 #include "kernel/cga.h"
 #include "kernel/panic.h"
 #include "kernel/kreboot.h"
@@ -39,12 +44,24 @@
 #include <stdbool.h>
 
 //global console quiet flag (0=verbose to screen 1=suppress)
-int g_console_quiet = 0;
+int g_console_quiet = 1;  //default to quiet, serial debug only
 
 static uint32_t total_memory_mb = 0;
 char *bsodVer = "classic"; //BSOD style for kernel panic
 
 extern char kernel_start, kernel_end;
+
+//VBE mode info subset
+typedef struct __attribute__((packed)) {
+    uint8_t  _pad0[0x10];
+    uint16_t BytesPerScanLine; //0x10
+    uint16_t XResolution;      //0x12
+    uint16_t YResolution;      //0x14
+    uint8_t  _pad1[0x03];
+    uint8_t  BitsPerPixel;     //0x19
+    uint8_t  _pad2[0x0E];
+    uint32_t PhysBasePtr;      //0x28
+} vbe_mode_info_t;
 
 //spawn a user program from VFS path
 //returns 1 on success 0 on failure
@@ -78,18 +95,6 @@ static int spawn_user_from_vfs(const char* path) {
     return 0;
 }
 
-//VBE mode info subset
-typedef struct __attribute__((packed)) {
-    uint8_t  _pad0[0x10];
-    uint16_t BytesPerScanLine; //0x10
-    uint16_t XResolution;      //0x12
-    uint16_t YResolution;      //0x14
-    uint8_t  _pad1[0x03];
-    uint8_t  BitsPerPixel;     //0x19
-    uint8_t  _pad2[0x0E];
-    uint32_t PhysBasePtr;      //0x28
-} vbe_mode_info_t;
-
 void kmain(uint32_t magic, uint32_t addr) {
     (void)magic; // unused
     multiboot_info_t* mbi = (multiboot_info_t*)addr;
@@ -102,12 +107,19 @@ void kmain(uint32_t magic, uint32_t addr) {
     const char* boot_cmdline = (mbi && mbi->cmdline) ? (const char*)mbi->cmdline : "";
     procfs_set_cmdline(boot_cmdline);
     int disable_vesa = 0;
+    int apic_override = 0;  //0=auto 1=force APIC -1=force PIC
     if (boot_cmdline && *boot_cmdline) {
         if (strstr(boot_cmdline, "novesa") || strstr(boot_cmdline, "vesa=off")) {
             disable_vesa = 1;
         }
         if (strstr(boot_cmdline, "quiet")) {
             g_console_quiet = 1;
+        }
+        //check for interrupt controller selection in cmdline
+        if (strstr(boot_cmdline, "noapic") || strstr(boot_cmdline, "pic")) {
+            apic_override = -1;  //force PIC
+        } else if (strstr(boot_cmdline, "apic")) {
+            apic_override = 1;   //force APIC
         }
     }
 
@@ -170,12 +182,23 @@ void kmain(uint32_t magic, uint32_t addr) {
     (void)rtc_register_device();
     (void)sb16_register_device();
 
+    //initialize PCI bus
+    pci_init();
+    DEBUG_PRINT("PCI bus initialized");
+
     //initialize and register ATA driver
     ata_init();
     DEBUG_PRINT("ATA driver initialized");
 
     ata_probe_and_register();
     DEBUG_PRINT("ATA device probing complete");
+
+    //initialize AHCI/SATA driver
+    ahci_init();
+    DEBUG_PRINT("AHCI driver initialized");
+
+    ahci_probe_and_register();
+    DEBUG_PRINT("AHCI device probing complete");
 
     //register keyboard device
     if (keyboard_register_device() == 0) {
@@ -211,12 +234,54 @@ void kmain(uint32_t magic, uint32_t addr) {
     process_init();
     DEBUG_PRINT("Process manager initialized");
 
-    timer_init(100); //100 hz
+    //initialize IPC subsystems
+    shm_init();
+    DEBUG_PRINT("Shared memory system initialized");
+    socket_init();
+    DEBUG_PRINT("Socket system initialized");
+
+    //initialize interrupt controller (APIC or PIC)
+    bool using_apic = false;
+    if (apic_override == -1) {
+        //user wants PIC
+        DEBUG_PRINT("APIC disabled by kernel parameter (noapic/pic)");
+    } else if (apic_override == 1) {
+        //user wants APIC
+        DEBUG_PRINT("Forcing APIC mode (kernel parameter)");
+        using_apic = apic_init();
+        if (!using_apic) {
+            DEBUG_PRINT("APIC initialization failed, falling back to PIC");
+        }
+    } else {
+        //auto-detect: try APIC if supported fallback to PIC
+        if (apic_is_supported()) {
+            DEBUG_PRINT("Auto-detected APIC support, initializing...");
+            using_apic = apic_init();
+            if (!using_apic) {
+                DEBUG_PRINT("APIC init failed, using PIC");
+            }
+        } else {
+            DEBUG_PRINT("APIC not supported by CPU, using PIC");
+        }
+    }
+    
     keyboard_init(); //enable IRQ1 and setup keyboard handler
     mouse_init();    //enable IRQ12 and setup mouse handler
-    DEBUG_PRINT("Timer and input devices initialized");
+    
+    //enable interrupts
     __asm__ volatile ("sti");
     DEBUG_PRINT("Interrupts enabled");
+    
+    //start timer
+    if (using_apic) {
+        DEBUG_PRINT("Using APIC timer");
+        apic_timer_init(100); //100 Hz
+    } else {
+        DEBUG_PRINT("Using PIT timer");
+        timer_init(100); //100 hz
+    }
+    
+    DEBUG_PRINT("Timer initialized");
     //initialize VFS
     if (vfs_init() == 0) {
         DEBUG_PRINT("VFS initialized successfully");

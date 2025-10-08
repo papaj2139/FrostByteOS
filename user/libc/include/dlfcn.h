@@ -11,7 +11,6 @@ extern "C" {
 #define RTLD_LOCAL 4
 #define RTLD_GLOBAL 8
 
-//current ABI uses int handles
 int  dlopen(const char* path, int flags);
 void* dlsym(int handle, const char* name);
 int  dlclose(int handle);

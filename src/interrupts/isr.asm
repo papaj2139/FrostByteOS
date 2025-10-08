@@ -2,6 +2,7 @@
 section .text
 
 extern irq_dispatch
+extern irq_dispatch_with_context
 extern isr_exception_dispatch
 extern isr_exception_dispatch_ext
 
@@ -121,9 +122,13 @@ ISR_NOERR 31  ;reserved
 global irq0
 irq0:
     pushad
-    push dword 0
-    call irq_dispatch
-    add esp, 4
+    ;for preemptive scheduling, pass stack pointer to capture interrupted context
+    ;stack layout at this point: [pushad 32 bytes][EIP][CS][EFLAGS][ESP?][SS?]
+    mov eax, esp           ;ESP points to start of pushad area
+    push eax               ;pass stack pointer as 2nd arg
+    push dword 0           ;IRQ number as 1st arg
+    call irq_dispatch_with_context
+    add esp, 8
     popad
     iretd
 

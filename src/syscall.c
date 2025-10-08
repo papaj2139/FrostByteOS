@@ -26,6 +26,8 @@
 #include "drivers/fb.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "errno_defs.h"
+#include "scheduler.h"
 
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
@@ -42,6 +44,9 @@
 #define S_IFLNK  0120000
 #define S_IFCHR  0020000
 #endif
+
+#define F_GETFL 3
+#define F_SETFL 4
 
 typedef struct {
     uint32_t st_mode;  // type + perms
@@ -240,37 +245,61 @@ void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags,
 //clone user space from src->dst directories (user part only)
 static int clone_user_space(page_directory_t src, page_directory_t dst) {
     if (!src || !dst) return -1;
-    const uint32_t TMP_SRC = 0xE0000000; //high kernel scratch outside kernel heap
-    const uint32_t TMP_DST = 0xE0001000;
+    uint8_t* page_buf = (uint8_t*)kmalloc(PAGE_SIZE);
+    if (!page_buf) return -1;
+
     for (int i = 0; i < 768; i++) { //user space only
-        //skip cloning PDE 0 and 1 (0 to 8MB identity region) these PTs are shared with the kernel
-        //so cloning into them would overwrite global identity mappings (e.x VGA 0xB8000)
-        //causing text output to disappear
-        if (i < 2) continue;
+        if (i < 2) continue; //skip identity-mapped PDEs shared with kernel
         if (!(src[i] & PAGE_PRESENT)) continue;
+
         uint32_t pt_src_phys = src[i] & ~0xFFF;
         page_table_t pt_src = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_src_phys);
+
         for (int j = 0; j < 1024; j++) {
             uint32_t pte = pt_src[j];
             if (!(pte & PAGE_PRESENT)) continue;
+
             uint32_t src_phys = pte & ~0xFFF;
-            uint32_t flags = PAGE_PRESENT | (pte & PAGE_WRITABLE) | PAGE_USER; //ensure USER
+            uint32_t flags = PAGE_PRESENT | PAGE_USER;
+            if (pte & PAGE_WRITABLE) flags |= PAGE_WRITABLE;
             uint32_t vaddr = ((uint32_t)i << 22) | ((uint32_t)j << 12);
-            //allocate and copy
+
             uint32_t dst_phys = pmm_alloc_page();
-            if (!dst_phys) return -1;
-            if (vmm_map_page(TMP_SRC, src_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) return -1;
-            if (vmm_map_page(TMP_DST, dst_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-                vmm_unmap_page_nofree(TMP_SRC);
+            if (!dst_phys) {
+                kfree(page_buf);
                 return -1;
             }
-            memcpy((void*)TMP_DST, (void*)TMP_SRC, 4096);
-            vmm_unmap_page_nofree(TMP_SRC);
-            vmm_unmap_page_nofree(TMP_DST);
-            //map into dst directory at vaddr
-            if (vmm_map_page_in_directory(dst, vaddr, dst_phys, flags) != 0) return -1;
+
+            uint32_t saved_src = 0;
+            void* src_map = vmm_map_temp_page(src_phys, &saved_src);
+            if (!src_map) {
+                pmm_free_page(dst_phys);
+                kfree(page_buf);
+                return -1;
+            }
+            memcpy(page_buf, src_map, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_src);
+
+            if (vmm_map_page_in_directory(dst, vaddr, dst_phys, flags) != 0) {
+                pmm_free_page(dst_phys);
+                kfree(page_buf);
+                return -1;
+            }
+
+            uint32_t saved_dst = 0;
+            void* dst_map = vmm_map_temp_page(dst_phys, &saved_dst);
+            if (!dst_map) {
+                vmm_unmap_page_in_directory(dst, vaddr);
+                pmm_free_page(dst_phys);
+                kfree(page_buf);
+                return -1;
+            }
+            memcpy(dst_map, page_buf, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_dst);
         }
     }
+
+    kfree(page_buf);
     return 0;
 }
 
@@ -417,6 +446,38 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_dup2((int32_t)arg1, (int32_t)arg2);
         case SYS_PIPE:
             return sys_pipe((int32_t*)arg1);
+        case SYS_SETUID:
+            return sys_setuid((int32_t)arg1);
+        case SYS_SETGID:
+            return sys_setgid((int32_t)arg1);
+        case SYS_SETEUID:
+            return sys_seteuid((int32_t)arg1);
+        case SYS_SETEGID:
+            return sys_setegid((int32_t)arg1);
+        case SYS_LSEEK:
+            return sys_lseek((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_SOCKET:
+            return sys_socket((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_BIND:
+            return sys_bind((int32_t)arg1, (const void*)arg2, arg3);
+        case SYS_LISTEN:
+            return sys_listen((int32_t)arg1, (int32_t)arg2);
+        case SYS_ACCEPT:
+            return sys_accept((int32_t)arg1, (void*)arg2, (uint32_t*)arg3);
+        case SYS_CONNECT:
+            return sys_connect((int32_t)arg1, (const void*)arg2, arg3);
+        case SYS_SHMGET:
+            return sys_shmget((int32_t)arg1, arg2, (int32_t)arg3);
+        case SYS_SHMAT:
+            return sys_shmat((int32_t)arg1, (const void*)arg2, (int32_t)arg3);
+        case SYS_SHMDT:
+            return sys_shmdt((const void*)arg1);
+        case SYS_SHMCTL:
+            return sys_shmctl((int32_t)arg1, (int32_t)arg2, (void*)arg3);
+        case SYS_SELECT:
+            return sys_select((int32_t)arg1, (void*)arg2, (void*)arg3, (void*)arg4, (void*)arg5);
+        case SYS_FCNTL:
+            return sys_fcntl((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
         default:
             print("Unknown syscall\n", 0x0F);
             return -1; //ENOSYS = Function not implemented
@@ -479,6 +540,26 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Writing to file via VFS\n");
     #endif
+    
+    //if O_APPEND is set seek to end of file before writing
+    if (file->append && file->node) {
+        int size = vfs_get_size(file->node);
+        if (size >= 0) {
+            file->offset = (uint32_t)size;
+        }
+    }
+    //for pipes block until writable unless O_NONBLOCK handle closed reader
+    if (file->node && fd_pipe_is_node(file->node)) {
+        while (!fd_pipe_can_write(file->node)) {
+            if (file->flags & O_NONBLOCK) {
+                signal_check_current();
+                return -EAGAIN; //would block
+            }
+            fd_pipe_wait_writable(file->node);
+            signal_check_current();
+        }
+    }
+
     //bounce buffer in manageable chunks to avoid large contiguous allocations
     const uint32_t CHUNK = 65536; //64 KiB
     uint32_t remaining = count;
@@ -496,6 +577,11 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
             total_written = (total_written > 0) ? total_written : -1;
             break;
         }
+        #if LOG_SYSCALL
+        serial_printf("[SYSCALL] Write: kbuf first 4 bytes: %x %x %x %x\n",
+                      ((uint8_t*)kbuf)[0], ((uint8_t*)kbuf)[1],
+                      ((uint8_t*)kbuf)[2], ((uint8_t*)kbuf)[3]);
+        #endif
         int r = vfs_write(file->node, file->offset, this_chunk, kbuf);
         kfree(kbuf);
         if (r <= 0) {
@@ -514,8 +600,12 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     }
     //for device nodes reset the file offset after each write syscall so each
     //subsequent write starts fresh (useful for streaming devices like /dev/fb0)
+    //but DON'T reset for block devices (storage) since they need to maintain offset
     if (file && file->node && file->node->type == VFS_FILE_TYPE_DEVICE) {
-        file->offset = 0;
+        device_t* dev = (device_t*)file->node->device;
+        if (dev && dev->type != DEVICE_TYPE_STORAGE) {
+            file->offset = 0;
+        }
     }
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Write completed, bytes: ");
@@ -597,6 +687,18 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
         return -1; //EBADF
     }
 
+    //for pipes: block until readable unless O_NONBLOCK
+    if (file->node && fd_pipe_is_node(file->node)) {
+        while (!fd_pipe_can_read(file->node)) {
+            //non-blocking: indicate no data available
+            if (file->flags & O_NONBLOCK) {
+                signal_check_current();
+                return -EAGAIN; //would block
+            }
+            fd_pipe_wait_readable(file->node);
+            signal_check_current();
+        }
+    }
     //bounce buffer in kernel space then copy to user
     int bytes_read = -1;
     char* kbuf = (char*)kmalloc(count);
@@ -619,25 +721,54 @@ int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
 }
 
 int32_t sys_open(const char* pathname, int32_t flags) {
-    //convert POSIX flags to VFS flags
+    //extract O_CREAT, O_TRUNC, O_APPEND flags
+    int o_creat = (flags & 0100);   //O_CREAT
+    int o_trunc = (flags & 01000);  //O_TRUNC
+    int o_append = (flags & 02000); //O_APPEND
+    
+    //convert POSIX access mode flags to VFS flags
+    int access_mode = flags & 3;  //O_RDONLY(0), O_WRONLY(1), O_RDWR(2)
     uint32_t vfs_flags = 0;
-    if (flags == 0) {
+    if (access_mode == 0) {
         vfs_flags = VFS_FLAG_READ;  //O_RDONLY
-    } else if (flags == 1) {
+    } else if (access_mode == 1) {
         vfs_flags = VFS_FLAG_WRITE; //O_WRONLY
-    } else if (flags == 2) {
+    } else if (access_mode == 2) {
         vfs_flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //O_RDWR
-    } else {
-        vfs_flags = VFS_FLAG_READ; //default to read-only
     }
+    
     char abspath[VFS_MAX_PATH];
     if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
+    
+    //try to open existing file
     vfs_node_t* node = vfs_open(abspath, vfs_flags);
+    
+    //if open failed and O_CREAT is set try to create the file
+    if (!node && o_creat) {
+        process_t* cur = process_get_current();
+        if (!cur) return -1;
+        uint32_t mode = 0666 & ~cur->umask;  //default mode
+        if (vfs_create(abspath, 0) != 0) {
+            return -1;
+        }
+        vfs_set_metadata_override(abspath, 1, mode, 1, cur->euid, 1, cur->egid);
+        //now try to open it
+        node = vfs_open(abspath, vfs_flags);
+        if (!node) return -1;
+    }
+    
     if (!node) {
         return -1;
     }
-    //install into current process descriptor table
-    return fd_alloc(node, vfs_flags);
+    
+    //handle O_TRUNC: truncate file to 0 bytes
+    if (o_trunc && (vfs_flags & VFS_FLAG_WRITE)) {
+        //truncate by writing 0 bytes at offset 0 (some filesystems support this)
+        vfs_write(node, 0, 0, NULL);
+    }
+    
+    //install into current process descriptor table with append flag
+    return fd_alloc(node, vfs_flags, o_append ? 1 : 0);
 }
 
 int32_t sys_close(int32_t fd) {
@@ -693,7 +824,7 @@ int32_t sys_creat(const char* pathname, int32_t mode) {
                 }
             }
             if (child) {
-                fd = fd_alloc(child, 1); //O_WRONLY
+                fd = fd_alloc(child, 1, 0); //O_WRONLY no append
                 if (fd < 0) {
                     vfs_close(child);
                 }
@@ -870,17 +1001,20 @@ int32_t sys_brk(uint32_t new_end) {
                 return -1;
             }
             //zero page via temp map
-            const uint32_t TMP = 0x00800000;
-            if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
-                memset((void*)TMP, 0, PAGE_SIZE);
-                vmm_unmap_page_nofree(TMP);
+            uint32_t saved_entry2 = 0;
+            void* tmp2 = vmm_map_temp_page(phys, &saved_entry2);
+            if (tmp2) {
+                memset(tmp2, 0, PAGE_SIZE);
+                vmm_unmap_temp_page(saved_entry2);
             }
         }
     } else if (new_top < old_top) {
-        //shrink: unmap pages beyond new_top (vmm_unmap_page frees the frame)
+        //shrink: unmap and free pages
         for (uint32_t va = new_top; va < old_top; va += PAGE_SIZE) {
-            if (vmm_get_physical_addr(va)) {
+            uint32_t phys = vmm_get_physical_addr(va);
+            if (phys) {
                 vmm_unmap_page(va);
+                pmm_free_page(phys);
             }
         }
     }
@@ -1097,11 +1231,12 @@ int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot, uint32_t flags) 
             }
             return -1;
         }
-        //zero page via temp map
-        const uint32_t TMP = 0x00800000;
-        if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
-            memset((void*)TMP, 0, PAGE_SIZE);
-            vmm_unmap_page_nofree(TMP);
+        //zero page via dedicated temp map slot
+        uint32_t saved_entry = 0;
+        void* tmp = vmm_map_temp_page(phys, &saved_entry);
+        if (tmp) {
+            memset(tmp, 0, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_entry);
         }
     }
     #if LOG_SYSCALL
@@ -1109,7 +1244,7 @@ int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot, uint32_t flags) 
         serial_write_string(" len=0x"); serial_printf("%x", len);
         serial_write_string("\n");
     #endif
-    //return start address as int32
+    //return start address
     return (int32_t)start;
 }
 
@@ -1207,15 +1342,11 @@ static int read_user_u32(page_directory_t dir, uint32_t va, uint32_t* out) {
     uint32_t off = va & 0xFFFu;
     vmm_switch_directory(saved);
     if (!phys) return -1;
-    uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-    const uint32_t TMP = 0x00800000u;
-    if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        if (eflags_save & 0x200) __asm__ volatile ("sti");
-        return -1;
-    }
-    *out = *(uint32_t*)(TMP + off);
-    vmm_unmap_page_nofree(TMP);
-    if (eflags_save & 0x200) __asm__ volatile ("sti");
+    uint32_t saved_entry = 0;
+    void* tmp = vmm_map_temp_page(phys, &saved_entry);
+    if (!tmp) return -1;
+    *out = *(uint32_t*)((uint8_t*)tmp + off);
+    vmm_unmap_temp_page(saved_entry);
     return 0;
 }
 
@@ -1658,17 +1789,57 @@ static int32_t sys_mmap_ex(void* uargs_ptr) {
 
     if (a.fd < 0) {
         //anonymous mapping: allocate pages
+        uint32_t allocated = 0;
+        uint32_t phys_list_count = len / PAGE_SIZE;
+        uint32_t* phys_list = (phys_list_count > 0) ? (uint32_t*)kmalloc(sizeof(uint32_t) * phys_list_count) : NULL;
+        if (phys_list_count > 0 && !phys_list) return -1;
+
         for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
             uint32_t phys = pmm_alloc_page();
-            if (!phys) return -1;
-            if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) return -1;
-            //zero page via temp map
-            const uint32_t TMP = 0x00A00000 + off; //simplistic scratch reused immediately
-            if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
-                memset((void*)TMP, 0, PAGE_SIZE);
-                vmm_unmap_page_nofree(TMP);
+            if (!phys) {
+                if (phys_list) {
+                    for (uint32_t i = 0; i < allocated; i++) {
+                        uint32_t va = start + i * PAGE_SIZE;
+                        vmm_unmap_page_in_directory(cur->page_directory, va);
+                        pmm_free_page(phys_list[i]);
+                    }
+                    kfree(phys_list);
+                }
+                return -1;
             }
+            if (phys_list) phys_list[allocated] = phys;
+            if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) {
+                pmm_free_page(phys);
+                if (phys_list) {
+                    for (uint32_t i = 0; i < allocated; i++) {
+                        uint32_t va = start + i * PAGE_SIZE;
+                        vmm_unmap_page_in_directory(cur->page_directory, va);
+                        pmm_free_page(phys_list[i]);
+                    }
+                    kfree(phys_list);
+                }
+                return -1;
+            }
+            uint32_t saved_entry = 0;
+            void* tmp = vmm_map_temp_page(phys, &saved_entry);
+            if (!tmp) {
+                vmm_unmap_page_in_directory(cur->page_directory, start + off);
+                pmm_free_page(phys);
+                if (phys_list) {
+                    for (uint32_t i = 0; i < allocated; i++) {
+                        uint32_t va = start + i * PAGE_SIZE;
+                        vmm_unmap_page_in_directory(cur->page_directory, va);
+                        pmm_free_page(phys_list[i]);
+                    }
+                    kfree(phys_list);
+                }
+                return -1;
+            }
+            memset(tmp, 0, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_entry);
+            allocated++;
         }
+        if (phys_list) kfree(phys_list);
         return (int32_t)start;
     }
 
@@ -1696,16 +1867,53 @@ static int32_t sys_mmap_ex(void* uargs_ptr) {
     }
 
     //regular file: allocate pages and read file bytes into mapping
+    uint32_t pages = len / PAGE_SIZE;
+    uint32_t* phys_pages = (pages > 0) ? (uint32_t*)kmalloc(sizeof(uint32_t) * pages) : NULL;
+    if (pages > 0 && !phys_pages) return -1;
+
     for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
         uint32_t phys = pmm_alloc_page();
-        if (!phys) return -1;
-        if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) return -1;
-        //temp map for zeroing and staging
-        const uint32_t TMP = 0x00B00000; //fixed temp VA
-        if (vmm_map_page(TMP, phys, PAGE_PRESENT | PAGE_WRITABLE) == 0) {
-            memset((void*)TMP, 0, PAGE_SIZE);
-            vmm_unmap_page_nofree(TMP);
+        if (!phys) {
+            if (phys_pages) {
+                for (uint32_t i = 0; i < off / PAGE_SIZE; i++) {
+                    uint32_t va = start + i * PAGE_SIZE;
+                    vmm_unmap_page_in_directory(cur->page_directory, va);
+                    pmm_free_page(phys_pages[i]);
+                }
+                kfree(phys_pages);
+            }
+            return -1;
         }
+        if (phys_pages) phys_pages[off / PAGE_SIZE] = phys;
+        if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) {
+            pmm_free_page(phys);
+            if (phys_pages) {
+                for (uint32_t i = 0; i < off / PAGE_SIZE; i++) {
+                    uint32_t va = start + i * PAGE_SIZE;
+                    vmm_unmap_page_in_directory(cur->page_directory, va);
+                    pmm_free_page(phys_pages[i]);
+                }
+                kfree(phys_pages);
+            }
+            return -1;
+        }
+        uint32_t saved_entry = 0;
+        void* tmp = vmm_map_temp_page(phys, &saved_entry);
+        if (!tmp) {
+            vmm_unmap_page_in_directory(cur->page_directory, start + off);
+            pmm_free_page(phys);
+            if (phys_pages) {
+                for (uint32_t i = 0; i < off / PAGE_SIZE; i++) {
+                    uint32_t va = start + i * PAGE_SIZE;
+                    vmm_unmap_page_in_directory(cur->page_directory, va);
+                    pmm_free_page(phys_pages[i]);
+                }
+                kfree(phys_pages);
+            }
+            return -1;
+        }
+        memset(tmp, 0, PAGE_SIZE);
+        vmm_unmap_temp_page(saved_entry);
     }
     //read file content into user mapping in chunks
     const uint32_t CHUNK = 4096;
@@ -1804,5 +2012,342 @@ int32_t sys_pipe(int32_t* pipefd) {
         return -1;
     }
 
+    return 0;
+}
+
+int32_t sys_setuid(int32_t uid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //only root can change UID arbitrarily
+    if (cur->euid == 0) {
+        cur->uid = (uint32_t)uid;
+        cur->euid = (uint32_t)uid;
+        return 0;
+    }
+    
+    //non-root can only set to real or effective UID
+    if ((uint32_t)uid == cur->uid || (uint32_t)uid == cur->euid) {
+        cur->euid = (uint32_t)uid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_setgid(int32_t gid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //only root can change GID arbitrarily
+    if (cur->euid == 0) {
+        cur->gid = (uint32_t)gid;
+        cur->egid = (uint32_t)gid;
+        return 0;
+    }
+    
+    //non-root can only set to real or effective GID
+    if ((uint32_t)gid == cur->gid || (uint32_t)gid == cur->egid) {
+        cur->egid = (uint32_t)gid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_seteuid(int32_t euid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //root or current euid can change
+    if (cur->euid == 0 || (uint32_t)euid == cur->uid || (uint32_t)euid == cur->euid) {
+        cur->euid = (uint32_t)euid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_setegid(int32_t egid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //root or current egid can change
+    if (cur->euid == 0 || (uint32_t)egid == cur->gid || (uint32_t)egid == cur->egid) {
+        cur->egid = (uint32_t)egid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_lseek(int32_t fd, int32_t offset, int32_t whence) {
+    vfs_file_t* file = fd_get(fd);
+    if (!file) return -1; //EBADF
+    
+    int32_t new_offset;
+    
+    switch (whence) {
+        case 0: //SEEK_SET
+            new_offset = offset;
+            break;
+        case 1: //SEEK_CUR
+            new_offset = (int32_t)file->offset + offset;
+            break;
+        case 2: { //SEEK_END
+            if (!file->node) return -1;
+            int size = vfs_get_size(file->node);
+            if (size < 0) return -1;
+            new_offset = size + offset;
+            break;
+        }
+        default:
+            return -1; //EINVAL
+    }
+    
+    //don't allow negative offsets
+    if (new_offset < 0) return -1; //EINVAL
+    
+    file->offset = (uint32_t)new_offset;
+    return new_offset;
+}
+
+int32_t sys_fcntl(int32_t fd, int32_t cmd, int32_t arg) {
+    vfs_file_t* file = fd_get(fd);
+    if (!file) return -EBADF;
+    
+    //check if this is a socket - get socket structure from VFS node
+    if (file->node && file->node->type == VFS_FILE_TYPE_DEVICE) {
+        //this might be a socket - try to get socket from private_data
+        
+        //forward declare socket_t to avoid circular include
+        typedef struct socket socket_t;
+        socket_t* sock = (socket_t*)file->node->private_data;
+        
+        if (sock) {
+            switch (cmd) {
+                case F_GETFL:
+                    //get file status flags
+                    //for sockets we store flags in the socket structure
+                    //access the flags field (it's at offset after valid/domain/type/protocol/state)
+                    //return the flags
+                    return *((int*)((char*)sock + 20));  //flags field offset
+                    
+                case F_SETFL:
+                    //set file status flags
+                    //only O_NONBLOCK and O_APPEND can be set via F_SETFL
+                    *((int*)((char*)sock + 20)) = arg;
+                    return 0;
+                    
+                default:
+                    return -EINVAL;
+            }
+        }
+    }
+    
+    //for regular files store flags in vfs_file_t
+    switch (cmd) {
+        case F_GETFL:
+            //return the file flags
+            return file->flags;
+            
+        case F_SETFL:
+            //only certain flags can be changed
+            file->flags = (file->flags & ~O_NONBLOCK) | (arg & O_NONBLOCK);
+            return 0;
+            
+        default:
+            return -EINVAL;
+    }
+}
+
+int32_t sys_select(int32_t nfds, void* readfds_ptr, void* writefds_ptr, void* exceptfds_ptr, void* timeout_ptr) {
+    //validate parameters
+    if (nfds < 0 || nfds > 1024) return -EINVAL;
+    
+    //validate and copy fd_sets from user space
+    //fd_set is 1024 bits = 128 bytes
+    //use heap allocation to avoid stack overflow
+    #define FD_SET_SIZE 128
+    uint8_t* readfds = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* writefds = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* exceptfds = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* result_read = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* result_write = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* result_except = (uint8_t*)kmalloc(FD_SET_SIZE);
+    
+    if (!readfds || !writefds || !exceptfds || !result_read || !result_write || !result_except) {
+        if (readfds) kfree(readfds);
+        if (writefds) kfree(writefds);
+        if (exceptfds) kfree(exceptfds);
+        if (result_read) kfree(result_read);
+        if (result_write) kfree(result_write);
+        if (result_except) kfree(result_except);
+        return -ENOMEM;
+    }
+    
+    memset(result_read, 0, FD_SET_SIZE);
+    memset(result_write, 0, FD_SET_SIZE);
+    memset(result_except, 0, FD_SET_SIZE);
+    
+    int has_readfds = 0, has_writefds = 0, has_exceptfds = 0;
+    
+    if (readfds_ptr) {
+        if (!user_range_ok(readfds_ptr, FD_SET_SIZE, 0)) return -EFAULT;
+        if (copy_from_user(readfds, readfds_ptr, FD_SET_SIZE) != 0) return -EFAULT;
+        has_readfds = 1;
+    } else {
+        memset(readfds, 0, FD_SET_SIZE);
+    }
+    
+    if (writefds_ptr) {
+        if (!user_range_ok(writefds_ptr, FD_SET_SIZE, 0)) return -EFAULT;
+        if (copy_from_user(writefds, writefds_ptr, FD_SET_SIZE) != 0) return -EFAULT;
+        has_writefds = 1;
+    } else {
+        memset(writefds, 0, FD_SET_SIZE);
+    }
+    
+    if (exceptfds_ptr) {
+        if (!user_range_ok(exceptfds_ptr, FD_SET_SIZE, 0)) return -EFAULT;
+        if (copy_from_user(exceptfds, exceptfds_ptr, FD_SET_SIZE) != 0) return -EFAULT;
+        has_exceptfds = 1;
+    } else {
+        memset(exceptfds, 0, FD_SET_SIZE);
+    }
+    
+    //parse timeout
+    uint32_t timeout_ms = 0;
+    int has_timeout = 0;
+    if (timeout_ptr) {
+        if (!user_range_ok(timeout_ptr, 8, 0)) return -EFAULT;
+        int32_t tv_sec, tv_usec;
+        if (copy_from_user(&tv_sec, timeout_ptr, 4) != 0) return -EFAULT;
+        if (copy_from_user(&tv_usec, (char*)timeout_ptr + 4, 4) != 0) return -EFAULT;
+        if (tv_sec < 0 || tv_usec < 0) return -EINVAL;
+        timeout_ms = (uint32_t)tv_sec * 1000 + (uint32_t)tv_usec / 1000;
+        has_timeout = 1;
+    }
+    
+    #define FD_IS_SET(fd, set) ((set[(fd) / 8] & (1 << ((fd) % 8))) != 0)
+    #define FD_DO_SET(fd, set) (set[(fd) / 8] |= (1 << ((fd) % 8)))
+    uint32_t start_ticks = timer_get_ticks();
+    uint32_t timeout_ticks = has_timeout ? (timeout_ms * 100 / 1000) : 0; //100 Hz timer
+    
+    while (1) {
+        int ready_count = 0;
+        
+        //check each fd
+        for (int fd = 0; fd < nfds; fd++) {
+            int fd_ready = 0;
+            
+            //check readability
+            if (has_readfds && FD_IS_SET(fd, readfds)) {
+                //check if fd is readable
+                vfs_file_t* file = fd_get(fd);
+                if (!file) {
+                    return -EBADF; //bad file descriptor
+                }
+                
+                int readable = 0;
+                if (file->node && fd_pipe_is_node(file->node)) {
+                    readable = fd_pipe_can_read(file->node);
+                } else if (file->node && file->node->ops && file->node->ops->poll_can_read) {
+                    readable = file->node->ops->poll_can_read(file->node);
+                } else if (file->node && file->node->type == VFS_FILE_TYPE_FILE) {
+                    //for regular files readable if offset < size
+                    int size = vfs_get_size(file->node);
+                    if (size < 0 || (uint32_t)size > file->offset) readable = 1;
+                } else if (file->node && file->node->type == VFS_FILE_TYPE_DEVICE) {
+                    //devices assume readable driver can still return 0
+                    readable = 1;
+                }
+                
+                if (readable) {
+                    FD_DO_SET(fd, result_read);
+                    fd_ready = 1;
+                }
+            }
+            
+            //check writability
+            if (has_writefds && FD_IS_SET(fd, writefds)) {
+                //check if fd is writable
+                vfs_file_t* file = fd_get(fd);
+                if (!file) {
+                    return -EBADF;
+                }
+                
+                int writable = 1;
+                if (file->node && fd_pipe_is_node(file->node)) {
+                    writable = fd_pipe_can_write(file->node);
+                } else if (file->node && file->node->ops && file->node->ops->poll_can_write) {
+                    writable = file->node->ops->poll_can_write(file->node);
+                }
+                if (writable) {
+                    FD_DO_SET(fd, result_write);
+                    fd_ready = 1;
+                }
+            }
+            
+            
+            if (fd_ready) ready_count++;
+        }
+        
+        //if any fds are ready return
+        if (ready_count > 0) {
+            //copy results back to user space
+            int ret = ready_count;
+            if (has_readfds && copy_to_user(readfds_ptr, result_read, FD_SET_SIZE) != 0) ret = -EFAULT;
+            if (ret > 0 && has_writefds && copy_to_user(writefds_ptr, result_write, FD_SET_SIZE) != 0) ret = -EFAULT;
+            if (ret > 0 && has_exceptfds && copy_to_user(exceptfds_ptr, result_except, FD_SET_SIZE) != 0) ret = -EFAULT;
+            
+            //cleanup
+            kfree(readfds);
+            kfree(writefds);
+            kfree(exceptfds);
+            kfree(result_read);
+            kfree(result_write);
+            kfree(result_except);
+            
+            return ret;
+        }
+        
+        //check timeout
+        if (has_timeout) {
+            uint32_t elapsed = timer_get_ticks() - start_ticks;
+            if (elapsed >= timeout_ticks) {
+                //timeout clear all fd_sets and return 0
+                memset(result_read, 0, FD_SET_SIZE);
+                memset(result_write, 0, FD_SET_SIZE);
+                memset(result_except, 0, FD_SET_SIZE);
+                if (has_readfds) copy_to_user(readfds_ptr, result_read, FD_SET_SIZE);
+                if (has_writefds) copy_to_user(writefds_ptr, result_write, FD_SET_SIZE);
+                if (has_exceptfds) copy_to_user(exceptfds_ptr, result_except, FD_SET_SIZE);
+                
+                //cleanup
+                kfree(readfds);
+                kfree(writefds);
+                kfree(exceptfds);
+                kfree(result_read);
+                kfree(result_write);
+                kfree(result_except);
+                
+                return 0;
+            }
+        }
+        
+        //yield CPU and check for signals
+        signal_check_current();
+        extern void schedule(void);
+        schedule();
+    }
+    
+    //should never reach here
+    kfree(readfds);
+    kfree(writefds);
+    kfree(exceptfds);
+    kfree(result_read);
+    kfree(result_write);
+    kfree(result_except);
     return 0;
 }

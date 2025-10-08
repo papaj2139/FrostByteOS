@@ -241,9 +241,11 @@ static int procfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const 
         }
     }
     if (p->kind == PROCFS_NODE_RESCAN) {
-        //ATA rescan
+        //rescan partitions on all storage devices
         extern void ata_rescan_partitions(void);
+        extern void ahci_rescan_partitions(void);
         ata_rescan_partitions();
+        ahci_rescan_partitions();
         return (int)size;
     }
     if (p->kind == PROCFS_NODE_CONSOLE) {

@@ -23,6 +23,15 @@ static volatile uint8_t ev_head = 0, ev_tail = 0;
 #define KBD_IEV_CAP 128
 static volatile kbd_input_event_t ievq[KBD_IEV_CAP];
 static volatile uint8_t iev_head = 0, iev_tail = 0;
+static wait_queue_t kbd_waitq;
+
+static void kbd_controller_flush(void) {
+    for (int i = 0; i < 256; i++) {
+        uint8_t status = inb(kbd_status_port);
+        if (!(status & 1)) break;
+        (void)inb(kbd_data_port);
+    }
+}
 
 static inline int iev_empty(void){
     return iev_head == iev_tail;
@@ -37,6 +46,7 @@ static inline void iev_push(uint16_t code, uint8_t type){
     kbd_input_event_t e = { .time_ms = ms, .code = code, .type = type, .reserved = 0 };
     ievq[iev_head] = e;
     iev_head = next;
+    wait_queue_wake_all(&kbd_waitq);
 }
 static inline kbd_input_event_t iev_pop(void){
     kbd_input_event_t e = (kbd_input_event_t){0};
@@ -44,6 +54,10 @@ static inline kbd_input_event_t iev_pop(void){
     e = ievq[iev_tail];
     iev_tail = (uint8_t)((iev_tail + 1) & (KBD_IEV_CAP - 1));
     return e;
+}
+
+int kbd_input_has_events(void) {
+    return !iev_empty();
 }
 
 static volatile uint8_t key_state[128];      //pressed state per scancode (0x00-0x7F)
@@ -74,7 +88,11 @@ static inline int keybuf_empty(void) {
 }
 static inline void keybuf_push(char c) {
     uint8_t next = (uint8_t)((key_head + 1) & 63);
-    if (next != key_tail) { keybuf[key_head] = c; key_head = next; }
+    if (next != key_tail) {
+        keybuf[key_head] = c;
+        key_head = next;
+        wait_queue_wake_all(&kbd_waitq);
+    }
 }
 
 static inline int evbuf_empty(void) {
@@ -82,7 +100,11 @@ static inline int evbuf_empty(void) {
 }
 static inline void evbuf_push(unsigned short e) {
     uint8_t next = (uint8_t)((ev_head + 1) & 63);
-    if (next != ev_tail) { evbuf[ev_head] = e; ev_head = next; }
+    if (next != ev_tail) {
+        evbuf[ev_head] = e;
+        ev_head = next;
+        wait_queue_wake_all(&kbd_waitq);
+    }
 }
 
 static inline char keybuf_pop(void) {
@@ -430,6 +452,9 @@ uint16_t kbd_poll_event(void) {
 }
 
 void keyboard_init(void) {
+    wait_queue_init(&kbd_waitq);
+    kbd_flush();
+    kbd_controller_flush();
     irq_install_handler(1, keyboard_irq_handler);
     pic_clear_mask(1); //unmask IRQ1
 }
@@ -448,7 +473,14 @@ void kbd_flush(void) {
     repeat_scancode = 0;
     repeat_next_tick = 0;
     iev_head = iev_tail = 0;
+    //drain any pending controller data
+    for (int i = 0; i < 256; i++) {
+        uint8_t status = inb(kbd_status_port);
+        if (!(status & 1)) break;
+        (void)inb(kbd_data_port);
+    }
     __asm__ volatile ("sti");
+    wait_queue_wake_all(&kbd_waitq);
 }
 
 device_t* keyboard_create_device(void) {
@@ -554,6 +586,6 @@ int kbd_input_read_events(kbd_input_event_t* out, uint32_t max_events, int block
         }
         if (n > 0) return (int)n;
         if (!blocking) return 0;
-        __asm__ volatile ("hlt");
+        process_wait_on(&kbd_waitq);
     }
 }

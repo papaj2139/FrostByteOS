@@ -14,6 +14,11 @@ extern "C" {
 #define O_CREAT  0100
 #define O_TRUNC  01000
 #define O_APPEND 02000
+#define O_NONBLOCK 04000
+
+//fcntl commands
+#define F_GETFL 3
+#define F_SETFL 4
 
 #ifdef __cplusplus
 }

@@ -18,6 +18,10 @@ typedef unsigned long long uint64_t;
 typedef uint32_t           uintptr_t;
 typedef int32_t            intptr_t;
 
+#ifndef UINT32_MAX
+#define UINT32_MAX 0xFFFFFFFFu
+#endif
+
 #ifdef __cplusplus
 }
 #endif

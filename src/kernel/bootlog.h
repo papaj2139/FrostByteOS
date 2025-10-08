@@ -32,4 +32,4 @@ static inline void bootlog_print(const char* s) {
 }
 #endif
 
-#endif // BOOTLOG_H
+#endif

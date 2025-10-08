@@ -17,7 +17,7 @@ typedef unsigned int ino_t;
 typedef unsigned int nlink_t;
 typedef int off_t; //32-bit offset for now
 
-typedef unsigned int time_t; //seconds since epoch
+typedef int time_t; //seconds since epoch
 
 typedef unsigned int clock_t;
 

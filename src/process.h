@@ -8,6 +8,13 @@
 
 //forward declaration to avoid including device_manager.h here
 struct device;
+//forward declaration for wait queues
+struct process;
+
+//wait queue for sleeping processes (event-based wakeups)
+typedef struct wait_queue {
+    struct process* head;   //singly-linked list via process.wait_next
+} wait_queue_t;
 
 #define MAX_PROCESSES 64
 #define PROCESS_NAME_MAX 32
@@ -55,6 +62,10 @@ typedef struct process {
     uint32_t time_slice;             //remaining time slice
     uint32_t priority;               //process priority (0 = highest)
     uint32_t wakeup_tick;            //absolute tick to wake from sleep (0 = not sleeping)
+    uint32_t base_priority;          //base priority before aging/boost
+    int32_t  aging_score;            //scheduler aging accumulator / bonus
+    uint8_t  static_priority;        //user-visible nice level (0..MAX)
+    uint16_t weight;                 //scheduler weight derived from static priority
 
     //parent/child relationships
     struct process* parent;          //parent process
@@ -94,6 +105,10 @@ typedef struct process {
 
     //dynamic linking context for this process (set by exec when PT_DYNAMIC present)
     dynlink_ctx_t dlctx;
+
+    //wait-queue linkage (for blocking on events)
+    struct process* wait_next;   //next entry in a wait queue
+    wait_queue_t*   waiting_on;  //queue this process is sleeping on (NULL if none)
 } process_t;
 
 //process manager functions
@@ -103,22 +118,26 @@ void process_destroy(process_t* proc);
 process_t* process_get_current(void);
 process_t* process_get_by_pid(uint32_t pid);
 uint32_t process_get_next_pid(void);
-
-//scheduling
-void scheduler_init(void);
-void schedule(void);
 void process_yield(void);
 void process_exit(int exit_code);
 void process_sleep(uint32_t ticks);
 void process_wake(process_t* proc);
 
+//wait queue API
+void wait_queue_init(wait_queue_t* q);
+void wait_queue_wake_all(wait_queue_t* q);
+void wait_queue_wake_one(wait_queue_t* q);
+void process_wait_on(wait_queue_t* q);
+
 //context switching
 void context_switch(process_t* old_proc, process_t* new_proc);
+void process_capture_irq_context(uint32_t* irq_stack_ptr);  //for preemptive switching
 extern void switch_to_user_mode(uint32_t eip, uint32_t esp);
 
 //process list management
 extern process_t process_table[MAX_PROCESSES];
 extern process_t* current_process;
 extern uint32_t next_pid;
+extern volatile int g_preempt_needed;
 
 #endif

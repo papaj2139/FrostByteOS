@@ -7,6 +7,7 @@
 #include <string.h>
 #include "../kernel/uaccess.h"
 #include "../libc/string.h"
+#include "../mm/heap.h"
 #include "ata.h"
 
 //forward declarations
@@ -72,17 +73,25 @@ static int ata_part_init(device_t* d) {
 static int ata_part_read(device_t* d, uint32_t offset, void* buffer, uint32_t size) {
     ata_part_priv_t* pp = (ata_part_priv_t*)d->private_data;
     if (!pp || !pp->base) return -1;
-    uint64_t part_bytes = (uint64_t)pp->sectors * 512ull;
+    //get sector size from base device
+    ata_device_data_t* base_data = (ata_device_data_t*)pp->base->private_data;
+    if (!base_data) return -1;
+    uint32_t sector_size = base_data->sector_size;
+    uint64_t part_bytes = (uint64_t)pp->sectors * (uint64_t)sector_size;
     if ((uint64_t)offset + (uint64_t)size > part_bytes) return -1;
-    uint32_t abs_off = (uint32_t)(pp->start_lba * 512ull + (uint64_t)offset);
+    uint32_t abs_off = (uint32_t)((uint64_t)pp->start_lba * (uint64_t)sector_size + (uint64_t)offset);
     return device_read(pp->base, abs_off, buffer, size);
 }
 static int ata_part_write(device_t* d, uint32_t offset, const void* buffer, uint32_t size) {
     ata_part_priv_t* pp = (ata_part_priv_t*)d->private_data;
     if (!pp || !pp->base) return -1;
-    uint64_t part_bytes = (uint64_t)pp->sectors * 512ull;
+    //get sector size from base device
+    ata_device_data_t* base_data = (ata_device_data_t*)pp->base->private_data;
+    if (!base_data) return -1;
+    uint32_t sector_size = base_data->sector_size;
+    uint64_t part_bytes = (uint64_t)pp->sectors * (uint64_t)sector_size;
     if ((uint64_t)offset + (uint64_t)size > part_bytes) return -1;
-    uint32_t abs_off = (uint32_t)(pp->start_lba * 512ull + (uint64_t)offset);
+    uint32_t abs_off = (uint32_t)((uint64_t)pp->start_lba * (uint64_t)sector_size + (uint64_t)offset);
     return device_write(pp->base, abs_off, buffer, size);
 }
 static int ata_part_ioctl(device_t* d, uint32_t cmd, void* arg) {
@@ -94,8 +103,13 @@ static int ata_part_ioctl(device_t* d, uint32_t cmd, void* arg) {
         } blkdev_info_t;
         if (!arg) return -1;
         ata_part_priv_t* pp = (ata_part_priv_t*)d->private_data;
-        if (!pp) return -1;
-        blkdev_info_t info; info.sector_size = 512u; info.sector_count = pp->sectors;
+        if (!pp || !pp->base) return -1;
+        //get sector size from base device
+        ata_device_data_t* base_data = (ata_device_data_t*)pp->base->private_data;
+        if (!base_data) return -1;
+        blkdev_info_t info; 
+        info.sector_size = base_data->sector_size;
+        info.sector_count = pp->sectors;
         //copy to user
         if (copy_to_user(arg, &info, sizeof(info)) != 0) return -1;
         return 0;
@@ -116,10 +130,22 @@ static const device_ops_t ata_part_ops = {
 
 static void ata_register_partitions(device_t* base_dev, int drive_no) {
     if (ata_part_count >= (int)(sizeof(ata_part_devices)/sizeof(ata_part_devices[0]))) return;
-    //read MBR sector
-    uint8_t mbr[512];
-    if (device_read(base_dev, 0, mbr, 512) != 512) return;
-    if (!(mbr[510] == 0x55 && mbr[511] == 0xAA)) return;
+    //get sector size from device
+    ata_device_data_t* base_data = (ata_device_data_t*)base_dev->private_data;
+    if (!base_data) return;
+    uint32_t sector_size = base_data->sector_size;
+    
+    //read MBR sector (always at least 512 bytes, allocate enough for larger sectors)
+    uint8_t* mbr = (uint8_t*)kmalloc(sector_size > 512 ? sector_size : 512);
+    if (!mbr) return;
+    if (device_read(base_dev, 0, mbr, sector_size) != (int)sector_size) {
+        kfree(mbr);
+        return;
+    }
+    if (!(mbr[510] == 0x55 && mbr[511] == 0xAA)) {
+        kfree(mbr);
+        return;
+    }
     //partition table at 446
     for (int i = 0; i < 4 && ata_part_count < 16; i++) {
         uint8_t* e = &mbr[446 + i * 16];
@@ -150,6 +176,7 @@ static void ata_register_partitions(device_t* base_dev, int drive_no) {
             ata_part_count++;
         }
     }
+    kfree(mbr);
 }
 
 //query helper for /proc/partitions exposure
@@ -311,10 +338,26 @@ static int ata_device_init(device_t* device) {
     for (int i = 0; i < 256; i++) {
         id[i] = inw(data->data_port);
     }
+    
     //parse 28-bit LBA sector count from words 60-61 (little-endian word order)
     uint32_t lba28 = ((uint32_t)id[61] << 16) | (uint32_t)id[60];
     data->total_sectors = lba28;
     ata_debug_hex("IDENTIFY LBA28 sectors", data->total_sectors);
+    
+    //parse sector size from IDENTIFY data
+    //word 106 bit 12: if set, logical sector size is in words 117-118
+    //word 106 bits 0-3: if bit 12 set, 2^X logical sectors per physical sector
+    data->sector_size = 512; //default to 512 bytes
+    
+    if (id[106] & (1 << 12)) {
+        //logical sector size is specified in words 117-118 (in words, not bytes)
+        uint32_t logical_sector_words = ((uint32_t)id[118] << 16) | (uint32_t)id[117];
+        if (logical_sector_words > 0) {
+            data->sector_size = logical_sector_words * 2; //convert words to bytes
+        }
+    }
+    
+    ata_debug_hex("Detected sector size", data->sector_size);
 
     ata_debug("Device initialization successful");
     return 0; //success
@@ -474,12 +517,16 @@ int ata_write_sectors(device_t* device, uint32_t lba, uint8_t sector_count, cons
 }
 
 int ata_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size) {
-    uint32_t lba = offset / 512;
-    uint8_t sector_count = (size + 511) / 512;
+    ata_device_data_t* data = (ata_device_data_t*)device->private_data;
+    if (!data) return -1;
+    uint32_t sector_size = data->sector_size;
+    uint32_t lba = offset / sector_size;
+    uint8_t sector_count = (size + sector_size - 1) / sector_size;
     #if LOG_ATA
     ata_debug("Device read request:");
     ata_debug_hex("Offset", offset);
     ata_debug_hex("Size", size);
+    ata_debug_hex("Sector size", sector_size);
     ata_debug_hex("Calculated LBA", lba);
     ata_debug_hex("Calculated sector count", sector_count);
     #endif
@@ -496,8 +543,11 @@ int ata_device_read(device_t* device, uint32_t offset, void* buffer, uint32_t si
 }
 
 int ata_device_write(device_t* device, uint32_t offset, const void* buffer, uint32_t size) {
-    uint32_t lba = offset / 512;
-    uint8_t sector_count = (size + 511) / 512;
+    ata_device_data_t* data = (ata_device_data_t*)device->private_data;
+    if (!data) return -1;
+    uint32_t sector_size = data->sector_size;
+    uint32_t lba = offset / sector_size;
+    uint8_t sector_count = (size + sector_size - 1) / sector_size;
     if (ata_write_sectors(device, lba, sector_count, (const uint16_t*)buffer) != 0) {
         return -1;
     }
@@ -513,7 +563,9 @@ int ata_device_ioctl(device_t* device, uint32_t cmd, void* arg) {
         if (!arg) return -1;
         ata_device_data_t* data = (ata_device_data_t*)device->private_data;
         if (!data) return -1;
-        blkdev_info_t info; info.sector_size = 512u; info.sector_count = data->total_sectors;
+        blkdev_info_t info;
+        info.sector_size = data->sector_size;
+        info.sector_count = data->total_sectors;
         if (copy_to_user(arg, &info, sizeof(info)) != 0) return -1;
         return 0;
     }

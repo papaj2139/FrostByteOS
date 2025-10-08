@@ -18,6 +18,7 @@ void* memmove(void* dst, const void* src, size_t n);
 void* memset(void* dst, int val, size_t n);
 char* strchr(const char* s, int c);
 char* strstr(const char* haystack, const char* needle);
+char* strtok(char* str, const char* delim);
 
 #ifdef __cplusplus
 }

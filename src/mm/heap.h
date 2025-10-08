@@ -10,7 +10,6 @@ void* kmalloc(size_t size);
 void* kmalloc_aligned(size_t size, uint32_t alignment);
 void* kmalloc_physical(size_t size, uint32_t* physical_addr);
 void kfree(void* ptr);
-void* krealloc(void* ptr, size_t new_size);
 
 //heap stats
 typedef struct {

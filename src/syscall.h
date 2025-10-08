@@ -60,6 +60,22 @@
 #define SYS_DUP            1053
 #define SYS_DUP2           1054
 #define SYS_PIPE           1055
+#define SYS_SETUID         1056
+#define SYS_SETGID         1057
+#define SYS_SETEUID        1058
+#define SYS_SETEGID        1059
+#define SYS_LSEEK          1060
+#define SYS_SOCKET         1061
+#define SYS_BIND           1062
+#define SYS_LISTEN         1063
+#define SYS_ACCEPT         1064
+#define SYS_CONNECT        1065
+#define SYS_SHMGET         1066
+#define SYS_SHMAT          1067
+#define SYS_SHMDT          1068
+#define SYS_SHMCTL         1069
+#define SYS_SELECT         1070
+#define SYS_FCNTL          1071
 
 //syscall interrupt vector
 #define SYSCALL_INT 0x80
@@ -134,5 +150,21 @@ int32_t sys_rename(const char* oldpath, const char* newpath);
 int32_t sys_dup(int32_t fd);
 int32_t sys_dup2(int32_t oldfd, int32_t newfd);
 int32_t sys_pipe(int32_t* pipefd);
+int32_t sys_setuid(int32_t uid);
+int32_t sys_setgid(int32_t gid);
+int32_t sys_seteuid(int32_t euid);
+int32_t sys_setegid(int32_t egid);
+int32_t sys_lseek(int32_t fd, int32_t offset, int32_t whence);
+int32_t sys_socket(int32_t domain, int32_t type, int32_t protocol);
+int32_t sys_bind(int32_t sockfd, const void* addr, uint32_t addrlen);
+int32_t sys_listen(int32_t sockfd, int32_t backlog);
+int32_t sys_accept(int32_t sockfd, void* addr, uint32_t* addrlen);
+int32_t sys_connect(int32_t sockfd, const void* addr, uint32_t addrlen);
+int32_t sys_shmget(int32_t key, int32_t size, int32_t shmflg);
+int32_t sys_shmat(int32_t shmid, const void* shmaddr, int32_t shmflg);
+int32_t sys_shmdt(const void* shmaddr);
+int32_t sys_shmctl(int32_t shmid, int32_t cmd, void* buf);
+int32_t sys_select(int32_t nfds, void* readfds, void* writefds, void* exceptfds, void* timeout);
+int32_t sys_fcntl(int32_t fd, int32_t cmd, int32_t arg);
 
 #endif

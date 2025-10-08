@@ -7,6 +7,8 @@
 #include "../libc/stdlib.h"
 #include "../mm/heap.h"
 #include "tmpfs.h"
+#include "fat16_vfs.h"
+#include "fat32_vfs.h"
 
 //toggle to disable strict permission enforcement
 #ifndef VFS_ENFORCE_PERMS
@@ -445,7 +447,9 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
     }
 
     //create root node for this filesystem
-    //tmpfs gets its own root node from tmpfs_get_root()
+    //tmpfs, fat16, and fat32 get their own root nodes
+    int is_fat16 = (strcmp(fs_type, "fat16") == 0);
+    int is_fat32 = (strcmp(fs_type, "fat32") == 0);
     if (is_tmpfs) {
         mount->root = tmpfs_get_root();
         if (!mount->root) {
@@ -454,6 +458,30 @@ int vfs_mount(const char* device, const char* mount_point, const char* fs_type) 
             return -1;
         }
         mount->root->mount = mount;
+    } else if (is_fat16 && fs) {
+        //FAT16 needs special root node setup
+        void* fat16_mount_data = &fs->fs_data.fat16;
+        mount->root = fat16_get_root(fat16_mount_data);
+        if (!mount->root) {
+            if (fs) kfree(fs);
+            kfree(mount);
+            vfs_debug("Failed to get FAT16 root");
+            return -1;
+        }
+        mount->root->mount = mount;
+        mount->root->device = dev;
+    } else if (is_fat32 && fs) {
+        //FAT32 needs special root node setup
+        void* fat32_mount_data = fs->fs_data.fat32_mount;
+        mount->root = fat32_get_root(fat32_mount_data);
+        if (!mount->root) {
+            if (fs) kfree(fs);
+            kfree(mount);
+            vfs_debug("Failed to get FAT32 root");
+            return -1;
+        }
+        mount->root->mount = mount;
+        mount->root->device = dev;
     } else {
         //virtual filesystems (no backing device) are read-only by default
         uint32_t root_flags = use_physical_fs ? (VFS_FLAG_READ | VFS_FLAG_WRITE) : VFS_FLAG_READ;

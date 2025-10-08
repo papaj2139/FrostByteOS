@@ -6,6 +6,7 @@
 
 //fb0 IOCTLs
 #define FB_IOCTL_BLIT 0x0001u
+#define FB_IOCTL_SET_CONSOLE 0x0002u  //enable (1) or disable (0) console output
 
 typedef struct fb_blit_args {
     uint32_t x;           //destination X in pixels

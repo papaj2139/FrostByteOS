@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
         printf("FrostByteOS\n");
         return 0;
     }
-    //tokens: e.g., "FrostByteOS version 0.0.5 (DATE TIME)\n"
+    //tokens: e.x "FrostByteOS version 0.0.5 (DATE TIME)"
     char name[32] = {0};
     char rel[32] = {0};
     //parse first token as name

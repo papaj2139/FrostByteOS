@@ -63,5 +63,6 @@ typedef struct {
 //fill buffer with up to max_events events if blocking!=0 block until at least one event
 //returns number of events copied
 int kbd_input_read_events(kbd_input_event_t* out, uint32_t max_events, int blocking);
+int kbd_input_has_events(void);
 
 #endif

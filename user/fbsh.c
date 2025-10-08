@@ -4,13 +4,18 @@
 #include <tty.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <passwd.h>
+
+#define ESC "\033["
+#define RESET ESC "0m"
+#define BOLD ESC "1m"
+#define GREEN ESC "32m"
+#define BLUE ESC "34m"
+#define CYAN ESC "36m"
+#define RED ESC "31m"
 
 static void print(const char* s) {
     fputs(1, s);
-}
-
-static void print_dec(int v) {
-    printf("%d", v);
 }
 
 static void chomp(char* b, int n) {
@@ -75,23 +80,6 @@ static int parse_command(char* s, char** argv, int max, char** redirect_in, char
     return argc;
 }
 
-static int split_args(char* s, char** argv, int max)
-{
-    int argc = 0;
-    //skip leading whitespace
-    while (*s && *s <= ' ') s++;
-    while (*s && argc < max - 1) {
-        argv[argc++] = s;
-        //find end of token (stop at any whitespace)
-        while (*s && *s > ' ') s++;
-        if (!*s) break;
-        *s++ = '\0';
-        while (*s && *s <= ' ') s++;
-    }
-    argv[argc] = 0;
-    return argc;
-}
-
 //build full path from command name
 static void build_path(const char* cmd, char* path, int pathsize) {
     path[0] = '\0';
@@ -120,6 +108,7 @@ static void build_path(const char* cmd, char* path, int pathsize) {
 
 //execute command with optional redirection
 static int exec_simple_command(char** argv, char** envp, char* redir_in, char* redir_out, int append) {
+    (void)append;
     if (!argv || !argv[0]) return -1;
 
     char path[128];
@@ -150,11 +139,15 @@ static int exec_simple_command(char** argv, char** envp, char* redir_in, char* r
         }
 
         if (redir_out) {
-            //for output redirection delete existing file first then create
-            unlink(redir_out); //ignore error if file doesn't exist
-            int fd = creat(redir_out, 0644);
+            //try to open for writing first (for procfs and other special files)
+            int fd = open(redir_out, 1); //O_WRONLY
             if (fd < 0) {
-                print("Cannot create output file: ");
+                //if open fails try create (for regular files)
+                unlink(redir_out); //delete existing file for truncate
+                fd = creat(redir_out, 0644);
+            }
+            if (fd < 0) {
+                print("Cannot open/create output file: ");
                 print(redir_out);
                 print("\n");
                 _exit(1);
@@ -259,8 +252,13 @@ static int run_pipeline(char* cmdline, char** envp) {
                 dup2(pipefd[1], 1);
                 close(pipefd[1]);
             } else if (redir_out) {
-                if (!append) unlink(redir_out); //delete existing for truncate
-                int fd = creat(redir_out, 0644);
+                //try to open for writing first (for procfs and other special files)
+                int fd = open(redir_out, 1); //O_WRONLY
+                if (fd < 0) {
+                    //if open fails try create (for regular files)
+                    if (!append) unlink(redir_out); //delete existing for truncate
+                    fd = creat(redir_out, 0644);
+                }
                 if (fd >= 0) {
                     dup2(fd, 1);
                     close(fd);
@@ -296,13 +294,34 @@ int main(int argc, char** argv, char** envp) {
     print("FrostByte Shell\n");
     char buf[256];
     for (;;) {
+        //get username and prompt symbol
+        int uid = getuid();
+        struct passwd* pw = getpwuid(uid);
+        const char* username = pw ? pw->pw_name : "?";
+        const char* color = (uid == 0) ? RED : GREEN;
+        const char* prompt_char = (uid == 0) ? "#" : "$";
+        
         char cwd[256];
         cwd[0] = 0;
         if (getcwd(cwd, sizeof(cwd))) {
+            //show user@host:cwd$ format
+            print(color);
+            print(BOLD);
+            print(username);
+            print(RESET);
+            print(":");
+            print(BLUE);
             print(cwd);
-            print("> ");
+            print(RESET);
+            print(prompt_char);
+            print(" ");
         } else {
-            print("fbsh> ");
+            print(color);
+            print(BOLD);
+            print(username);
+            print(RESET);
+            print(prompt_char);
+            print(" ");
         }
         int n = read(0, buf, sizeof(buf) - 1);
         if (n <= 0) continue;
@@ -377,5 +396,8 @@ int main(int argc, char** argv, char** envp) {
 
         //execute command with pipe/redirect support
         run_pipeline(s, envp);
+        
+        //invalidate passwd cache so prompt updates correctly
+        endpwent();
     }
 }
