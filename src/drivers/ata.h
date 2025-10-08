@@ -5,6 +5,9 @@
 #include "../device_manager.h"
 #include "../io.h"
 
+//public helper to query ATA device or partition info for /proc exposure
+int ata_query_device_info(struct device* dev, uint64_t* start_lba, uint64_t* sector_count, int* is_partition);
+
 
 //ATA I/O ports
 #define ATA_PRIMARY_DATA        0x1F0
@@ -49,11 +52,14 @@ typedef struct {
     uint16_t control_port;
     uint8_t drive_select; //ATA_DRIVE_MASTER or ATA_DRIVE_SLAVE
     int is_slave;
+    uint64_t total_sectors; //capacity in sectors (from IDENTIFY LBA48 or LBA28)
+    uint32_t sector_size;   //actual sector size in bytes (typically 512 or 4096)
 } ata_device_data_t;
 
 //function declarations
 void ata_init(void);
 void ata_probe_and_register(void);
+void ata_rescan_partitions(void);
 
 //ATA requires a 400ns delay after drive selection
 static inline void sleep_400ns(uint16_t control_port) {

@@ -22,7 +22,7 @@ typedef enum {
     DEVICE_SUBTYPE_MOUSE,        //mouse input
     DEVICE_SUBTYPE_STORAGE_ATA,  //ATA storage
     DEVICE_SUBTYPE_STORAGE_USB,  //USB storage
-    DEVICE_SUBTYPE_NETWORK_ETH,  //Ethernet network
+    DEVICE_SUBTYPE_NETWORK_ETH,  //ethernet network
     DEVICE_SUBTYPE_NETWORK_WIFI, //WiFi network
 } device_subtype_t;
 
@@ -73,5 +73,12 @@ int device_init(device_t* device);
 int device_read(device_t* device, uint32_t offset, void* buffer, uint32_t size);
 int device_write(device_t* device, uint32_t offset, const void* buffer, uint32_t size);
 int device_ioctl(device_t* device, uint32_t cmd, void* arg);
+
+//enumerate devices in registration order returns 0 on success and stores pointer in *out
+int device_enumerate(uint32_t index, device_t** out);
+
+//block device ioctls (shared codes across storage drivers)
+//return basic geometry information to user space
+#define IOCTL_BLK_GET_INFO      0x424C4B01u /* 'BLK'|1 */
 
 #endif

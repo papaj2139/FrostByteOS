@@ -4,23 +4,26 @@
 #include "../drivers/serial.h"
 #include <string.h>
 
+typedef struct irfs_blob {
+    uint8_t* data;
+    uint32_t size;
+    uint32_t refcnt;
+} irfs_blob_t;
+
 typedef struct initramfs_node {
     char name[64];
     uint32_t type; //VFS_FILE_TYPE_FILE or VFS_FILE_TYPE_DIRECTORY
+    //for symlink data/size hold target string
     uint32_t size;
-    uint8_t* data; //only for files
+    uint8_t* data;
+    //for regular files shared blob
+    irfs_blob_t* blob;
     struct initramfs_node* parent;
     struct initramfs_node* children; //singly-linked list of first child
     struct initramfs_node* next;     //next sibling
 } initramfs_node_t;
 
 static initramfs_node_t* g_ramfs_root = NULL;
-
-static void irfs_debug(const char* m) {
-    serial_write_string("[initramfs] ");
-    serial_write_string(m);
-    serial_write_string("\n");
-}
 
 //FS operations forward declarations
 static int irfs_open(vfs_node_t* node, uint32_t flags);
@@ -35,6 +38,11 @@ static int irfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out);
 static int irfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out);
 static int irfs_get_size(vfs_node_t* node);
 static int irfs_ioctl(vfs_node_t* node, uint32_t request, void* arg);
+static initramfs_node_t* irfs_ensure_dir_path(const char* path);
+static int irfs_readlink(vfs_node_t* node, char* buf, uint32_t bufsize);
+static int irfs_symlink(vfs_node_t* parent, const char* name, const char* target);
+static int irfs_link(vfs_node_t* parent, const char* name, vfs_node_t* src);
+static initramfs_node_t* irfs_node_from_vnode(vfs_node_t* vnode);
 
 static vfs_operations_t g_irfs_ops = {
     .open = irfs_open,
@@ -48,8 +56,28 @@ static vfs_operations_t g_irfs_ops = {
     .readdir = irfs_readdir,
     .finddir = irfs_finddir,
     .get_size = irfs_get_size,
-    .ioctl = irfs_ioctl
+    .ioctl = irfs_ioctl,
+    .readlink = irfs_readlink,
+    .symlink = irfs_symlink,
+    .link = irfs_link
 };
+
+static void irfs_debug(const char* m) {
+    #if LOG_VFS
+        serial_write_string("[initramfs] ");
+        serial_write_string(m);
+        serial_write_string("\n");
+    #else
+        (void)m;
+    #endif
+}
+
+int initramfs_add_dir(const char* path) {
+    if (!g_ramfs_root || !path || path[0] != '/') return -1;
+    //ensure path exists as directories
+    initramfs_node_t* dir = irfs_ensure_dir_path(path);
+    return dir ? 0 : -1;
+}
 
 static initramfs_node_t* irfs_create_node(const char* name, uint32_t type) {
     initramfs_node_t* n = (initramfs_node_t*)kmalloc(sizeof(initramfs_node_t));
@@ -61,6 +89,7 @@ static initramfs_node_t* irfs_create_node(const char* name, uint32_t type) {
     n->type = type;
     n->size = 0;
     n->data = NULL;
+    n->blob = NULL;
     n->parent = NULL;
     n->children = NULL;
     n->next = NULL;
@@ -119,16 +148,27 @@ static int irfs_add_file_at(initramfs_node_t* parent, const char* filename, cons
         n->next = parent->children;
         parent->children = n;
     }
-    //copy data
-    if (n->data) kfree(n->data);
-    n->data = NULL;
-    n->size = 0;
-    if (size) {
-        n->data = (uint8_t*)kmalloc(size);
-        if (!n->data) return -1;
-        memcpy(n->data, data, size);
-        n->size = size;
+    //replace blob data (drop previous blob if present)
+    if (n->blob) {
+        if (n->blob->refcnt > 1) {
+            n->blob->refcnt--;
+        } else {
+            if (n->blob->data) kfree(n->blob->data);
+            kfree(n->blob);
+        }
+        n->blob = NULL;
     }
+    irfs_blob_t* blob = (irfs_blob_t*)kmalloc(sizeof(irfs_blob_t));
+    if (!blob) return -1;
+    memset(blob, 0, sizeof(*blob));
+    if (size) {
+        blob->data = (uint8_t*)kmalloc(size);
+        if (!blob->data) { kfree(blob); return -1; }
+        memcpy(blob->data, data, size);
+        blob->size = size;
+    }
+    blob->refcnt = 1;
+    n->blob = blob;
     return 0;
 }
 
@@ -148,7 +188,7 @@ int initramfs_add_file(const char* path, const uint8_t* data, uint32_t size) {
     if (!last_slash) return -1;
     char dirpath[256];
     size_t dirlen = (size_t)(last_slash - path);
-    if (dirlen == 0) dirlen = 1; // root
+    if (dirlen == 0) dirlen = 1; //root
     if (dirlen >= sizeof(dirpath)) dirlen = sizeof(dirpath) - 1;
     memcpy(dirpath, path, dirlen);
     dirpath[dirlen] = '\0';
@@ -161,13 +201,61 @@ int initramfs_add_file(const char* path, const uint8_t* data, uint32_t size) {
     return irfs_add_file_at(dir, fname, data, size);
 }
 
-//fbsh shell binary gets generated at build time from userapp.asm
-//via Makefile rule that produces this header with arrays fbsh_bin / fbsh_bin_len
-#include "fbsh_blob.h"
-//init program binary generated from init.asm
-#include "init_blob.h"
-//forktest binary
-#include "forktest_blob.h"
+int initramfs_add_symlink(const char* path, const char* target) {
+    if (!g_ramfs_root || !path || path[0] != '/' || !target) return -1;
+    //split into parent dir path and link name
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) return -1;
+    char dirpath[256];
+    size_t dirlen = (size_t)(last_slash - path);
+    if (dirlen == 0) dirlen = 1; //root
+    if (dirlen >= sizeof(dirpath)) dirlen = sizeof(dirpath) - 1;
+    memcpy(dirpath, path, dirlen);
+    dirpath[dirlen] = '\0';
+
+    const char* fname = last_slash + 1;
+    if (!*fname) return -1;
+
+    initramfs_node_t* dir = irfs_ensure_dir_path(dirpath);
+    if (!dir) return -1;
+    initramfs_node_t* n = irfs_find_child(dir, fname);
+    if (!n) {
+        n = irfs_create_node(fname, VFS_FILE_TYPE_SYMLINK);
+        if (!n) return -1;
+        n->parent = dir;
+        n->next = dir->children;
+        dir->children = n;
+    } else {
+        n->type = VFS_FILE_TYPE_SYMLINK;
+        if (n->data) { kfree(n->data); n->data = NULL; }
+    }
+    size_t tlen = strlen(target);
+    n->data = (uint8_t*)kmalloc(tlen + 1);
+    if (!n->data) return -1;
+    memcpy(n->data, target, tlen);
+    n->data[tlen] = '\0';
+    n->size = (uint32_t)tlen;
+    return 0;
+}
+
+static int irfs_link(vfs_node_t* parent_vn, const char* name, vfs_node_t* src_vn) {
+    if (!parent_vn || !name || !src_vn) return -1;
+    initramfs_node_t* parent = irfs_node_from_vnode(parent_vn);
+    initramfs_node_t* src = irfs_node_from_vnode(src_vn);
+    if (!parent || !src) return -1;
+    if (parent->type != VFS_FILE_TYPE_DIRECTORY) return -1;
+    if (src->type != VFS_FILE_TYPE_FILE || !src->blob) return -1;
+    //fail if name exists
+    if (irfs_find_child(parent, name)) return -1;
+    initramfs_node_t* n = irfs_create_node(name, VFS_FILE_TYPE_FILE);
+    if (!n) return -1;
+    n->parent = parent;
+    n->next = parent->children;
+    parent->children = n;
+    n->blob = src->blob;
+    n->blob->refcnt++;
+    return 0;
+}
 
 void initramfs_install_as_root(void) {
     //define ops lazily below
@@ -178,7 +266,10 @@ void initramfs_install_as_root(void) {
     irfs_debug("Installed as root");
 }
 
-vfs_operations_t* initramfs_get_ops(void* unused) { (void)unused; return &g_irfs_ops; }
+vfs_operations_t* initramfs_get_ops(void* unused) {
+    (void)unused;
+    return &g_irfs_ops;
+}
 
 static initramfs_node_t* irfs_node_from_vnode(vfs_node_t* vnode) {
     return (initramfs_node_t*)vnode->private_data;
@@ -190,7 +281,8 @@ static vfs_node_t* irfs_make_vnode(initramfs_node_t* n) {
     if (!vn) return NULL;
     vn->ops = &g_irfs_ops;
     vn->private_data = n;
-    vn->size = n->size;
+    if (n->type == VFS_FILE_TYPE_FILE) vn->size = n->blob ? n->blob->size : 0;
+    else if (n->type == VFS_FILE_TYPE_SYMLINK) vn->size = n->size; else vn->size = 0;
     vn->parent = NULL;
     return vn;
 }
@@ -198,35 +290,78 @@ static vfs_node_t* irfs_make_vnode(initramfs_node_t* n) {
 static int irfs_open(vfs_node_t* node, uint32_t flags) {
     (void)node; (void)flags; return 0;
 }
-static int irfs_close(vfs_node_t* node) { 
-    if (node) node->private_data = NULL; 
-    return 0; 
+
+static int irfs_close(vfs_node_t* node) {
+    (void)node;
+    return 0;
 }
+
 static int irfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, const char* buffer) {
-    (void)node; (void)offset; (void)size; (void)buffer; return -1; // read-only
+    (void)node; (void)offset; (void)size; (void)buffer;
+    return -1; //read-only
 }
+
 static int irfs_create(vfs_node_t* parent, const char* name, uint32_t flags) {
-    (void)parent; (void)name; (void)flags; return -1; // not supported
+    (void)parent; (void)name; (void)flags; return -1; //not supported
 }
-static int irfs_unlink(vfs_node_t* node) { (void)node; return -1; }
+
+static int irfs_unlink(vfs_node_t* vnode) {
+    if (!vnode) return -1;
+    initramfs_node_t* n = irfs_node_from_vnode(vnode);
+    if (!n) return -1;
+    if (n->type == VFS_FILE_TYPE_DIRECTORY) return -1;
+    //remove from parent children list
+    initramfs_node_t* parent = n->parent;
+    if (!parent) return -1;
+    initramfs_node_t** pp = &parent->children;
+    while (*pp && *pp != n) pp = &(*pp)->next;
+    if (*pp == n) { *pp = n->next; }
+    //drop file blob or symlink data
+    if (n->type == VFS_FILE_TYPE_FILE) {
+        if (n->blob) {
+            if (n->blob->refcnt > 1) n->blob->refcnt--; else {
+                if (n->blob->data) kfree(n->blob->data);
+                kfree(n->blob);
+            }
+            n->blob = NULL;
+        }
+    } else if (n->type == VFS_FILE_TYPE_SYMLINK) {
+        if (n->data) kfree(n->data);
+        n->data = NULL;
+        n->size = 0;
+    }
+    //free node
+    kfree(n);
+    return 0;
+}
+
 static int irfs_mkdir(vfs_node_t* parent, const char* name, uint32_t flags) {
-    (void)parent; (void)name; (void)flags; return -1; }
-static int irfs_rmdir(vfs_node_t* node) { (void)node; return -1; }
+    (void)parent; (void)name; (void)flags;
+    return -1;
+
+}
+static int irfs_rmdir(vfs_node_t* node) {
+    (void)node;
+    return -1;
+}
 
 static int irfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char* buffer) {
     initramfs_node_t* n = irfs_node_from_vnode(node);
-    if (!n || n->type != VFS_FILE_TYPE_FILE) return -1;
-    if (offset >= n->size) return 0;
-    uint32_t tocopy = n->size - offset;
+    if (!n) return -1;
+    if (n->type != VFS_FILE_TYPE_FILE || !n->blob) return -1;
+    if (offset >= n->blob->size) return 0;
+    uint32_t tocopy = n->blob->size - offset;
     if (tocopy > size) tocopy = size;
-    memcpy(buffer, n->data + offset, tocopy);
+    memcpy(buffer, n->blob->data + offset, tocopy);
     return (int)tocopy;
 }
 
 static int irfs_get_size(vfs_node_t* node) {
     initramfs_node_t* n = irfs_node_from_vnode(node);
     if (!n) return -1;
-    return (int)n->size;
+    if (n->type == VFS_FILE_TYPE_FILE) return (int)(n->blob ? n->blob->size : 0);
+    if (n->type == VFS_FILE_TYPE_SYMLINK) return (int)n->size;
+    return 0;
 }
 
 static int irfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) {
@@ -259,16 +394,44 @@ static int irfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
 }
 
 static int irfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) {
-    (void)node; (void)request; (void)arg; return -1; }
+    (void)node;
+    (void)request;
+    (void)arg;
 
-void initramfs_populate_builtin(void) {
-    if (!g_ramfs_root) return;
-    const char* motd = "Welcome to FrostByte (initramfs)\n";
-    initramfs_add_file("/etc/motd", (const uint8_t*)motd, (uint32_t)strlen(motd));
-    //add the userspace shell at /bin/sh
-    initramfs_add_file("/bin/sh", (const uint8_t*)fbsh_bin, (uint32_t)fbsh_bin_len);
-    //add init that execs /bin/sh
-    initramfs_add_file("/bin/init", (const uint8_t*)init_bin, (uint32_t)init_bin_len);
-    //add forktest program
-    initramfs_add_file("/bin/forktest", (const uint8_t*)forktest_bin, (uint32_t)forktest_bin_len);
+    return -1;
+}
+
+static int irfs_readlink(vfs_node_t* node, char* buf, uint32_t bufsize) {
+    if (!node || !buf || bufsize == 0) return -1;
+    initramfs_node_t* n = irfs_node_from_vnode(node);
+    if (!n || n->type != VFS_FILE_TYPE_SYMLINK || !n->data) return -1;
+    size_t len = strlen((const char*)n->data);
+    if (len + 1 > bufsize) len = bufsize - 1;
+    memcpy(buf, n->data, len);
+    buf[len] = '\0';
+    return (int)len;
+}
+
+static int irfs_symlink(vfs_node_t* parent, const char* name, const char* target) {
+    if (!parent || !name || !target) return -1;
+    initramfs_node_t* dir = irfs_node_from_vnode(parent);
+    if (!dir || dir->type != VFS_FILE_TYPE_DIRECTORY) return -1;
+    initramfs_node_t* n = irfs_find_child(dir, name);
+    if (!n) {
+        n = irfs_create_node(name, VFS_FILE_TYPE_SYMLINK);
+        if (!n) return -1;
+        n->parent = dir;
+        n->next = dir->children;
+        dir->children = n;
+    } else {
+        n->type = VFS_FILE_TYPE_SYMLINK;
+        if (n->data) { kfree(n->data); n->data = NULL; }
+    }
+    size_t tlen = strlen(target);
+    n->data = (uint8_t*)kmalloc(tlen + 1);
+    if (!n->data) return -1;
+    memcpy(n->data, target, tlen);
+    n->data[tlen] = '\0';
+    n->size = (uint32_t)tlen;
+    return 0;
 }

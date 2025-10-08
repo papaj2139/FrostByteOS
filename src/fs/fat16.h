@@ -64,10 +64,19 @@ typedef struct {
 typedef struct {
     fat16_fs_t* fs;
     fat16_dir_entry_t entry;
-    uint32_t current_cluster;
-    uint32_t current_offset;
+    uint32_t current_cluster;   //cluster that contains current_offset
+    uint32_t current_offset;    //byte offset within file for next read/write
     uint32_t file_size;
     uint8_t is_open;
+    //streaming cache to avoid re-walking the cluster chain on sequential reads
+    uint32_t cached_offset;     //last offset for which cached_cluster is valid
+    uint16_t cached_cluster;    //cluster containing cached_offset
+    uint8_t  cache_valid;       //1 if cached_* are valid
+    //read-ahead buffer for sequential reads (cross-cluster prefetch)
+    uint8_t* ra_buf;            //buffer storage (allocated on first use)
+    uint32_t ra_buf_cap;        //capacity in bytes
+    uint32_t ra_len;            //valid bytes currently in buffer
+    uint32_t ra_off;            //file offset of start of buffer
 } fat16_file_t;
 
 //function declarations
@@ -79,7 +88,14 @@ int fat16_write_file(fat16_file_t* file, const void* buffer, uint32_t size);
 int fat16_close_file(fat16_file_t* file);
 int fat16_list_directory(fat16_fs_t* fs);
 int fat16_create_file(fat16_fs_t* fs, const char* filename);
+int fat16_create_file_in_dir(fat16_fs_t* fs, uint16_t dir_first_cluster, const char* name);
+int fat16_create_dir_in_dir(fat16_fs_t* fs, uint16_t parent_first_cluster, const char* name);
 uint16_t fat16_get_next_cluster(fat16_fs_t* fs, uint16_t cluster);
+int fat16_create_dir_root(fat16_fs_t* fs, const char* name);
+int fat16_remove_dir_root(fat16_fs_t* fs, const char* name);
+int fat16_delete_file_root(fat16_fs_t* fs, const char* filename);
+int fat16_delete_file_in_dir(fat16_fs_t* fs, uint16_t dir_first_cluster, const char* name);
+int fat16_update_dir_entry_in_dir(fat16_fs_t* fs, uint16_t dir_first_cluster, const fat16_dir_entry_t* entry);
 
 //util functions
 void fat16_to_83_name(const char* name, char* fat_name);

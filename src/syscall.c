@@ -11,25 +11,205 @@
 #include "drivers/tty.h"
 #include "process.h"
 #include "drivers/timer.h"
+#include "drivers/rtc.h"
+#include "device_manager.h"
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
 #include "debug.h"
+#include "kernel/elf.h"
+#include "kernel/cga.h"
+#include "kernel/panic.h"
+#include "kernel/signal.h"
+#include "kernel/uaccess.h"
+#include "kernel/dynlink.h"
+#include "drivers/fb.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "errno_defs.h"
+#include "scheduler.h"
 
-//forward declarations
-void print(char* msg, unsigned char colour);
-void kpanic_msg(const char* reason);
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define MAP_ANON    0x1
+#define MAP_FIXED   0x10
+#define MMAP_SCAN_START 0x04000000u   //avoid low 8MB identity region
+#define MMAP_SCAN_END   0x7F000000u   //keep under 2GiB to avoid sign issues
+#define USER_HEAP_BASE 0x03000000u
+
+#ifndef S_IFMT
+#define S_IFMT   0170000
+#define S_IFREG  0100000
+#define S_IFDIR  0040000
+#define S_IFLNK  0120000
+#define S_IFCHR  0020000
+#endif
+
+#define F_GETFL 3
+#define F_SETFL 4
+
+typedef struct {
+    uint32_t st_mode;  // type + perms
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t st_size;
+} stat32_t;
+
+static const int mdays_norm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+
+//timekeeping base captured at first use
+static uint64_t g_boot_epoch = 0;     //seconds since epoch at boot
+static uint64_t g_boot_ticks = 0;     //timer ticks at the moment of boot capture
+static uint32_t g_hz_cached = 0;      //timer frequency (ticks per second)
+
+//32-bit user ABI for timespec/timeval structures
+typedef struct {
+    uint32_t tv_sec;
+    uint32_t tv_nsec;
+} timespec32_t;
+
+typedef struct {
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+} timeval32_t;
+
+//for fd backed mmap
+typedef struct {
+    uint32_t addr;
+    uint32_t length;
+    uint32_t prot;
+    uint32_t flags;
+    int32_t  fd;
+    uint32_t offset; // byte offset
+} mmap_ex_args_t;
 
 //external assembly handler
 extern void syscall_handler_asm(void);
+
+//divide 64-bit unsigned by 32-bit unsigned return quotient store remainder
+static uint64_t udivmod_u64_u32(uint64_t n, uint32_t d, uint32_t* rem)
+{
+    //simple binary long division
+    uint64_t q = 0;
+    uint64_t r = 0;
+    for (int i = 63; i >= 0; --i) {
+        r = (r << 1) | ((n >> i) & 1ull);
+        if (r >= d) { r -= d; q |= (1ull << i); }
+    }
+    if (rem) *rem = (uint32_t)r;
+    return q;
+}
+
+//compute UNIX epoch seconds from RTC time (naive and UTC assumption)
+static int is_leap(unsigned y) {
+    return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
+}
+
+//forward declarations
+static int normalize_user_path(const char* in, char* out, size_t outsz);
+static int32_t sys_mmap_ex(void* uargs_ptr);
+
+int32_t sys_chdir(const char* path) {
+    if (!path) return -1;
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    vfs_node_t* node = vfs_resolve_path(abspath);
+    if (!node) return -1;
+    int ok = (node->type == VFS_FILE_TYPE_DIRECTORY);
+    vfs_close(node);
+    if (!ok) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    strncpy(cur->cwd, abspath, sizeof(cur->cwd) - 1);
+    cur->cwd[sizeof(cur->cwd) - 1] = '\0';
+    return 0;
+}
+
+int32_t sys_getcwd(char* buf, uint32_t bufsize) {
+    if (!buf || bufsize == 0) return -1;
+    process_t* cur = process_get_current();
+    if (!cur || !cur->cwd[0]) {
+        if (bufsize < 2) return -1;
+        buf[0] = '/'; buf[1] = '\0';
+        return 0;
+    }
+    size_t len = strlen(cur->cwd);
+    if (len + 1 > bufsize) return -1;
+    memcpy(buf, cur->cwd, len + 1);
+    return 0;
+}
+
+static uint64_t rtc_to_epoch_seconds(void) {
+    rtc_time_t t;
+    if (!rtc_read(&t)) return 0;
+    unsigned y = t.year;
+    unsigned m = t.month;
+    unsigned d = t.day;
+    unsigned hh = t.hour;
+    unsigned mm = t.minute;
+    unsigned ss = t.second;
+    if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return 0;
+    uint64_t days = 0;
+    for (unsigned yr = 1970; yr < y; ++yr) days += is_leap(yr) ? 366 : 365;
+    for (unsigned i = 1; i < m; ++i) {
+        days += mdays_norm[i-1];
+        if (i == 2 && is_leap(y)) days += 1;
+    }
+    days += (d - 1);
+    uint64_t secs = days * 86400ull + hh * 3600ull + mm * 60ull + ss;
+    return secs;
+}
+
+static void ensure_time_base(void) {
+    if (g_hz_cached == 0) g_hz_cached = timer_get_frequency();
+    if (g_boot_epoch == 0) {
+        uint64_t now = rtc_to_epoch_seconds();
+        if (now == 0) now = 1735689600ull; //fallback 2025-01-01 UTC
+        g_boot_epoch = now;
+        g_boot_ticks = timer_get_ticks();
+    }
+}
 
 //mark entry/exit of syscalls for scheduler to restore correct context
 void syscall_mark_enter(void) {
     process_t* cur = process_get_current();
     if (cur) cur->in_kernel = true;
 }
+
+//find a free virtual region of 'length' bytes in the current process directory
+static uint32_t mmap_find_free_region(page_directory_t dir, uint32_t length, uint32_t hint_start) {
+    (void)dir; //vmm_get_physical_addr uses the currently active directory
+    if (length == 0) return 0;
+    uint32_t start = hint_start ? hint_start : MMAP_SCAN_START;
+    if (start < USER_VIRTUAL_START) start = USER_VIRTUAL_START;
+    if (start & (PAGE_SIZE - 1)) start = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint32_t end_limit = MMAP_SCAN_END;
+    if (end_limit > USER_VIRTUAL_END) end_limit = USER_VIRTUAL_END;
+    //simple first-fit scan
+    for (uint32_t base = start; base + length <= end_limit; base += PAGE_SIZE) {
+        bool ok = true;
+        for (uint32_t off = 0; off < length; off += PAGE_SIZE) {
+            if (vmm_get_physical_addr(base + off) != 0) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return base;
+    }
+    return 0;
+}
+
 void syscall_mark_exit(void) {
     process_t* cur = process_get_current();
     if (cur) cur->in_kernel = false;
+}
+
+//normalize a user-provided path against the current process CWD into an absolute path
+static int normalize_user_path(const char* in, char* out, size_t outsz) {
+    if (!in || !out || outsz == 0) return -1;
+    process_t* cur = process_get_current();
+    const char* base = (cur && cur->cwd[0]) ? cur->cwd : "/";
+    return vfs_normalize_path(base, in, out, outsz);
 }
 
 //initialize syscall system
@@ -40,8 +220,11 @@ void syscall_init(void) {
     fd_init();
 }
 
-//capture user-mode return frame at syscall entry so fork() can clone the exact return point
-void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint32_t useresp, uint32_t ss) {
+//capture user-mode return frame and GPRs at syscall entry so fork() can clone precisely
+void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags,
+                                uint32_t useresp, uint32_t ss, uint32_t ebp,
+                                uint32_t eax, uint32_t ebx, uint32_t ecx,
+                                uint32_t edx, uint32_t esi, uint32_t edi) {
     process_t* cur = process_get_current();
     if (!cur) return;
     cur->context.eip = eip;
@@ -49,49 +232,81 @@ void syscall_capture_user_frame(uint32_t eip, uint32_t cs, uint32_t eflags, uint
     cur->context.eflags = eflags;
     cur->context.esp = useresp;
     cur->context.ss = ss;
+    cur->context.ebp = ebp;
+    //save user GPRs as they were at syscall entry
+    cur->context.eax = eax;
+    cur->context.ebx = ebx;
+    cur->context.ecx = ecx;
+    cur->context.edx = edx;
+    cur->context.esi = esi;
+    cur->context.edi = edi;
 }
 
 //clone user space from src->dst directories (user part only)
 static int clone_user_space(page_directory_t src, page_directory_t dst) {
     if (!src || !dst) return -1;
-    const uint32_t TMP_SRC = 0xE0000000; //high kernel scratch outside kernel heap
-    const uint32_t TMP_DST = 0xE0001000;
+    uint8_t* page_buf = (uint8_t*)kmalloc(PAGE_SIZE);
+    if (!page_buf) return -1;
+
     for (int i = 0; i < 768; i++) { //user space only
-        //skip cloning PDE 0 and 1 (0 to 8MB identity region) these PTs are shared with the kernel
-        //so cloning into them would overwrite global identity mappings (e.x VGA 0xB8000)
-        //causing text output to disappear
-        if (i < 2) continue;
+        if (i < 2) continue; //skip identity-mapped PDEs shared with kernel
         if (!(src[i] & PAGE_PRESENT)) continue;
+
         uint32_t pt_src_phys = src[i] & ~0xFFF;
         page_table_t pt_src = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_src_phys);
+
         for (int j = 0; j < 1024; j++) {
             uint32_t pte = pt_src[j];
             if (!(pte & PAGE_PRESENT)) continue;
+
             uint32_t src_phys = pte & ~0xFFF;
-            uint32_t flags = PAGE_PRESENT | (pte & PAGE_WRITABLE) | PAGE_USER; //ensure USER
+            uint32_t flags = PAGE_PRESENT | PAGE_USER;
+            if (pte & PAGE_WRITABLE) flags |= PAGE_WRITABLE;
             uint32_t vaddr = ((uint32_t)i << 22) | ((uint32_t)j << 12);
-            //allocate and copy
+
             uint32_t dst_phys = pmm_alloc_page();
-            if (!dst_phys) return -1;
-            if (vmm_map_page(TMP_SRC, src_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) return -1;
-            if (vmm_map_page(TMP_DST, dst_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-                vmm_unmap_page_nofree(TMP_SRC);
+            if (!dst_phys) {
+                kfree(page_buf);
                 return -1;
             }
-            memcpy((void*)TMP_DST, (void*)TMP_SRC, 4096);
-            vmm_unmap_page_nofree(TMP_SRC);
-            vmm_unmap_page_nofree(TMP_DST);
-            // map into dst directory at vaddr
-            if (vmm_map_page_in_directory(dst, vaddr, dst_phys, flags) != 0) return -1;
+
+            uint32_t saved_src = 0;
+            void* src_map = vmm_map_temp_page(src_phys, &saved_src);
+            if (!src_map) {
+                pmm_free_page(dst_phys);
+                kfree(page_buf);
+                return -1;
+            }
+            memcpy(page_buf, src_map, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_src);
+
+            if (vmm_map_page_in_directory(dst, vaddr, dst_phys, flags) != 0) {
+                pmm_free_page(dst_phys);
+                kfree(page_buf);
+                return -1;
+            }
+
+            uint32_t saved_dst = 0;
+            void* dst_map = vmm_map_temp_page(dst_phys, &saved_dst);
+            if (!dst_map) {
+                vmm_unmap_page_in_directory(dst, vaddr);
+                pmm_free_page(dst_phys);
+                kfree(page_buf);
+                return -1;
+            }
+            memcpy(dst_map, page_buf, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_dst);
         }
     }
+
+    kfree(page_buf);
     return 0;
 }
 
 //main syscall dispatcher called from assembly
 int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4, uint32_t arg5) {
     (void)arg4; //suppress unused parameter warning
-    (void)arg5; //suppress unused parameter warning
+    (void)arg5;
     switch (syscall_num) {
         case SYS_EXIT:
             return sys_exit((int32_t)arg1);
@@ -111,14 +326,158 @@ int32_t syscall_dispatch(uint32_t syscall_num, uint32_t arg1, uint32_t arg2, uin
             return sys_sleep(arg1);
         case SYS_FORK:
             return sys_fork();
-        case SYS_EXECVE:
-            return sys_execve((const char*)arg1, (char* const*)arg2, (char* const*)arg3);
+        case SYS_EXECVE: {
+            const char* p = (const char*)arg1;
+            char* const* avp = (char* const*)arg2;
+            char* const* evp = (char* const*)arg3;
+            #if LOG_EXEC
+            serial_write_string("[SYS_EXECVE] path ptr=0x");
+            serial_printf("%x", (uint32_t)p);
+            serial_write_string(" path=\"");
+            if (p) serial_write_string(p); else serial_write_string("(null)");
+            serial_write_string("\"\n");
+            serial_write_string("[SYS_EXECVE] argv ptr=0x");
+            serial_printf("%x", (uint32_t)avp);
+            serial_write_string(" envp ptr=0x");
+            serial_printf("%x", (uint32_t)evp);
+            serial_write_string("\n");
+            if (avp) {
+                serial_write_string("[SYS_EXECVE] argv0 ptr=0x");
+                serial_printf("%x", (uint32_t)avp[0]);
+                serial_write_string("\n");
+                if (avp[0]) {
+                    serial_write_string("[SYS_EXECVE] argv0=\"");
+                    serial_write_string(avp[0]);
+                    serial_write_string("\"\n");
+                }
+            }
+            #endif
+            return sys_execve(p, avp, evp);
+        }
         case SYS_WAIT:
             return sys_wait((int32_t*)arg1);
+        case SYS_WAITPID:
+            return sys_waitpid((int32_t)arg1, (int32_t*)arg2, (int32_t)arg3);
         case SYS_YIELD:
             return sys_yield();
         case SYS_IOCTL:
             return sys_ioctl((int32_t)arg1, arg2, (void*)arg3);
+        case SYS_BRK:
+            return sys_brk(arg1);
+        case SYS_SBRK:
+            return sys_sbrk((int32_t)arg1);
+        case SYS_UNLINK:
+            return sys_unlink((const char*)arg1);
+        case SYS_MKDIR:
+            return sys_mkdir((const char*)arg1, (int32_t)arg2);
+        case SYS_RMDIR:
+            return sys_rmdir((const char*)arg1);
+        case SYS_MOUNT:
+            return sys_mount((const char*)arg1, (const char*)arg2, (const char*)arg3);
+        case SYS_UMOUNT:
+            return sys_umount((const char*)arg1);
+        case SYS_READDIR_FD:
+            return sys_readdir_fd((int32_t)arg1, arg2, (char*)arg3, arg4, (uint32_t*)arg5);
+        case SYS_MMAP:
+            return sys_mmap(arg1, arg2, arg3, arg4);
+        case SYS_MMAP_EX:
+            return sys_mmap_ex((void*)arg1);
+        case SYS_MUNMAP:
+            return sys_munmap(arg1, arg2);
+        case SYS_TIME:
+            return sys_time();
+        case SYS_CLOCK_GETTIME:
+            return sys_clock_gettime(arg1, (void*)arg2);
+        case SYS_GETTIMEOFDAY:
+            return sys_gettimeofday((void*)arg1, (void*)arg2);
+        case SYS_NANOSLEEP:
+            return sys_nanosleep((const void*)arg1, (void*)arg2);
+        case SYS_LINK:
+            return sys_link((const char*)arg1, (const char*)arg2);
+        case SYS_KILL:
+            return sys_kill(arg1, arg2);
+        case SYS_SYMLINK:
+            return sys_symlink((const char*)arg1, (const char*)arg2);
+        case SYS_READLINK:
+            return sys_readlink((const char*)arg1, (char*)arg2, arg3);
+        case SYS_CHDIR:
+            return sys_chdir((const char*)arg1);
+        case SYS_GETCWD:
+            return sys_getcwd((char*)arg1, arg2);
+        case SYS_DL_GET_INIT:
+            return sys_dl_get_init(arg1);
+        case SYS_DL_GET_FINI:
+            return sys_dl_get_fini(arg1);
+        case SYS_DLOPEN:
+            return sys_dlopen((const char*)arg1, arg2);
+        case SYS_DLCLOSE:
+            return sys_dlclose((int32_t)arg1);
+        case SYS_DLSYM:
+            return sys_dlsym((int32_t)arg1, (const char*)arg2);
+        case SYS_GETUID:
+            return sys_getuid();
+        case SYS_GETEUID:
+            return sys_geteuid();
+        case SYS_GETGID:
+            return sys_getgid();
+        case SYS_GETEGID:
+            return sys_getegid();
+        case SYS_UMASK:
+            return sys_umask((int32_t)arg1);
+        case SYS_STAT:
+            return sys_stat((const char*)arg1, (void*)arg2);
+        case SYS_LSTAT:
+            return sys_lstat((const char*)arg1, (void*)arg2);
+        case SYS_FSTAT:
+            return sys_fstat((int32_t)arg1, (void*)arg2);
+        case SYS_CHMOD:
+            return sys_chmod((const char*)arg1, (int32_t)arg2);
+        case SYS_CHOWN:
+            return sys_chown((const char*)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_FCHMOD:
+            return sys_fchmod((int32_t)arg1, (int32_t)arg2);
+        case SYS_FCHOWN:
+            return sys_fchown((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_RENAME:
+            return sys_rename((const char*)arg1, (const char*)arg2);
+        case SYS_DUP:
+            return sys_dup((int32_t)arg1);
+        case SYS_DUP2:
+            return sys_dup2((int32_t)arg1, (int32_t)arg2);
+        case SYS_PIPE:
+            return sys_pipe((int32_t*)arg1);
+        case SYS_SETUID:
+            return sys_setuid((int32_t)arg1);
+        case SYS_SETGID:
+            return sys_setgid((int32_t)arg1);
+        case SYS_SETEUID:
+            return sys_seteuid((int32_t)arg1);
+        case SYS_SETEGID:
+            return sys_setegid((int32_t)arg1);
+        case SYS_LSEEK:
+            return sys_lseek((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_SOCKET:
+            return sys_socket((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
+        case SYS_BIND:
+            return sys_bind((int32_t)arg1, (const void*)arg2, arg3);
+        case SYS_LISTEN:
+            return sys_listen((int32_t)arg1, (int32_t)arg2);
+        case SYS_ACCEPT:
+            return sys_accept((int32_t)arg1, (void*)arg2, (uint32_t*)arg3);
+        case SYS_CONNECT:
+            return sys_connect((int32_t)arg1, (const void*)arg2, arg3);
+        case SYS_SHMGET:
+            return sys_shmget((int32_t)arg1, arg2, (int32_t)arg3);
+        case SYS_SHMAT:
+            return sys_shmat((int32_t)arg1, (const void*)arg2, (int32_t)arg3);
+        case SYS_SHMDT:
+            return sys_shmdt((const void*)arg1);
+        case SYS_SHMCTL:
+            return sys_shmctl((int32_t)arg1, (int32_t)arg2, (void*)arg3);
+        case SYS_SELECT:
+            return sys_select((int32_t)arg1, (void*)arg2, (void*)arg3, (void*)arg4, (void*)arg5);
+        case SYS_FCNTL:
+            return sys_fcntl((int32_t)arg1, (int32_t)arg2, (int32_t)arg3);
         default:
             print("Unknown syscall\n", 0x0F);
             return -1; //ENOSYS = Function not implemented
@@ -146,16 +505,31 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     serial_printf("%x", (uint32_t)buf);
     serial_write_string("\n");
     #endif
-    
-    if (fd == 1 || fd == 2) {
-        #if LOG_SYSCALL
-        serial_write_string("[SYSCALL] Writing to TTY\n");
-        #endif
-        int written = tty_write(buf, count);
-        return (written < 0) ? written : (int32_t)count;
+    //validate user buffer
+    if (!buf || count == 0) return 0;
+    if (!user_range_ok(buf, count, 0)) return -1;
+
+    //special handling for stdout/stderr ONLY if they're not redirected
+    //if fd 1 or 2 has been dup2'd to a filewe should use the file
+    vfs_file_t* maybe_file = fd_get(fd);
+    if ((fd == 1 || fd == 2) && !maybe_file) {
+        //fd 1/2 not redirected, write to TTY
+        process_t* curp = process_get_current();
+        device_t* dev = (curp) ? curp->tty : NULL;
+        int32_t rc;
+        if (dev) {
+            int wr = device_write(dev, 0, buf, count);
+            rc = (wr < 0) ? wr : (int32_t)count;
+        } else {
+            int written = tty_write(buf, count);
+            rc = (written < 0) ? written : (int32_t)count;
+        }
+        signal_check_current();
+        return rc;
     }
-    
-    vfs_file_t* file = fd_get(fd);
+
+    //reuse maybe_file if already fetched otherwise get it
+    vfs_file_t* file = maybe_file ? maybe_file : fd_get(fd);
     if (!file) {
         #if LOG_SYSCALL
         serial_write_string("[SYSCALL] Invalid file descriptor\n");
@@ -166,56 +540,235 @@ int32_t sys_write(int32_t fd, const char* buf, uint32_t count) {
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Writing to file via VFS\n");
     #endif
-    int bytes_written = vfs_write(file->node, file->offset, count, buf);
-    if (bytes_written >= 0) {
-        file->offset += bytes_written;
+    
+    //if O_APPEND is set seek to end of file before writing
+    if (file->append && file->node) {
+        int size = vfs_get_size(file->node);
+        if (size >= 0) {
+            file->offset = (uint32_t)size;
+        }
+    }
+    //for pipes block until writable unless O_NONBLOCK handle closed reader
+    if (file->node && fd_pipe_is_node(file->node)) {
+        while (!fd_pipe_can_write(file->node)) {
+            if (file->flags & O_NONBLOCK) {
+                signal_check_current();
+                return -EAGAIN; //would block
+            }
+            fd_pipe_wait_writable(file->node);
+            signal_check_current();
+        }
+    }
+
+    //bounce buffer in manageable chunks to avoid large contiguous allocations
+    const uint32_t CHUNK = 65536; //64 KiB
+    uint32_t remaining = count;
+    int total_written = 0;
+    while (remaining > 0) {
+        uint32_t this_chunk = remaining > CHUNK ? CHUNK : remaining;
+        char* kbuf = (char*)kmalloc(this_chunk);
+        if (!kbuf) {
+            //out of memory: if nothing written yet report error else return partial
+            total_written = (total_written > 0) ? total_written : -1;
+            break;
+        }
+        if (copy_from_user(kbuf, buf + total_written, this_chunk) != 0) {
+            kfree(kbuf);
+            total_written = (total_written > 0) ? total_written : -1;
+            break;
+        }
+        #if LOG_SYSCALL
+        serial_printf("[SYSCALL] Write: kbuf first 4 bytes: %x %x %x %x\n",
+                      ((uint8_t*)kbuf)[0], ((uint8_t*)kbuf)[1],
+                      ((uint8_t*)kbuf)[2], ((uint8_t*)kbuf)[3]);
+        #endif
+        int r = vfs_write(file->node, file->offset, this_chunk, kbuf);
+        kfree(kbuf);
+        if (r <= 0) {
+            if (r < 0 && total_written == 0) total_written = r; //propagate error if nothing written
+            break;
+        }
+        file->offset += r;
+        total_written += r;
+        if ((uint32_t)r < this_chunk) {
+            //short write stop here
+            break;
+        }
+        remaining -= (uint32_t)r;
+        //allow pending signals to be processed between chunks
+        signal_check_current();
+    }
+    //for device nodes reset the file offset after each write syscall so each
+    //subsequent write starts fresh (useful for streaming devices like /dev/fb0)
+    //but DON'T reset for block devices (storage) since they need to maintain offset
+    if (file && file->node && file->node->type == VFS_FILE_TYPE_DEVICE) {
+        device_t* dev = (device_t*)file->node->device;
+        if (dev && dev->type != DEVICE_TYPE_STORAGE) {
+            file->offset = 0;
+        }
     }
     #if LOG_SYSCALL
     serial_write_string("[SYSCALL] Write completed, bytes: ");
-    serial_printf("%d", bytes_written);
+    serial_printf("%d", total_written);
     serial_write_string("\n");
     #endif
-    return bytes_written;
+    //signal check
+    signal_check_current();
+    return total_written;
 }
 
 int32_t sys_read(int32_t fd, char* buf, uint32_t count) {
+    if (!buf || count == 0) return 0;
+    if (!user_range_ok(buf, count, 1)) return -1;
     if (fd == 0) {
         //read from controlling TTY using the current process TTY mode
         process_t* cur = process_get_current();
         uint32_t mode = (cur) ? cur->tty_mode : (TTY_MODE_CANON | TTY_MODE_ECHO);
-        return tty_read_mode(buf, count, mode);
+        device_t* dev = (cur) ? cur->tty : NULL;
+        if (!dev || strcmp(dev->name, "tty0") == 0) {
+            //text console keyboard path
+            int r = tty_read_mode(buf, count, mode);
+            //ff ctrl-c interrupted input r may be 0 don't terminate the shell in that case
+            if (r > 0) {
+                signal_check_current();
+            }
+            return r;
+        } else {
+            //serial or other device: implement a line/raw reader via device manager
+            uint32_t pos = 0;
+            char ch;
+            if (mode & TTY_MODE_CANON) {
+                for (;;) {
+                    int r;
+                    //block for first byte
+                    do {
+                        r = device_read(dev, 0, &ch, 1);
+                    } while (r <= 0);
+                    if (ch == '\r') ch = '\n';
+                    buf[pos++] = ch;
+                    if (mode & TTY_MODE_ECHO) device_write(dev, 0, &ch, 1);
+                    if (ch == '\n' || pos >= count) return (int32_t)pos;
+                    //drain immediately available without blocking too long
+                    while (pos < count) {
+                        char t;
+                        int rr = device_read(dev, 0, &t, 1);
+                        if (rr <= 0) break;
+                        if (t == '\r') t = '\n';
+                        buf[pos++] = t;
+                        if (mode & TTY_MODE_ECHO) device_write(dev, 0, &t, 1);
+                        if (t == '\n') return (int32_t)pos;
+                    }
+                }
+            } else {
+                //raw mode: block for first byte then return immediately if no more
+                int r;
+                do {
+                    r = device_read(dev, 0, &ch, 1);
+                } while (r <= 0);
+                if (ch == '\r') ch = '\n';
+                buf[pos++] = ch;
+                if (mode & TTY_MODE_ECHO) device_write(dev, 0, &ch, 1);
+                while (pos < count) {
+                    char t;
+                    int rr = device_read(dev, 0, &t, 1);
+                    if (rr <= 0) break;
+                    if (t == '\r') t = '\n';
+                    buf[pos++] = t;
+                    if (mode & TTY_MODE_ECHO) device_write(dev, 0, &t, 1);
+                }
+                signal_check_current();
+                return (int32_t)pos;
+            }
+        }
     }
-    
+
     vfs_file_t* file = fd_get(fd);
     if (!file) {
         return -1; //EBADF
     }
 
-    int bytes_read = vfs_read(file->node, file->offset, count, buf);
-    if (bytes_read >= 0) {
-        file->offset += bytes_read;
+    //for pipes: block until readable unless O_NONBLOCK
+    if (file->node && fd_pipe_is_node(file->node)) {
+        while (!fd_pipe_can_read(file->node)) {
+            //non-blocking: indicate no data available
+            if (file->flags & O_NONBLOCK) {
+                signal_check_current();
+                return -EAGAIN; //would block
+            }
+            fd_pipe_wait_readable(file->node);
+            signal_check_current();
+        }
     }
+    //bounce buffer in kernel space then copy to user
+    int bytes_read = -1;
+    char* kbuf = (char*)kmalloc(count);
+    if (kbuf) {
+        int r = vfs_read(file->node, file->offset, count, kbuf);
+        if (r > 0) {
+            if (copy_to_user(buf, kbuf, (size_t)r) == 0) {
+                file->offset += r;
+                bytes_read = r;
+            } else {
+                bytes_read = -1;
+            }
+        } else {
+            bytes_read = r;
+        }
+        kfree(kbuf);
+    }
+    signal_check_current();
     return bytes_read;
 }
 
 int32_t sys_open(const char* pathname, int32_t flags) {
-    //convert POSIX flags to VFS flags
+    //extract O_CREAT, O_TRUNC, O_APPEND flags
+    int o_creat = (flags & 0100);   //O_CREAT
+    int o_trunc = (flags & 01000);  //O_TRUNC
+    int o_append = (flags & 02000); //O_APPEND
+    
+    //convert POSIX access mode flags to VFS flags
+    int access_mode = flags & 3;  //O_RDONLY(0), O_WRONLY(1), O_RDWR(2)
     uint32_t vfs_flags = 0;
-    if (flags == 0) {
+    if (access_mode == 0) {
         vfs_flags = VFS_FLAG_READ;  //O_RDONLY
-    } else if (flags == 1) {
-        vfs_flags = VFS_FLAG_WRITE; //O_WRONLY  
-    } else if (flags == 2) {
+    } else if (access_mode == 1) {
+        vfs_flags = VFS_FLAG_WRITE; //O_WRONLY
+    } else if (access_mode == 2) {
         vfs_flags = VFS_FLAG_READ | VFS_FLAG_WRITE; //O_RDWR
-    } else {
-        vfs_flags = VFS_FLAG_READ; //default to read-only
     }
     
-    vfs_node_t* node = vfs_open(pathname, vfs_flags);
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
+    
+    //try to open existing file
+    vfs_node_t* node = vfs_open(abspath, vfs_flags);
+    
+    //if open failed and O_CREAT is set try to create the file
+    if (!node && o_creat) {
+        process_t* cur = process_get_current();
+        if (!cur) return -1;
+        uint32_t mode = 0666 & ~cur->umask;  //default mode
+        if (vfs_create(abspath, 0) != 0) {
+            return -1;
+        }
+        vfs_set_metadata_override(abspath, 1, mode, 1, cur->euid, 1, cur->egid);
+        //now try to open it
+        node = vfs_open(abspath, vfs_flags);
+        if (!node) return -1;
+    }
+    
     if (!node) {
         return -1;
     }
-    return fd_alloc(node, flags);
+    
+    //handle O_TRUNC: truncate file to 0 bytes
+    if (o_trunc && (vfs_flags & VFS_FLAG_WRITE)) {
+        //truncate by writing 0 bytes at offset 0 (some filesystems support this)
+        vfs_write(node, 0, 0, NULL);
+    }
+    
+    //install into current process descriptor table with append flag
+    return fd_alloc(node, vfs_flags, o_append ? 1 : 0);
 }
 
 int32_t sys_close(int32_t fd) {
@@ -224,13 +777,66 @@ int32_t sys_close(int32_t fd) {
 }
 
 int32_t sys_creat(const char* pathname, int32_t mode) {
-    int result = vfs_create(pathname, mode);
-    if (result != 0) {
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    //apply umask default file mode 0666 if mode==0
+    uint32_t req = (mode == 0) ? 0666u : (uint32_t)mode;
+    uint32_t eff_mode = req & ~cur->umask;
+
+    //create the file (filesystem-specific)
+    if (vfs_create(abspath, 0) != 0) {
         return -1;
     }
-    return sys_open(pathname, 0); //open the file with default flags
-}
 
+    //persist initial ownership and permissions via overlay so subsequent resolves see them
+    vfs_set_metadata_override(abspath, 1, (eff_mode & 07777), 1, cur->euid, 1, cur->egid);
+
+    //open parent directory directly then locate child and open it to avoid resolution race/case issues
+    char* parent_path = vfs_get_parent_path(abspath);
+    if (!parent_path) {
+        return -1;
+    }
+    char* base = vfs_get_basename(abspath);
+    if (!base) { kfree(parent_path); return -1; }
+
+    vfs_node_t* parent = vfs_open(parent_path, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    if (!parent) {
+        kfree(parent_path);
+        kfree(base);
+        return -1;
+    }
+
+    vfs_node_t* child = NULL;
+    int fd = -1;
+    if (parent->ops && parent->ops->finddir) {
+        if (parent->ops->finddir(parent, base, &child) == 0 && child) {
+            //best-effort set attributes on node instance as well
+            child->mode = (eff_mode & 07777);
+            child->uid = cur->euid;
+            child->gid = cur->egid;
+            //ensure filesystem-specific open occurs for write
+            if (child->ops && child->ops->open) {
+                if (child->ops->open(child, VFS_FLAG_WRITE) != 0) {
+                    vfs_close(child);
+                    child = NULL;
+                }
+            }
+            if (child) {
+                fd = fd_alloc(child, 1, 0); //O_WRONLY no append
+                if (fd < 0) {
+                    vfs_close(child);
+                }
+            }
+        }
+    }
+
+    vfs_close(parent);
+    kfree(parent_path);
+    kfree(base);
+    return fd;
+}
 
 int32_t sys_getpid(void) {
     process_t* current = process_get_current();
@@ -238,9 +844,9 @@ int32_t sys_getpid(void) {
 }
 
 int32_t sys_sleep(uint32_t seconds) {
-    uint64_t now = timer_get_ticks();
     uint32_t ticks = seconds * 100;
     #if LOG_PROC
+    uint64_t now = timer_get_ticks();
     serial_write_string("[SLEEP] seconds=\n");
     serial_printf("%d", (int)seconds);
     serial_write_string(" ticks=\n");
@@ -304,16 +910,32 @@ int32_t sys_fork(void) {
     //and EAX=0 in the child per POSIX semantics
     child->context.eip = parent->context.eip;      //return point in user space
     child->context.esp = parent->context.esp;      //user stack pointer at syscall entry
-    child->context.ebp = parent->context.esp;      //best-effort (we don't capture exact EBP)
+    child->context.ebp = parent->context.ebp;      //preserve proper frame pointer for local vars
     child->context.cs  = 0x1B;                     //user code segment
     child->context.ss  = 0x23;                     //user stack segment
     child->context.ds = child->context.es = child->context.fs = child->context.gs = 0x23;
     child->context.eflags = parent->context.eflags; //preserve IF and flags
-    child->context.eax = 0;                        //fork() returns 0 in child
+    //inherit parent general-purpose registers so callee-saved regs remain valid across fork
+    child->context.eax = 0;                        //fork returns 0 in child
+    child->context.ebx = parent->context.ebx;
+    child->context.ecx = parent->context.ecx;
+    child->context.edx = parent->context.edx;
+    child->context.esi = parent->context.esi;
+    child->context.edi = parent->context.edi;
 
     //inherit TTY mode and controlling TTY
     child->tty = parent->tty;
     child->tty_mode = parent->tty_mode;
+
+    //inherit file descriptors (per-process) and bump open-file refcounts
+    fd_copy_on_fork(parent, child);
+
+    //inherit cmdline for /proc/<pid>/cmdline until execve updates it
+    child->cmdline[0] = '\0';
+    if (parent->cmdline[0]) {
+        strncpy(child->cmdline, parent->cmdline, sizeof(child->cmdline) - 1);
+        child->cmdline[sizeof(child->cmdline) - 1] = '\0';
+    }
 
     //ensure parent saved user context reflects fork return value as well
     parent->context.eax = (uint32_t)child->pid;
@@ -329,255 +951,90 @@ int32_t sys_fork(void) {
 }
 
 int32_t sys_execve(const char* pathname, char* const argv[], char* const envp[]) {
-    (void)argv; (void)envp; //not yet used by flat loader
     if (!pathname) return -1;
+    //normalize path against CWD
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(pathname, abspath, sizeof(abspath)) != 0) return -1;
 
-    //open the target program from VFS
-    vfs_node_t* node = vfs_open(pathname, VFS_FLAG_READ);
-    if (!node) {
-        #if LOG_PROC
-        serial_write_string("[EXEC] File not found\n");
-        #endif
-        return -1;
-    }
-
-    int fsize = vfs_get_size(node);
-    #if LOG_PROC
-    serial_write_string("[EXEC] opened file, size=\n");
-    serial_printf("%d", fsize);
-    serial_write_string("\n");
-    #endif
-    if (fsize <= 0) {
-        vfs_close(node);
-        #if LOG_PROC
-        serial_write_string("[EXEC] Invalid file size\n");
-        #endif
-        return -1;
-    }
-    if (fsize > 4096) fsize = 4096; //single-page flat loader for now
-
-    const uint32_t entry_va = 0x01000000;      //program entry VA
-    const uint32_t temp_kmap = 0x00800000;     //temp kernel VA for copying
-    const uint32_t ustack_top = 0x02000000;    //user stack top
-    process_t* cur = process_get_current();
-
-    //allocate a new physical page for code
-    uint32_t new_code_phys = pmm_alloc_page();
-    if (!new_code_phys) {
-        vfs_close(node);
-        #if LOG_PROC
-        serial_write_string("[EXEC] pmm_alloc_page failed for code\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] code phys=0x\n");
-    serial_printf("%x", new_code_phys);
-    serial_write_string("\n");
-    #endif
-
-    //perform temporary mapping and file copy under the kernel directory
-    //disable interrupts to prevent preemption while CR3 is set to kernel dir
-    uint32_t eflags_save;
-    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
-    vmm_switch_directory(vmm_get_kernel_directory());
-    if (vmm_map_page(temp_kmap, new_code_phys, PAGE_PRESENT | PAGE_WRITABLE) != 0) {
-        vfs_close(node);
-        pmm_free_page(new_code_phys);
-        #if LOG_PROC
-        serial_write_string("[EXEC] map temp page failed\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] temp map ok at 0x00800000\n");
-    #endif
-
-    //zero and copy program into page
-    memset((void*)temp_kmap, 0, 4096);
-    uint32_t offset = 0;
-    while (offset < (uint32_t)fsize) {
-        int r = vfs_read(node, offset, (uint32_t)(fsize - offset), (char*)((uint8_t*)temp_kmap + offset));
-        #if LOG_PROC
-        serial_write_string("[EXEC] read chunk r=\n");
-        serial_printf("%d", r);
-        serial_write_string(" off=\n");
-        serial_printf("%d", (int)offset);
-        serial_write_string("\n");
-        #endif
-        if (r <= 0) break;
-        offset += (uint32_t)r;
-    }
-    vfs_close(node);
-    vmm_unmap_page_nofree(temp_kmap);
-    //switch back to the current process directory for installing user mappings
-    if (cur && cur->page_directory) {
-        vmm_switch_directory(cur->page_directory);
-    }
-    //restore IF if it was set
-    if (eflags_save & 0x200) __asm__ volatile ("sti");
-    #if LOG_PROC
-    serial_write_string("[EXEC] copied bytes=\n");
-    serial_printf("%d", (int)offset);
-    serial_write_string("\n");
-    #endif
-
-    //replace mapping at entry_va with new code page in the process directory only
-    uint32_t old_code_phys = vmm_get_physical_addr(entry_va) & ~0xFFF; //assumes current_directory is cur's dir
-    if (!cur || !cur->page_directory ||
-        vmm_map_page_in_directory(cur->page_directory, entry_va, new_code_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        pmm_free_page(new_code_phys);
-        #if LOG_PROC
-        serial_write_string("[EXEC] map code in proc dir failed\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] mapped code at entry_va=0x\n");
-    serial_printf("%x", entry_va);
-    serial_write_string(" phys=0x\n");
-    serial_printf("%x", new_code_phys);
-    serial_write_string("\n");
-    #endif
-
-    //free old code phys if it existed and differs
-    if (old_code_phys && old_code_phys != new_code_phys) {
-        pmm_free_page(old_code_phys);
-    }
-
-    //create a fresh user stack page and map it
-    uint32_t new_stack_phys = pmm_alloc_page();
-    if (!new_stack_phys) {
-        #if LOG_PROC
-        serial_write_string("[EXEC] alloc user stack failed\n");
-        #endif
-        return -1;
-    }
-    uint32_t ustack_va = ustack_top - 0x1000;
-    uint32_t old_stack_phys = vmm_get_physical_addr(ustack_va) & ~0xFFF;
-    //map the user stack only into the process directory
-    if (vmm_map_page_in_directory(cur->page_directory, ustack_va, new_stack_phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
-        pmm_free_page(new_stack_phys);
-        #if LOG_PROC
-        serial_write_string("[EXEC] map user stack (proc dir) failed\n");
-        #endif
-        return -1;
-    }
-    #if LOG_PROC
-    serial_write_string("[EXEC] mapped stack va=0x\n");
-    serial_printf("%x", ustack_va);
-    serial_write_string(" phys=0x\n");
-    serial_printf("%x", new_stack_phys);
-    serial_write_string("\n");
-    #endif
-    if (old_stack_phys && old_stack_phys != new_stack_phys) {
-        pmm_free_page(old_stack_phys);
-    }
-
-    //build user stack with argc argv[] envp[] and strings
-    uint32_t sp = ustack_top; //stack grows down
-
-    //count argc and envc
-    int argc = 0;
-    if (argv) {
-        while (argv[argc]) argc++;
-    }
-    int envc = 0;
-    if (envp) {
-        while (envp[envc]) envc++;
-    }
-
-    //calculate total size for strings
-    uint32_t strings_size = 0;
-    for (int i = 0; i < argc; i++) {
-        strings_size += (uint32_t)strlen(argv[i]) + 1;
-    }
-    for (int i = 0; i < envc; i++) {
-        strings_size += (uint32_t)strlen(envp[i]) + 1;
-    }
-
-    //space for vectors: argc + argv pointers + NULL + envp pointers + NULL
-    uint32_t vector_words = 1 + (uint32_t)argc + 1 + (uint32_t)envc + 1;
-    uint32_t vector_bytes = vector_words * 4;
-
-    //ensure it fits in one page (naive check)
-    if (strings_size + vector_bytes + 64 > 4096) {
-        #if LOG_PROC
-        serial_write_string("[EXEC] argv/envp too large for one-page stack\n");
-        #endif
-        return -1;
-    }
-
-    //copy strings to stack and record user pointers
-    uint32_t* argv_user = NULL;
-    uint32_t* envp_user = NULL;
-    if (argc > 0) argv_user = (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)argc);
-    if (envc > 0) envp_user = (uint32_t*)kmalloc(sizeof(uint32_t) * (uint32_t)envc);
-
-    //copy envp strings
-    for (int i = envc - 1; i >= 0; i--) {
-        const char* s = envp[i];
-        uint32_t len = (uint32_t)strlen(s) + 1;
-        sp -= len;
-        memcpy((void*)sp, s, len);
-        envp_user[i] = sp;
-    }
-    //copy argv strings
-    for (int i = argc - 1; i >= 0; i--) {
-        const char* s = argv[i];
-        uint32_t len = (uint32_t)strlen(s) + 1;
-        sp -= len;
-        memcpy((void*)sp, s, len);
-        argv_user[i] = sp;
-    }
-
-    //aign stack to 16 bytes
-    sp &= ~0xF;
-
-    //push envp NULL
-    sp -= 4; *(uint32_t*)sp = 0;
-    //push envp pointers in reverse so they appear in ascending order in memory
-    for (int i = envc - 1; i >= 0; i--) {
-        sp -= 4; *(uint32_t*)sp = envp_user[i];
-    }
-    //push argv NULL
-    sp -= 4; *(uint32_t*)sp = 0;
-    //push argv pointers in reverse
-    for (int i = argc - 1; i >= 0; i--) {
-        sp -= 4; *(uint32_t*)sp = argv_user[i];
-    }
-    //push argc
-    sp -= 4; *(uint32_t*)sp = (uint32_t)argc;
-
-    if (argv_user) kfree(argv_user);
-    if (envp_user) kfree(envp_user);
-
-    //reset process context and TTY defaults
-    if (cur) {
-        strncpy(cur->name, pathname, PROCESS_NAME_MAX - 1);
-        cur->name[PROCESS_NAME_MAX - 1] = '\0';
-        cur->context.eip = entry_va;
-        cur->context.esp = sp;
-        cur->context.ebp = sp;
-        cur->user_eip = entry_va;
-        cur->tty_mode = TTY_MODE_CANON | TTY_MODE_ECHO;
-    }
-
-    #if LOG_PROC
-    serial_write_string("[EXEC] Success, jumping to user EIP=0x\n");
-    serial_printf("%x", entry_va);
-    serial_write_string(" ESP=0x\n");
-    serial_printf("%x", sp);
-    serial_write_string("\n");
-    #endif
-    //ensure CR3 is set to the current process directory before jumping
-    vmm_switch_directory(cur->page_directory);
-    //clear in-kernel flag since we are not returning through the syscall exit path
-    syscall_mark_exit();
-    //jump directly to user mode at the new entry; execve() does not return on success
-    switch_to_user_mode(entry_va, sp);
-    //not reached
+    int er = elf_execve(abspath, argv, envp);
+    if (er == 0) return 0;   //not returned
+    //any failure (including not an ELF) equals error
     return -1;
+}
+
+static inline uint32_t page_align_up(uint32_t addr) {
+    return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+}
+
+int32_t sys_brk(uint32_t new_end) {
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory) return -1;
+
+    //initialize heap base on first use
+    if (cur->heap_start == 0 && cur->heap_end == 0) {
+        cur->heap_start = USER_HEAP_BASE;
+        cur->heap_end = USER_HEAP_BASE;
+    }
+
+    uint32_t old_end = cur->heap_end;
+    if (new_end == 0) {
+        //glibc sometimes calls brk(0) to query break return current end as success (0) is ambiguous
+        //we follow linux-like semantics so return 0 on success user queries via sbrk(0)
+        return 0;
+    }
+
+    //prevent setting break below start
+    if (new_end < cur->heap_start) new_end = cur->heap_start;
+
+    uint32_t old_top = page_align_up(old_end);
+    uint32_t new_top = page_align_up(new_end);
+
+    //switch to this process directory for unmap operations
+    vmm_switch_directory(cur->page_directory);
+
+    if (new_top > old_top) {
+        //grow: map new pages
+        for (uint32_t va = old_top; va < new_top; va += PAGE_SIZE) {
+            uint32_t phys = pmm_alloc_page();
+            if (!phys) return -1;
+            if (vmm_map_page_in_directory(cur->page_directory, va, phys, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE) != 0) {
+                return -1;
+            }
+            //zero page via temp map
+            uint32_t saved_entry2 = 0;
+            void* tmp2 = vmm_map_temp_page(phys, &saved_entry2);
+            if (tmp2) {
+                memset(tmp2, 0, PAGE_SIZE);
+                vmm_unmap_temp_page(saved_entry2);
+            }
+        }
+    } else if (new_top < old_top) {
+        //shrink: unmap and free pages
+        for (uint32_t va = new_top; va < old_top; va += PAGE_SIZE) {
+            uint32_t phys = vmm_get_physical_addr(va);
+            if (phys) {
+                vmm_unmap_page(va);
+                pmm_free_page(phys);
+            }
+        }
+    }
+
+    cur->heap_end = new_end;
+    return 0;
+}
+
+int32_t sys_sbrk(int32_t increment) {
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory) return -1;
+    if (cur->heap_start == 0 && cur->heap_end == 0) {
+        cur->heap_start = USER_HEAP_BASE;
+        cur->heap_end = USER_HEAP_BASE;
+    }
+    uint32_t old_end = cur->heap_end;
+    uint32_t new_end = (increment >= 0) ? (cur->heap_end + (uint32_t)increment)
+                                        : (cur->heap_end - (uint32_t)(-increment));
+    if (sys_brk(new_end) != 0) return -1;
+    return (int32_t)old_end;
 }
 
 int32_t sys_wait(int32_t* status) {
@@ -632,10 +1089,12 @@ int32_t sys_ioctl(int32_t fd, uint32_t cmd, void* arg) {
         if (!cur) return -1;
         if (cmd == TTY_IOCTL_SET_MODE) {
             if (!arg) return -1;
+            if (!user_range_ok(arg, sizeof(uint32_t), 0)) return -1;
             cur->tty_mode = *(uint32_t*)arg;
             return 0;
         } else if (cmd == TTY_IOCTL_GET_MODE) {
             if (!arg) return -1;
+            if (!user_range_ok(arg, sizeof(uint32_t), 1)) return -1;
             *(uint32_t*)arg = cur->tty_mode;
             return 0;
         }
@@ -650,3 +1109,1245 @@ int32_t sys_ioctl(int32_t fd, uint32_t cmd, void* arg) {
     return file->node->ops->ioctl(file->node, cmd, arg);
 }
 
+int32_t sys_unlink(const char* path) {
+    if (!path) return -1;
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    return vfs_unlink(abspath);
+}
+
+int32_t sys_mkdir(const char* path, int32_t mode) {
+    if (!path) return -1;
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    uint32_t req = (mode == 0) ? 0777u : (uint32_t)mode;
+    uint32_t eff_mode = req & ~cur->umask;
+    int r = vfs_mkdir(abspath, 0);
+    if (r != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(abspath);
+    if (n) {
+        n->mode = (eff_mode & 07777);
+        n->uid = cur->euid;
+        n->gid = cur->egid;
+        vfs_close(n);
+    }
+    return 0;
+}
+
+int32_t sys_rmdir(const char* path) {
+    if (!path) return -1;
+    char abspath[VFS_MAX_PATH];
+    if (normalize_user_path(path, abspath, sizeof(abspath)) != 0) return -1;
+    return vfs_rmdir(abspath);
+}
+
+int32_t sys_readdir_fd(int32_t fd, uint32_t index, char* name_buf, uint32_t buf_size, uint32_t* out_type) {
+    vfs_file_t* file = fd_get(fd);
+    if (!file || !file->node) return -1;
+    if (name_buf && buf_size > 0 && !user_range_ok(name_buf, buf_size, 1)) return -1;
+    if (out_type && !user_range_ok(out_type, sizeof(uint32_t), 1)) return -1;
+    vfs_node_t* node = file->node;
+    if (node->type != VFS_FILE_TYPE_DIRECTORY) return -1;
+    vfs_node_t* child = NULL;
+    int r = vfs_readdir(node, index, &child);
+    if (r != 0 || !child) return -1;
+    //copy name and type out
+    if (name_buf && buf_size > 0) {
+        size_t nlen = strlen(child->name);
+        if (nlen + 1 > buf_size) nlen = buf_size - 1;
+        memcpy(name_buf, child->name, nlen);
+        name_buf[nlen] = '\0';
+    }
+    if (out_type) *out_type = child->type;
+    vfs_close(child);
+    return 0;
+}
+
+int32_t sys_mount(const char* device, const char* mount_point, const char* fs_type) {
+    if (!device || !mount_point || !fs_type) return -1;
+    char mp[VFS_MAX_PATH];
+    if (normalize_user_path(mount_point, mp, sizeof(mp)) != 0) return -1;
+    int r = vfs_mount(device, mp, fs_type);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_umount(const char* mount_point) {
+    if (!mount_point) return -1;
+    char mp[VFS_MAX_PATH];
+    if (normalize_user_path(mount_point, mp, sizeof(mp)) != 0) return -1;
+    int r = vfs_unmount(mp);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot, uint32_t flags) {
+    #if LOG_SYSCALL
+        serial_write_string("[MMAP] req addr=0x"); serial_printf("%x", addr);
+        serial_write_string(" len=0x"); serial_printf("%x", length);
+        serial_write_string(" prot=0x"); serial_printf("%x", prot);
+        serial_write_string(" flags=0x"); serial_printf("%x", flags);
+        serial_write_string("\n");
+    #endif
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory || length == 0) return -1;
+    //align length up to page size
+    uint32_t len = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    //operate under this process address space
+    vmm_switch_directory(cur->page_directory);
+
+    uint32_t start = 0;
+    if (flags & MAP_FIXED) {
+        //require the specified region to be free
+        start = addr & ~(PAGE_SIZE - 1);
+        if (start < USER_VIRTUAL_START || start + len > USER_VIRTUAL_END) return -1;
+        for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+            if (vmm_get_physical_addr(start + off) != 0) return -1;
+        }
+    } else {
+        uint32_t hint = addr ? (addr & ~(PAGE_SIZE - 1)) : 0;
+        start = mmap_find_free_region(cur->page_directory, len, hint);
+        if (!start) return -1;
+    }
+
+    uint32_t page_flags = PAGE_PRESENT | PAGE_USER | ((prot & PROT_WRITE) ? PAGE_WRITABLE : 0);
+    //map and zero each page
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        uint32_t phys = pmm_alloc_page();
+        if (!phys) {
+            //rollback
+            for (uint32_t roff = 0; roff < off; roff += PAGE_SIZE) {
+                if (vmm_get_physical_addr(start + roff)) vmm_unmap_page(start + roff);
+            }
+            return -1;
+        }
+        if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, page_flags) != 0) {
+            //free this phys and rollback
+            //no mapping was installed for this page just free phys
+            pmm_free_page(phys);
+            for (uint32_t roff = 0; roff < off; roff += PAGE_SIZE) {
+                if (vmm_get_physical_addr(start + roff)) vmm_unmap_page(start + roff);
+            }
+            return -1;
+        }
+        //zero page via dedicated temp map slot
+        uint32_t saved_entry = 0;
+        void* tmp = vmm_map_temp_page(phys, &saved_entry);
+        if (tmp) {
+            memset(tmp, 0, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_entry);
+        }
+    }
+    #if LOG_SYSCALL
+        serial_write_string("[MMAP] ok start=0x"); serial_printf("%x", (uint32_t)start);
+        serial_write_string(" len=0x"); serial_printf("%x", len);
+        serial_write_string("\n");
+    #endif
+    //return start address
+    return (int32_t)start;
+}
+
+int32_t sys_munmap(uint32_t addr, uint32_t length) {
+    #if LOG_SYSCALL
+        serial_write_string("[MUNMAP] addr=0x"); serial_printf("%x", addr);
+        serial_write_string(" len=0x"); serial_printf("%x", length);
+        serial_write_string("\n");
+    #endif
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory || length == 0) return -1;
+    uint32_t start = addr & ~(PAGE_SIZE - 1);
+    uint32_t len = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (start < USER_VIRTUAL_START || start + len > USER_VIRTUAL_END) return -1;
+    vmm_switch_directory(cur->page_directory);
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        if (vmm_get_physical_addr(start + off)) {
+            vmm_unmap_page(start + off);
+        }
+    }
+    return 0;
+}
+
+int32_t sys_time(void) {
+    ensure_time_base();
+    uint64_t ticks = timer_get_ticks() - g_boot_ticks;
+    uint32_t hz = (g_hz_cached ? g_hz_cached : timer_get_frequency());
+    uint64_t q = 0;
+    if (hz) q = udivmod_u64_u32(ticks, hz, NULL);
+    uint64_t secs = g_boot_epoch + q;
+    return (int32_t)secs;
+}
+
+int32_t sys_clock_gettime(uint32_t clock_id, void* ts_out) {
+    if (!ts_out) return -1;
+    ensure_time_base();
+    uint64_t ticks = timer_get_ticks() - g_boot_ticks;
+    uint32_t hz = (g_hz_cached ? g_hz_cached : timer_get_frequency());
+    uint64_t sec = 0, nsec = 0;
+    if (hz == 0) hz = 100; //fallback
+    uint32_t rem32 = 0;
+    sec = udivmod_u64_u32(ticks, hz, &rem32);
+    nsec = udivmod_u64_u32((uint64_t)rem32 * 1000000000u, hz, NULL);
+    if (clock_id == 0) { //CLOCK_REALTIME
+        sec += g_boot_epoch;
+    } else {
+        //CLOCK_MONOTONIC or others treated as monotonic
+    }
+    timespec32_t* ts = (timespec32_t*)ts_out;
+    ts->tv_sec = (uint32_t)sec;
+    ts->tv_nsec = (uint32_t)nsec;
+    return 0;
+}
+
+int32_t sys_gettimeofday(void* tv_out, void* tz_ignored) {
+    (void)tz_ignored;
+    if (!tv_out) return -1;
+    ensure_time_base();
+    uint64_t ticks = timer_get_ticks() - g_boot_ticks;
+    uint32_t hz = (g_hz_cached ? g_hz_cached : timer_get_frequency());
+    if (hz == 0) hz = 100;
+    uint32_t rem32 = 0;
+    uint64_t q = udivmod_u64_u32(ticks, hz, &rem32);
+    uint64_t sec = g_boot_epoch + q;
+    uint64_t usec = udivmod_u64_u32((uint64_t)rem32 * 1000000u, hz, NULL);
+    timeval32_t* tv = (timeval32_t*)tv_out;
+    tv->tv_sec = (uint32_t)sec;
+    tv->tv_usec = (uint32_t)usec;
+    return 0;
+}
+
+int32_t sys_nanosleep(const void* req_ts, void* rem_ts) {
+    (void)rem_ts; //not supporting remainder yet
+    if (!req_ts) return -1;
+    const timespec32_t* ts = (const timespec32_t*)req_ts;
+    uint64_t nsec = (uint64_t)ts->tv_sec * 1000000000ull + (uint64_t)ts->tv_nsec;
+    if (ts->tv_nsec >= 1000000000ull) return -1;
+    uint32_t hz = timer_get_frequency();
+    if (hz == 0) hz = 100;
+    uint32_t ns_rem = 0;
+    uint64_t whole = udivmod_u64_u32(nsec, 1000000000u, &ns_rem);
+    uint64_t ticks = whole * hz;
+    ticks += udivmod_u64_u32((uint64_t)ns_rem * hz, 1000000000u, NULL);
+    if (ticks == 0 && nsec > 0) ticks = 1;
+    if (ticks > 0xFFFFFFFFu) ticks = 0xFFFFFFFFu;
+    process_sleep((uint32_t)ticks);
+    return 0;
+}
+
+static int read_user_u32(page_directory_t dir, uint32_t va, uint32_t* out) {
+    if (!va || !out) return -1;
+    page_directory_t saved = vmm_get_kernel_directory();
+    vmm_switch_directory(dir);
+    uint32_t phys = vmm_get_physical_addr(va & ~0xFFFu) & ~0xFFFu;
+    uint32_t off = va & 0xFFFu;
+    vmm_switch_directory(saved);
+    if (!phys) return -1;
+    uint32_t saved_entry = 0;
+    void* tmp = vmm_map_temp_page(phys, &saved_entry);
+    if (!tmp) return -1;
+    *out = *(uint32_t*)((uint8_t*)tmp + off);
+    vmm_unmap_temp_page(saved_entry);
+    return 0;
+}
+
+int32_t sys_dl_get_init(uint32_t index) {
+    process_t* cur = process_get_current();
+    if (!cur) return 0;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (ctx->count <= 0) return 0;
+
+    //enumerate in load order: init_array entries, then init function
+    for (int i = 0; i < ctx->count; i++) {
+        dynobj_t* o = &ctx->objs[i];
+        if (!o->ready) continue;
+        if (o->init_array && o->init_arraysz) {
+            uint32_t entries = o->init_arraysz / 4u;
+            if (index < entries) {
+                uint32_t fn = 0;
+                if (read_user_u32(ctx->dir, o->init_array + index * 4u, &fn) == 0) return (int32_t)fn;
+                return 0;
+            } else {
+                index -= entries;
+            }
+        }
+        if (o->init_addr) {
+            if (index == 0) return (int32_t)o->init_addr;
+            index--;
+        }
+    }
+    return 0;
+}
+
+int32_t sys_dl_get_fini(uint32_t index) {
+    process_t* cur = process_get_current();
+    if (!cur) return 0;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (ctx->count <= 0) return 0;
+
+    //enumerate in reverse order: fini_addr first, then fini_array in reverse
+    for (int i = ctx->count - 1; i >= 0; i--) {
+        dynobj_t* o = &ctx->objs[i];
+        if (!o->ready) continue;
+        if (o->fini_addr) {
+            if (index == 0) return (int32_t)o->fini_addr;
+            index--;
+        }
+        if (o->fini_array && o->fini_arraysz) {
+            uint32_t entries = o->fini_arraysz / 4u;
+            if (index < entries) {
+                uint32_t rev_idx = entries - 1u - index;
+                uint32_t fn = 0;
+                if (read_user_u32(ctx->dir, o->fini_array + rev_idx * 4u, &fn) == 0) return (int32_t)fn;
+                return 0;
+            } else {
+                index -= entries;
+            }
+        }
+    }
+    return 0;
+}
+
+static int build_candidate(char* out, uint32_t outsz, const char* dir, const char* name) {
+    if (!out || !dir || !name) return -1;
+    size_t dl = strlen(dir); if (dl >= outsz) dl = outsz - 1;
+    memcpy(out, dir, dl);
+    size_t pos = dl;
+    if (pos == 0 || out[pos - 1] != '/') {
+        if (pos + 1 < outsz) out[pos++] = '/';
+    }
+    size_t nl = strlen(name);
+    if (pos + nl >= outsz) nl = outsz - pos - 1;
+    memcpy(out + pos, name, nl);
+    out[pos + nl] = '\0';
+    return 0;
+}
+
+int32_t sys_dlopen(const char* path, uint32_t flags) {
+    (void)flags;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (!ctx->dir) {
+        dynlink_ctx_init(ctx, cur->page_directory);
+    }
+    //dlopen(NULL, ...) returns a special handle for the main program namespace
+    if (path == NULL) {
+        return -2; //special handle: MAIN
+    }
+    char name[96];
+    if (copy_user_string(path, name, sizeof(name)) != 0) return -1;
+
+    //if it already exists (by SONAME or basename) return existing handle
+    int idx_existing = dynlink_find_loaded(ctx, name);
+    if (idx_existing >= 0) {
+        return idx_existing;
+    }
+
+    // If contains '/', try directly
+    int loaded = 0;
+    dynobj_t* child = NULL;
+    if (strchr(name, '/')) {
+        if (dynlink_load_shared(ctx, name, &child) == 0 && child) loaded = 1;
+    } else {
+        //try LD_LIBRARY_PATH list
+        if (ctx->ld_library_path[0]) {
+            const char* s = ctx->ld_library_path; const char* start = s;
+            char cand[128];
+            while (!loaded) {
+                if (*s == ':' || *s == '\0') {
+                    size_t len = (size_t)(s - start);
+                    if (len > 0 && len < sizeof(cand) - 2) {
+                        char dir[96]; if (len >= sizeof(dir)) len = sizeof(dir) - 1;
+                        memcpy(dir, start, len); dir[len] = '\0';
+                        build_candidate(cand, sizeof(cand), dir, name);
+                        if (dynlink_load_shared(ctx, cand, &child) == 0 && child) { loaded = 1; break; }
+                    }
+                    if (*s == '\0') break;
+                    start = s + 1;
+                }
+                s++;
+            }
+        }
+        //fallback /lib/<name>
+        if (!loaded) {
+            char cand[128];
+            build_candidate(cand, sizeof(cand), "/lib", name);
+            if (dynlink_load_shared(ctx, cand, &child) == 0 && child) loaded = 1;
+        }
+    }
+
+    if (!loaded || !child) return -1;
+    int start_idx = cur->dlctx.count - 1; //'child' is the last loaded object index
+    if (start_idx < 0) start_idx = 0;
+    (void)dynlink_load_needed(ctx, child);
+    //apply relocations only to newly loaded objects (avoid re-relocating existing ones)
+    int apply_start = start_idx; //conservative if load_needed added more they are >= start_idx
+    if (dynlink_apply_relocations_from(ctx, apply_start) != 0) return -1;
+    //handle is index of child
+    int handle = (int)(child - &ctx->objs[0]);
+    return handle;
+}
+
+int32_t sys_dlsym(int32_t handle, const char* name) {
+    process_t* cur = process_get_current();
+    if (!cur) return 0;
+    dynlink_ctx_t* ctx = &cur->dlctx;
+    if (!ctx->dir) return 0;
+    char sym[96];
+    if (copy_user_string(name, sym, sizeof(sym)) != 0) return 0;
+    serial_write_string("[DLSYM] ");
+    serial_write_string(sym);
+    serial_write_string(" handle=");
+    serial_printf("%d", handle);
+    serial_write_string("\n");
+
+    void* va = 0;
+    if (handle >= 0 && handle < ctx->count) {
+        va = dynlink_lookup_symbol_in(ctx, handle, sym);
+    } else if (handle == -2) {
+        //main namespace: search main object only (base==0)
+        int main_idx = 0;
+        for (int i = 0; i < ctx->count; i++) { if (ctx->objs[i].base == 0) { main_idx = i; break; } }
+        va = dynlink_lookup_symbol_in(ctx, main_idx, sym);
+    } else {
+        //global search across all loaded objects
+        va = dynlink_lookup_symbol(ctx, sym);
+    }
+
+    serial_write_string("[DLSYM] result=");
+    serial_printf("%x", (uint32_t)(uintptr_t)va);
+    serial_write_string("\n");
+    return (int32_t)(uint32_t)(uintptr_t)va;
+}
+
+int32_t sys_dlclose(int32_t handle) {
+    (void)handle; //unloading not supported yet
+    return 0;
+}
+
+int32_t sys_link(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -1;
+    char src[VFS_MAX_PATH], dst[VFS_MAX_PATH];
+    if (normalize_user_path(oldpath, src, sizeof(src)) != 0) return -1;
+    if (normalize_user_path(newpath, dst, sizeof(dst)) != 0) return -1;
+    int r = vfs_link(src, dst);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_kill(uint32_t pid, uint32_t sig) {
+    process_t* p = process_get_by_pid(pid);
+    if (!p) return -1;
+    signal_raise(p, (int)sig);
+    process_wake(p);
+    return 0;
+}
+
+int32_t sys_symlink(const char* target, const char* linkpath) {
+    if (!target || !linkpath) return -1;
+    char lp[VFS_MAX_PATH];
+    if (normalize_user_path(linkpath, lp, sizeof(lp)) != 0) return -1;
+    int r = vfs_symlink(target, lp);
+    return (r == 0) ? 0 : -1;
+}
+
+int32_t sys_readlink(const char* path, char* buf, uint32_t bufsiz) {
+    if (!path || !buf || bufsiz == 0) return -1;
+    if (!user_range_ok(buf, bufsiz, 1)) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    return vfs_readlink(ap, buf, bufsiz);
+}
+
+int32_t sys_getuid(void) {
+    process_t* cur = process_get_current();
+    #if LOG_SYSCALL
+    serial_write_string("[SYSCALL] getuid -> ");
+    serial_printf("%d", cur ? (int)cur->uid : -1);
+    serial_write_string("\n");
+    #endif
+    return cur ? (int32_t)cur->uid : -1;
+}
+
+int32_t sys_geteuid(void) {
+    process_t* cur = process_get_current();
+    #if LOG_SYSCALL
+    serial_write_string("[SYSCALL] geteuid -> ");
+    serial_printf("%d", cur ? (int)cur->euid : -1);
+    serial_write_string("\n");
+    #endif
+    return cur ? (int32_t)cur->euid : -1;
+}
+
+int32_t sys_getgid(void) {
+    process_t* cur = process_get_current();
+    return cur ? (int32_t)cur->gid : -1;
+}
+
+int32_t sys_getegid(void) {
+    process_t* cur = process_get_current();
+    return cur ? (int32_t)cur->egid : -1;
+}
+
+int32_t sys_umask(int32_t new_mask) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    int32_t old = (int32_t)cur->umask;
+    if (new_mask >= 0) cur->umask = (uint32_t)(new_mask & 0777);
+    return old;
+}
+
+static uint32_t vfs_type_to_ifmt(uint32_t t)
+{
+    switch (t) {
+        case VFS_FILE_TYPE_DIRECTORY: return S_IFDIR;
+        case VFS_FILE_TYPE_SYMLINK:   return S_IFLNK;
+        case VFS_FILE_TYPE_DEVICE:    return S_IFCHR;
+        case VFS_FILE_TYPE_FILE:
+        default: return S_IFREG;
+    }
+}
+
+static void fill_stat_from_node(vfs_node_t* n, stat32_t* st)
+{
+    st->st_mode = (n->mode & 07777) | vfs_type_to_ifmt(n->type);
+    st->st_uid = n->uid;
+    st->st_gid = n->gid;
+    st->st_size = n->size;
+}
+
+int32_t sys_stat(const char* path, void* stat_out)
+{
+    if (!path || !stat_out) return -1;
+    if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(ap);
+    if (!n) return -1;
+    stat32_t st; fill_stat_from_node(n, &st);
+    memcpy(stat_out, &st, sizeof(st));
+    vfs_close(n);
+    return 0;
+}
+
+int32_t sys_lstat(const char* path, void* stat_out) {
+    if (!path || !stat_out) return -1;
+    if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path_nofollow(ap);
+    if (!n) return -1;
+    stat32_t st; fill_stat_from_node(n, &st);
+    memcpy(stat_out, &st, sizeof(st));
+    vfs_close(n);
+    return 0;
+}
+
+int32_t sys_fstat(int32_t fd, void* stat_out) {
+    if (!stat_out) return -1;
+    if (!user_range_ok(stat_out, sizeof(stat32_t), 1)) return -1;
+    vfs_file_t* f = fd_get(fd);
+    if (!f || !f->node) return -1;
+    stat32_t st; fill_stat_from_node(f->node, &st);
+    memcpy(stat_out, &st, sizeof(st));
+    return 0;
+}
+
+int32_t sys_chmod(const char* path, int32_t mode) {
+    if (!path) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(ap);
+    if (!n) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) { vfs_close(n); return -1; }
+    if (!(cur->euid == 0 || cur->euid == n->uid)) { vfs_close(n); return -1; }
+    n->mode = (uint32_t)mode & 07777;
+    vfs_close(n);
+    //persist via overlay so changes stick across re-resolve
+    vfs_set_metadata_override(ap, 1, (uint32_t)mode & 07777, 0, 0, 0, 0);
+    return 0;
+}
+
+int32_t sys_chown(const char* path, int32_t uid, int32_t gid) {
+    if (!path) return -1;
+    char ap[VFS_MAX_PATH];
+    if (normalize_user_path(path, ap, sizeof(ap)) != 0) return -1;
+    vfs_node_t* n = vfs_resolve_path(ap);
+    if (!n) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) { vfs_close(n); return -1; }
+    if (cur->euid != 0) { vfs_close(n); return -1; }
+    if (uid >= 0) n->uid = (uint32_t)uid;
+    if (gid >= 0) n->gid = (uint32_t)gid;
+    vfs_close(n);
+    vfs_set_metadata_override(ap, 0, 0, uid >= 0, (uint32_t)uid, gid >= 0, (uint32_t)gid);
+    return 0;
+}
+
+int32_t sys_fchmod(int32_t fd, int32_t mode) {
+    vfs_file_t* f = fd_get(fd);
+    if (!f || !f->node) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    if (!(cur->euid == 0 || cur->euid == f->node->uid)) return -1;
+    f->node->mode = (uint32_t)mode & 07777;
+    return 0;
+}
+
+int32_t sys_fchown(int32_t fd, int32_t uid, int32_t gid) {
+    vfs_file_t* f = fd_get(fd);
+    if (!f || !f->node) return -1;
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    if (cur->euid != 0) return -1;
+    if (uid >= 0) f->node->uid = (uint32_t)uid;
+    if (gid >= 0) f->node->gid = (uint32_t)gid;
+    return 0;
+}
+
+int32_t sys_waitpid(int32_t pid, int32_t* status, int32_t options) {
+    process_t* parent = process_get_current();
+    if (!parent) return -1;
+
+    for (;;) {
+        bool have_children = false;
+        bool found_match = false;
+        //scan children for a zombie matching pid (or any if pid == -1)
+        process_t* child = parent->children;
+        #if LOG_PROC
+        serial_write_string("[WAITPID] parent="); serial_printf("%d", (int)parent->pid);
+        serial_write_string(" req="); serial_printf("%d", (int)pid);
+        serial_write_string(" opts="); serial_printf("%d", (int)options);
+        serial_write_string("\n");
+        #endif
+        while (child) {
+            have_children = true;
+            #if LOG_PROC
+            serial_write_string("[WAITPID] scan child="); serial_printf("%d", (int)child->pid);
+            serial_write_string(" state="); serial_printf("%d", (int)child->state);
+            serial_write_string("\n");
+            #endif
+            if (pid == -1 || (int32_t)child->pid == pid) {
+                found_match = true;
+                if (child->state == PROC_ZOMBIE) {
+                    int cpid = (int)child->pid;
+                    int ec = child->exit_code;
+                    if (status) *status = ec; //raw exit code per sys_wait
+                    process_destroy(child);
+                    return cpid;
+                }
+            }
+            child = child->sibling;
+        }
+        //if no children yet or no matching child yet optionally block unless WNOHANG
+        if (!have_children || !found_match) {
+            if (options & 1) { //WNOHANG
+                return 0;
+            }
+            parent->state = PROC_SLEEPING;
+            schedule();
+            continue;
+        }
+        //matching child exists but none zombie block unless WNOHANG
+        if (options & 1) { //WNOHANG
+            return 0;
+        }
+        parent->state = PROC_SLEEPING;
+        schedule();
+    }
+}
+
+//fd-backed mmap (extended)
+static uint32_t mmap_prot_to_flags(uint32_t prot) {
+    uint32_t f = PAGE_PRESENT | PAGE_USER;
+    if (prot & PROT_WRITE) f |= PAGE_WRITABLE;
+    return f;
+}
+
+static int32_t sys_mmap_ex(void* uargs_ptr) {
+    if (!uargs_ptr) return -1;
+    mmap_ex_args_t a = {0};
+    if (!user_range_ok(uargs_ptr, sizeof(mmap_ex_args_t), 0)) return -1;
+    if (copy_from_user(&a, uargs_ptr, sizeof(a)) != 0) return -1;
+    if (a.length == 0) return -1;
+
+    process_t* cur = process_get_current();
+    if (!cur || !cur->page_directory) return -1;
+
+    uint32_t len = (a.length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint32_t flags = a.flags;
+    uint32_t prot = a.prot;
+
+    //choose address
+    uint32_t start = 0;
+    if ((flags & MAP_FIXED) && a.addr) {
+        start = a.addr;
+    } else {
+        start = mmap_find_free_region(cur->page_directory, len, 0);
+        if (!start) return -1;
+    }
+
+    if (a.fd < 0) {
+        //anonymous mapping: allocate pages
+        uint32_t allocated = 0;
+        uint32_t phys_list_count = len / PAGE_SIZE;
+        uint32_t* phys_list = (phys_list_count > 0) ? (uint32_t*)kmalloc(sizeof(uint32_t) * phys_list_count) : NULL;
+        if (phys_list_count > 0 && !phys_list) return -1;
+
+        for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+            uint32_t phys = pmm_alloc_page();
+            if (!phys) {
+                if (phys_list) {
+                    for (uint32_t i = 0; i < allocated; i++) {
+                        uint32_t va = start + i * PAGE_SIZE;
+                        vmm_unmap_page_in_directory(cur->page_directory, va);
+                        pmm_free_page(phys_list[i]);
+                    }
+                    kfree(phys_list);
+                }
+                return -1;
+            }
+            if (phys_list) phys_list[allocated] = phys;
+            if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) {
+                pmm_free_page(phys);
+                if (phys_list) {
+                    for (uint32_t i = 0; i < allocated; i++) {
+                        uint32_t va = start + i * PAGE_SIZE;
+                        vmm_unmap_page_in_directory(cur->page_directory, va);
+                        pmm_free_page(phys_list[i]);
+                    }
+                    kfree(phys_list);
+                }
+                return -1;
+            }
+            uint32_t saved_entry = 0;
+            void* tmp = vmm_map_temp_page(phys, &saved_entry);
+            if (!tmp) {
+                vmm_unmap_page_in_directory(cur->page_directory, start + off);
+                pmm_free_page(phys);
+                if (phys_list) {
+                    for (uint32_t i = 0; i < allocated; i++) {
+                        uint32_t va = start + i * PAGE_SIZE;
+                        vmm_unmap_page_in_directory(cur->page_directory, va);
+                        pmm_free_page(phys_list[i]);
+                    }
+                    kfree(phys_list);
+                }
+                return -1;
+            }
+            memset(tmp, 0, PAGE_SIZE);
+            vmm_unmap_temp_page(saved_entry);
+            allocated++;
+        }
+        if (phys_list) kfree(phys_list);
+        return (int32_t)start;
+    }
+
+    //fd-backed mapping
+    vfs_file_t* file = fd_get(a.fd);
+    if (!file || !file->node) return -1;
+
+    //device special case map /dev/fb0 into user address space with no copy
+    if (file->node->type == VFS_FILE_TYPE_DEVICE && strcmp(file->node->name, "fb0") == 0) {
+        uint8_t* fbv = 0;
+        uint32_t w=0,h=0,bpp=0,pitch=0;
+        if (fb_get_info(&fbv, &w, &h, &bpp, &pitch) != 0 || !fbv) return -1;
+        uint32_t fb_size = pitch * h;
+        uint32_t off = a.offset;
+        if (off >= fb_size) return -1;
+        uint32_t map_len = (len > (fb_size - off)) ? (fb_size - off) : len;
+        //map page-by-page from kernel fb virtual to user range
+        for (uint32_t o = 0; o < map_len; o += PAGE_SIZE) {
+            uint32_t kva = (uint32_t)fbv + off + o;
+            uint32_t phys = vmm_get_physical_addr(kva);
+            if (!phys) return -1;
+            if (vmm_map_page_in_directory(cur->page_directory, start + o, phys, mmap_prot_to_flags(prot)) != 0) return -1;
+        }
+        return (int32_t)start;
+    }
+
+    //regular file: allocate pages and read file bytes into mapping
+    uint32_t pages = len / PAGE_SIZE;
+    uint32_t* phys_pages = (pages > 0) ? (uint32_t*)kmalloc(sizeof(uint32_t) * pages) : NULL;
+    if (pages > 0 && !phys_pages) return -1;
+
+    for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
+        uint32_t phys = pmm_alloc_page();
+        if (!phys) {
+            if (phys_pages) {
+                for (uint32_t i = 0; i < off / PAGE_SIZE; i++) {
+                    uint32_t va = start + i * PAGE_SIZE;
+                    vmm_unmap_page_in_directory(cur->page_directory, va);
+                    pmm_free_page(phys_pages[i]);
+                }
+                kfree(phys_pages);
+            }
+            return -1;
+        }
+        if (phys_pages) phys_pages[off / PAGE_SIZE] = phys;
+        if (vmm_map_page_in_directory(cur->page_directory, start + off, phys, mmap_prot_to_flags(prot)) != 0) {
+            pmm_free_page(phys);
+            if (phys_pages) {
+                for (uint32_t i = 0; i < off / PAGE_SIZE; i++) {
+                    uint32_t va = start + i * PAGE_SIZE;
+                    vmm_unmap_page_in_directory(cur->page_directory, va);
+                    pmm_free_page(phys_pages[i]);
+                }
+                kfree(phys_pages);
+            }
+            return -1;
+        }
+        uint32_t saved_entry = 0;
+        void* tmp = vmm_map_temp_page(phys, &saved_entry);
+        if (!tmp) {
+            vmm_unmap_page_in_directory(cur->page_directory, start + off);
+            pmm_free_page(phys);
+            if (phys_pages) {
+                for (uint32_t i = 0; i < off / PAGE_SIZE; i++) {
+                    uint32_t va = start + i * PAGE_SIZE;
+                    vmm_unmap_page_in_directory(cur->page_directory, va);
+                    pmm_free_page(phys_pages[i]);
+                }
+                kfree(phys_pages);
+            }
+            return -1;
+        }
+        memset(tmp, 0, PAGE_SIZE);
+        vmm_unmap_temp_page(saved_entry);
+    }
+    //read file content into user mapping in chunks
+    const uint32_t CHUNK = 4096;
+    uint32_t copied = 0;
+    while (copied < len) {
+        char kbuf[CHUNK];
+        int r = vfs_read(file->node, a.offset + copied, CHUNK, kbuf);
+        if (r <= 0) break;
+        if (copy_to_user((void*)(start + copied), kbuf, (size_t)r) != 0) {
+            break;
+        }
+        copied += (uint32_t)r;
+    }
+    return (int32_t)start;
+}
+
+int32_t sys_rename(const char* oldpath, const char* newpath) {
+    if (!oldpath || !newpath) return -1;
+
+    char old_abs[VFS_MAX_PATH];
+    char new_abs[VFS_MAX_PATH];
+    if (normalize_user_path(oldpath, old_abs, sizeof(old_abs)) != 0) return -1;
+    if (normalize_user_path(newpath, new_abs, sizeof(new_abs)) != 0) return -1;
+
+    //read old file, create new file, write data, delete old
+    //this is not atomic but works for basic rename functionality
+    vfs_node_t* old_node = vfs_open(old_abs, VFS_FLAG_READ);
+    if (!old_node) return -1;
+
+    //allocate buffer for file content
+    uint32_t size = old_node->size;
+    char* buffer = (char*)kmalloc(size + 1);
+    if (!buffer) {
+        vfs_close(old_node);
+        return -1;
+    }
+
+    //read old file content
+    int r = vfs_read(old_node, 0, size, buffer);
+    vfs_close(old_node);
+    if (r < 0 || (uint32_t)r != size) {
+        kfree(buffer);
+        return -1;
+    }
+
+    //create new file and write content
+    if (vfs_create(new_abs, VFS_FLAG_WRITE) != 0) {
+        kfree(buffer);
+        return -1;
+    }
+
+    vfs_node_t* new_node = vfs_open(new_abs, VFS_FLAG_WRITE);
+    if (!new_node) {
+        kfree(buffer);
+        return -1;
+    }
+
+    int w = vfs_write(new_node, 0, size, buffer);
+    vfs_close(new_node);
+    kfree(buffer);
+
+    if (w < 0 || (uint32_t)w != size) {
+        vfs_unlink(new_abs); //cleanup
+        return -1;
+    }
+
+    //delete old file
+    if (vfs_unlink(old_abs) != 0) {
+        //old file deletion failed but new file exists - partial success
+        return -1;
+    }
+
+    return 0;
+}
+
+int32_t sys_dup(int32_t fd) {
+    return fd_dup(fd);
+}
+
+int32_t sys_dup2(int32_t oldfd, int32_t newfd) {
+    return fd_dup2(oldfd, newfd);
+}
+
+int32_t sys_pipe(int32_t* pipefd) {
+    if (!pipefd) return -1;
+    if (!user_range_ok(pipefd, sizeof(int32_t) * 2, 1)) return -1;
+
+    int32_t kpipefd[2];
+    int r = fd_pipe(kpipefd);
+    if (r != 0) return r;
+
+    if (copy_to_user(pipefd, kpipefd, sizeof(int32_t) * 2) != 0) {
+        //failed to copy to user close the pipes
+        fd_close(kpipefd[0]);
+        fd_close(kpipefd[1]);
+        return -1;
+    }
+
+    return 0;
+}
+
+int32_t sys_setuid(int32_t uid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //only root can change UID arbitrarily
+    if (cur->euid == 0) {
+        cur->uid = (uint32_t)uid;
+        cur->euid = (uint32_t)uid;
+        return 0;
+    }
+    
+    //non-root can only set to real or effective UID
+    if ((uint32_t)uid == cur->uid || (uint32_t)uid == cur->euid) {
+        cur->euid = (uint32_t)uid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_setgid(int32_t gid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //only root can change GID arbitrarily
+    if (cur->euid == 0) {
+        cur->gid = (uint32_t)gid;
+        cur->egid = (uint32_t)gid;
+        return 0;
+    }
+    
+    //non-root can only set to real or effective GID
+    if ((uint32_t)gid == cur->gid || (uint32_t)gid == cur->egid) {
+        cur->egid = (uint32_t)gid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_seteuid(int32_t euid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //root or current euid can change
+    if (cur->euid == 0 || (uint32_t)euid == cur->uid || (uint32_t)euid == cur->euid) {
+        cur->euid = (uint32_t)euid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_setegid(int32_t egid) {
+    process_t* cur = process_get_current();
+    if (!cur) return -1;
+    
+    //root or current egid can change
+    if (cur->euid == 0 || (uint32_t)egid == cur->gid || (uint32_t)egid == cur->egid) {
+        cur->egid = (uint32_t)egid;
+        return 0;
+    }
+    
+    return -1; //EPERM
+}
+
+int32_t sys_lseek(int32_t fd, int32_t offset, int32_t whence) {
+    vfs_file_t* file = fd_get(fd);
+    if (!file) return -1; //EBADF
+    
+    int32_t new_offset;
+    
+    switch (whence) {
+        case 0: //SEEK_SET
+            new_offset = offset;
+            break;
+        case 1: //SEEK_CUR
+            new_offset = (int32_t)file->offset + offset;
+            break;
+        case 2: { //SEEK_END
+            if (!file->node) return -1;
+            int size = vfs_get_size(file->node);
+            if (size < 0) return -1;
+            new_offset = size + offset;
+            break;
+        }
+        default:
+            return -1; //EINVAL
+    }
+    
+    //don't allow negative offsets
+    if (new_offset < 0) return -1; //EINVAL
+    
+    file->offset = (uint32_t)new_offset;
+    return new_offset;
+}
+
+int32_t sys_fcntl(int32_t fd, int32_t cmd, int32_t arg) {
+    vfs_file_t* file = fd_get(fd);
+    if (!file) return -EBADF;
+    
+    //check if this is a socket - get socket structure from VFS node
+    if (file->node && file->node->type == VFS_FILE_TYPE_DEVICE) {
+        //this might be a socket - try to get socket from private_data
+        
+        //forward declare socket_t to avoid circular include
+        typedef struct socket socket_t;
+        socket_t* sock = (socket_t*)file->node->private_data;
+        
+        if (sock) {
+            switch (cmd) {
+                case F_GETFL:
+                    //get file status flags
+                    //for sockets we store flags in the socket structure
+                    //access the flags field (it's at offset after valid/domain/type/protocol/state)
+                    //return the flags
+                    return *((int*)((char*)sock + 20));  //flags field offset
+                    
+                case F_SETFL:
+                    //set file status flags
+                    //only O_NONBLOCK and O_APPEND can be set via F_SETFL
+                    *((int*)((char*)sock + 20)) = arg;
+                    return 0;
+                    
+                default:
+                    return -EINVAL;
+            }
+        }
+    }
+    
+    //for regular files store flags in vfs_file_t
+    switch (cmd) {
+        case F_GETFL:
+            //return the file flags
+            return file->flags;
+            
+        case F_SETFL:
+            //only certain flags can be changed
+            file->flags = (file->flags & ~O_NONBLOCK) | (arg & O_NONBLOCK);
+            return 0;
+            
+        default:
+            return -EINVAL;
+    }
+}
+
+int32_t sys_select(int32_t nfds, void* readfds_ptr, void* writefds_ptr, void* exceptfds_ptr, void* timeout_ptr) {
+    //validate parameters
+    if (nfds < 0 || nfds > 1024) return -EINVAL;
+    
+    //validate and copy fd_sets from user space
+    //fd_set is 1024 bits = 128 bytes
+    //use heap allocation to avoid stack overflow
+    #define FD_SET_SIZE 128
+    uint8_t* readfds = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* writefds = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* exceptfds = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* result_read = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* result_write = (uint8_t*)kmalloc(FD_SET_SIZE);
+    uint8_t* result_except = (uint8_t*)kmalloc(FD_SET_SIZE);
+    
+    if (!readfds || !writefds || !exceptfds || !result_read || !result_write || !result_except) {
+        if (readfds) kfree(readfds);
+        if (writefds) kfree(writefds);
+        if (exceptfds) kfree(exceptfds);
+        if (result_read) kfree(result_read);
+        if (result_write) kfree(result_write);
+        if (result_except) kfree(result_except);
+        return -ENOMEM;
+    }
+    
+    memset(result_read, 0, FD_SET_SIZE);
+    memset(result_write, 0, FD_SET_SIZE);
+    memset(result_except, 0, FD_SET_SIZE);
+    
+    int has_readfds = 0, has_writefds = 0, has_exceptfds = 0;
+    
+    if (readfds_ptr) {
+        if (!user_range_ok(readfds_ptr, FD_SET_SIZE, 0)) return -EFAULT;
+        if (copy_from_user(readfds, readfds_ptr, FD_SET_SIZE) != 0) return -EFAULT;
+        has_readfds = 1;
+    } else {
+        memset(readfds, 0, FD_SET_SIZE);
+    }
+    
+    if (writefds_ptr) {
+        if (!user_range_ok(writefds_ptr, FD_SET_SIZE, 0)) return -EFAULT;
+        if (copy_from_user(writefds, writefds_ptr, FD_SET_SIZE) != 0) return -EFAULT;
+        has_writefds = 1;
+    } else {
+        memset(writefds, 0, FD_SET_SIZE);
+    }
+    
+    if (exceptfds_ptr) {
+        if (!user_range_ok(exceptfds_ptr, FD_SET_SIZE, 0)) return -EFAULT;
+        if (copy_from_user(exceptfds, exceptfds_ptr, FD_SET_SIZE) != 0) return -EFAULT;
+        has_exceptfds = 1;
+    } else {
+        memset(exceptfds, 0, FD_SET_SIZE);
+    }
+    
+    //parse timeout
+    uint32_t timeout_ms = 0;
+    int has_timeout = 0;
+    if (timeout_ptr) {
+        if (!user_range_ok(timeout_ptr, 8, 0)) return -EFAULT;
+        int32_t tv_sec, tv_usec;
+        if (copy_from_user(&tv_sec, timeout_ptr, 4) != 0) return -EFAULT;
+        if (copy_from_user(&tv_usec, (char*)timeout_ptr + 4, 4) != 0) return -EFAULT;
+        if (tv_sec < 0 || tv_usec < 0) return -EINVAL;
+        timeout_ms = (uint32_t)tv_sec * 1000 + (uint32_t)tv_usec / 1000;
+        has_timeout = 1;
+    }
+    
+    #define FD_IS_SET(fd, set) ((set[(fd) / 8] & (1 << ((fd) % 8))) != 0)
+    #define FD_DO_SET(fd, set) (set[(fd) / 8] |= (1 << ((fd) % 8)))
+    uint32_t start_ticks = timer_get_ticks();
+    uint32_t timeout_ticks = has_timeout ? (timeout_ms * 100 / 1000) : 0; //100 Hz timer
+    
+    while (1) {
+        int ready_count = 0;
+        
+        //check each fd
+        for (int fd = 0; fd < nfds; fd++) {
+            int fd_ready = 0;
+            
+            //check readability
+            if (has_readfds && FD_IS_SET(fd, readfds)) {
+                //check if fd is readable
+                vfs_file_t* file = fd_get(fd);
+                if (!file) {
+                    return -EBADF; //bad file descriptor
+                }
+                
+                int readable = 0;
+                if (file->node && fd_pipe_is_node(file->node)) {
+                    readable = fd_pipe_can_read(file->node);
+                } else if (file->node && file->node->ops && file->node->ops->poll_can_read) {
+                    readable = file->node->ops->poll_can_read(file->node);
+                } else if (file->node && file->node->type == VFS_FILE_TYPE_FILE) {
+                    //for regular files readable if offset < size
+                    int size = vfs_get_size(file->node);
+                    if (size < 0 || (uint32_t)size > file->offset) readable = 1;
+                } else if (file->node && file->node->type == VFS_FILE_TYPE_DEVICE) {
+                    //devices assume readable driver can still return 0
+                    readable = 1;
+                }
+                
+                if (readable) {
+                    FD_DO_SET(fd, result_read);
+                    fd_ready = 1;
+                }
+            }
+            
+            //check writability
+            if (has_writefds && FD_IS_SET(fd, writefds)) {
+                //check if fd is writable
+                vfs_file_t* file = fd_get(fd);
+                if (!file) {
+                    return -EBADF;
+                }
+                
+                int writable = 1;
+                if (file->node && fd_pipe_is_node(file->node)) {
+                    writable = fd_pipe_can_write(file->node);
+                } else if (file->node && file->node->ops && file->node->ops->poll_can_write) {
+                    writable = file->node->ops->poll_can_write(file->node);
+                }
+                if (writable) {
+                    FD_DO_SET(fd, result_write);
+                    fd_ready = 1;
+                }
+            }
+            
+            
+            if (fd_ready) ready_count++;
+        }
+        
+        //if any fds are ready return
+        if (ready_count > 0) {
+            //copy results back to user space
+            int ret = ready_count;
+            if (has_readfds && copy_to_user(readfds_ptr, result_read, FD_SET_SIZE) != 0) ret = -EFAULT;
+            if (ret > 0 && has_writefds && copy_to_user(writefds_ptr, result_write, FD_SET_SIZE) != 0) ret = -EFAULT;
+            if (ret > 0 && has_exceptfds && copy_to_user(exceptfds_ptr, result_except, FD_SET_SIZE) != 0) ret = -EFAULT;
+            
+            //cleanup
+            kfree(readfds);
+            kfree(writefds);
+            kfree(exceptfds);
+            kfree(result_read);
+            kfree(result_write);
+            kfree(result_except);
+            
+            return ret;
+        }
+        
+        //check timeout
+        if (has_timeout) {
+            uint32_t elapsed = timer_get_ticks() - start_ticks;
+            if (elapsed >= timeout_ticks) {
+                //timeout clear all fd_sets and return 0
+                memset(result_read, 0, FD_SET_SIZE);
+                memset(result_write, 0, FD_SET_SIZE);
+                memset(result_except, 0, FD_SET_SIZE);
+                if (has_readfds) copy_to_user(readfds_ptr, result_read, FD_SET_SIZE);
+                if (has_writefds) copy_to_user(writefds_ptr, result_write, FD_SET_SIZE);
+                if (has_exceptfds) copy_to_user(exceptfds_ptr, result_except, FD_SET_SIZE);
+                
+                //cleanup
+                kfree(readfds);
+                kfree(writefds);
+                kfree(exceptfds);
+                kfree(result_read);
+                kfree(result_write);
+                kfree(result_except);
+                
+                return 0;
+            }
+        }
+        
+        //yield CPU and check for signals
+        signal_check_current();
+        extern void schedule(void);
+        schedule();
+    }
+    
+    //should never reach here
+    kfree(readfds);
+    kfree(writefds);
+    kfree(exceptfds);
+    kfree(result_read);
+    kfree(result_write);
+    kfree(result_except);
+    return 0;
+}

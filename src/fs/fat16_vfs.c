@@ -4,8 +4,14 @@
 #include "../mm/heap.h"
 #include "vfs.h"
 #include "fs.h"
+#include "../debug.h"
 #include <stdbool.h>
 #include <string.h>
+
+//FAT16 constants used by directory traversal
+#ifndef FAT16_END_OF_CHAIN
+#define FAT16_END_OF_CHAIN 0xFFF8
+#endif
 
 //FAT16 VFS operations
 static int fat16_vfs_open(vfs_node_t* node, uint32_t flags);
@@ -42,26 +48,140 @@ vfs_operations_t fat16_vfs_ops = {
 //FAT16 file private data
 typedef struct {
     fat16_file_t file;
+    uint16_t dir_first_cluster; //0 for root captured at open time for persistence
     int is_open;
 } fat16_file_private_t;
 
 //FAT16 directory private data
+//NOTE: the magic number is used to distinguish between filesystem_t* and fat16_dir_private_t*
+//in mount->root->private_data since VFS mounting initially stores filesystem_t* there
+//but after the first open() call it gets replaced with fat16_dir_private_t*
 typedef struct {
-    uint32_t magic;             //magic number to identify this struct
+    uint32_t magic;             //magic number to identify this struct (FAT16_DIR_PRIVATE_MAGIC)
     fat16_fs_t* fs;
+    uint16_t first_cluster;     //0 for root directory otherwise cluster of directory
     uint32_t current_sector;
     uint32_t sector_offset;
     uint32_t entries_per_sector;
-    uint32_t root_dir_sectors;
+    uint32_t root_dir_sectors;  //only valid for root
+    uint32_t sectors_per_cluster;
     uint32_t current_index; //keep track of current position for readdir
 } fat16_dir_private_t;
+
+static int fat16v_is_root_dir(fat16_dir_private_t* d){ return d->first_cluster == 0; }
+
+//build display name from a dir entry (8.3 to canonical string)
+static void fat16v_entry_make_name(const fat16_dir_entry_t* entry, char* name_out, size_t outsz) {
+    char name[9];
+    memcpy(name, entry->filename, 8);
+    name[8] = '\0';
+    //trim spaces
+    for (int j = 7; j >= 0; j--) {
+        if (name[j] == ' ') name[j] = '\0';
+        else break;
+    }
+    strncpy(name_out, name, outsz-1);
+    name_out[outsz-1] = '\0';
+    if (entry->extension[0] != ' ') {
+        size_t len = strlen(name_out);
+        if (len + 1 < outsz) { name_out[len++] = '.'; name_out[len] = '\0'; }
+        for (int j = 0; j < 3 && entry->extension[j] != ' '; j++) {
+            size_t l2 = strlen(name_out);
+            if (l2 + 1 < outsz) { name_out[l2] = entry->extension[j]; name_out[l2+1] = '\0'; }
+        }
+    }
+}
+
+//iterate entries in a directory and return the logical-th entry
+static int fat16v_dir_get_entry(fat16_dir_private_t* dir, uint32_t logical_index, fat16_dir_entry_t* out_entry) {
+    if (!dir || !out_entry) return -1;
+    uint32_t per_sec = dir->entries_per_sector;
+    uint8_t buffer[512];
+
+    if (fat16v_is_root_dir(dir)) {
+        uint32_t physical_index = 0;
+        uint32_t current_sector = 0xFFFFFFFF;
+        while (physical_index < (dir->root_dir_sectors * per_sec)) {
+            uint32_t sector_index = physical_index / per_sec;
+            uint32_t entry_index_in_sector = physical_index % per_sec;
+            if (sector_index >= dir->root_dir_sectors) return -1;
+            if (sector_index != current_sector) {
+                uint32_t offset = (dir->fs->root_dir_start + sector_index) * 512;
+                if (device_read(dir->fs->device, offset, buffer, 512) != 512) return -1;
+                current_sector = sector_index;
+            }
+            fat16_dir_entry_t* entry = &((fat16_dir_entry_t*)buffer)[entry_index_in_sector];
+            if (entry->filename[0] == 0x00) return -1; //end
+            physical_index++;
+            if (entry->filename[0] == 0xE5 || (entry->attributes & FAT16_ATTR_VOLUME_ID)) continue;
+            if (logical_index == 0) { memcpy(out_entry, entry, sizeof(*out_entry)); return 0; }
+            logical_index--;
+        }
+        return -1;
+    } else {
+        //iterate cluster chain
+        uint16_t cluster = dir->first_cluster;
+        uint32_t logical = 0;
+        while (cluster >= 2 && cluster < FAT16_END_OF_CHAIN) {
+            uint32_t base_lba = dir->fs->data_start + (cluster - 2) * dir->sectors_per_cluster;
+            for (uint32_t s = 0; s < dir->sectors_per_cluster; s++) {
+                if (device_read(dir->fs->device, (base_lba + s) * 512, buffer, 512) != 512) return -1;
+                fat16_dir_entry_t* entries = (fat16_dir_entry_t*)buffer;
+                for (uint32_t i = 0; i < per_sec; i++) {
+                    fat16_dir_entry_t* entry = &entries[i];
+                    if (entry->filename[0] == 0x00) return -1; //end marker
+                    if (entry->filename[0] == 0xE5 || (entry->attributes & FAT16_ATTR_VOLUME_ID)) continue;
+                    if (logical == logical_index) { memcpy(out_entry, entry, sizeof(*out_entry)); return 0; }
+                    logical++;
+                }
+            }
+            uint16_t next = fat16_get_next_cluster(dir->fs, cluster);
+            if (next >= FAT16_END_OF_CHAIN) break; else cluster = next;
+        }
+        return -1;
+    }
+}
+
+//find an entry by name in a directory (case-insensitive for FAT semantics)
+static int fat16v_dir_find(fat16_dir_private_t* dir, const char* name, fat16_dir_entry_t* out) {
+    if (!dir || !name || !out) return -1;
+    //build an uppercased copy of the search name
+    char want[13];
+    size_t nlen = strlen(name);
+    if (nlen >= sizeof(want)) nlen = sizeof(want) - 1;
+    for (size_t i = 0; i < nlen; i++) {
+        char c = name[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        want[i] = c;
+    }
+    want[nlen] = '\0';
+
+    uint32_t idx = 0;
+    fat16_dir_entry_t e;
+    while (fat16v_dir_get_entry(dir, idx, &e) == 0) {
+        char ename[13];
+        fat16v_entry_make_name(&e, ename, sizeof(ename));
+        //uppercase ename in place for comparison
+        for (size_t i = 0; ename[i]; i++) {
+            if (ename[i] >= 'a' && ename[i] <= 'z') ename[i] = (char)(ename[i] - 'a' + 'A');
+        }
+        if (strcmp(ename, want) == 0) {
+            memcpy(out, &e, sizeof(e));
+            return 0;
+        }
+        idx++;
+    }
+    return -1;
+}
 
 static int fat16_vfs_open(vfs_node_t* node, uint32_t flags) {
     (void)flags;
 
-    serial_write_string("[FAT16-VFS] Opening node: ");
-    serial_write_string(node->name);
-    serial_write_string("\n");
+    #if LOG_FAT16
+        serial_write_string("[FAT16-VFS] Opening node: ");
+        serial_write_string(node->name);
+        serial_write_string("\n");
+    #endif
 
     if (node->type == VFS_FILE_TYPE_DIRECTORY) {
         if (node->private_data && ((fat16_dir_private_t*)node->private_data)->magic == FAT16_DIR_PRIVATE_MAGIC) {
@@ -96,8 +216,10 @@ static int fat16_vfs_open(vfs_node_t* node, uint32_t flags) {
         memset(dir_data, 0, sizeof(fat16_dir_private_t));
         dir_data->magic = FAT16_DIR_PRIVATE_MAGIC;
         dir_data->fs = fs;
+        dir_data->first_cluster = 0; //root by default when opening arbitrary dir
         dir_data->entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
         dir_data->root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+        dir_data->sectors_per_cluster = fs->boot_sector.sectors_per_cluster;
 
         if (node->private_data && node != node->mount->root) {
             kfree(node->private_data);
@@ -115,27 +237,33 @@ static int fat16_vfs_open(vfs_node_t* node, uint32_t flags) {
             node->private_data = file_data;
         }
 
-        //resolve filesystem pointer from mount root
-        if (!node->mount || !node->mount->root || !node->mount->root->private_data) {
-            return -1;
-        }
-        fat16_fs_t* fs;
-        void* pdata = node->mount->root->private_data;
-        if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
-            fs = ((fat16_dir_private_t*)pdata)->fs;
+        //if already have seeded file metadata we can open without needing the parent
+        if (!file_data->is_open && file_data->file.fs) {
+            file_data->file.is_open = 1;
+            file_data->is_open = 1;
         } else {
-            fs = &((filesystem_t*)pdata)->fs_data.fat16;
-        }
-        if (!fs) {
-            return -1;
-        }
-
-        //open the file now so subsequent operations have a valid handle
-        if (!file_data->is_open) {
-            if (fat16_open_file(fs, &file_data->file, node->name) != 0) {
+            //resolve fs and parent directory from parent->private_data
+            if (!node->parent || !node->parent->private_data) {
                 return -1;
             }
-            file_data->is_open = 1;
+            fat16_dir_private_t* pdir = (fat16_dir_private_t*)node->parent->private_data;
+            if (pdir->magic != FAT16_DIR_PRIVATE_MAGIC) return -1;
+
+            if (!file_data->is_open) {
+                fat16_dir_entry_t ent;
+                if (fat16v_dir_find(pdir, node->name, &ent) != 0) return -1;
+                //must be file
+                if (ent.attributes & FAT16_ATTR_DIRECTORY) return -1;
+                memset(&file_data->file, 0, sizeof(file_data->file));
+                file_data->file.fs = pdir->fs;
+                memcpy(&file_data->file.entry, &ent, sizeof(ent));
+                file_data->file.current_cluster = ent.first_cluster;
+                file_data->file.current_offset = 0;
+                file_data->file.file_size = ent.file_size;
+                file_data->file.is_open = 1; //ensure underlying file marked open
+                file_data->dir_first_cluster = pdir->first_cluster; //remember parent directory cluster
+                file_data->is_open = 1;
+            }
         }
     }
 
@@ -144,9 +272,11 @@ static int fat16_vfs_open(vfs_node_t* node, uint32_t flags) {
 
 //close a FAT16 node
 static int fat16_vfs_close(vfs_node_t* node) {
-    serial_write_string("[FAT16-VFS] Closing node: ");
-    serial_write_string(node->name);
-    serial_write_string("\n");
+    #if LOG_FAT16
+        serial_write_string("[FAT16-VFS] Closing node: ");
+        serial_write_string(node->name);
+        serial_write_string("\n");
+    #endif
 
     if (node == node->mount->root) {
         return 0;
@@ -173,9 +303,11 @@ static int fat16_vfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char
         return -1;
     }
 
-    serial_write_string("[FAT16-VFS] Reading from file: ");
-    serial_write_string(node->name);
-    serial_write_string("\n");
+    #if LOG_FAT16
+        serial_write_string("[FAT16-VFS] Reading from file: ");
+        serial_write_string(node->name);
+        serial_write_string("\n");
+    #endif
 
     //get filesystem from mount
     if (!node->mount || !node->mount->root || !node->mount->root->private_data) {
@@ -184,8 +316,10 @@ static int fat16_vfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char
 
     fat16_fs_t* fs;
     void* pdata = node->mount->root->private_data;
-    //HACK determine the type of the pointer by checking for our dir_data magic numbe
-    //this is needed cuz the VFS design uses one pointer for two types
+    //hack:
+    //determine the type of pointer using magic number pattern
+    //VFS stores filesystem_t* initially but after first open() it's fat16_dir_private_t*
+    //the magic number lets us safely distinguish which type we have
     if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
         fs = ((fat16_dir_private_t*)pdata)->fs;
     } else {
@@ -208,11 +342,16 @@ static int fat16_vfs_read(vfs_node_t* node, uint32_t offset, uint32_t size, char
     }
 
     //open file if not already open
-    if (!file_data->is_open) {
-        if (fat16_open_file(fs, &file_data->file, node->name) != 0) {
-            return -1;
+    if (!file_data->file.is_open) {
+        if (file_data->file.fs) {
+            file_data->file.is_open = 1;
+            file_data->is_open = 1;
+        } else {
+            if (fat16_open_file(fs, &file_data->file, node->name) != 0) {
+                return -1;
+            }
+            file_data->is_open = 1;
         }
-        file_data->is_open = 1;
     }
 
     //set file position
@@ -229,9 +368,11 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
         return -1;
     }
 
-    serial_write_string("[FAT16-VFS] Writing to file: ");
-    serial_write_string(node->name);
-    serial_write_string("\n");
+    #if LOG_FAT16
+        serial_write_string("[FAT16-VFS] Writing to file: ");
+        serial_write_string(node->name);
+        serial_write_string("\n");
+    #endif
 
     //ensure file private data exists
     fat16_file_private_t* file_data = (fat16_file_private_t*)node->private_data;
@@ -246,7 +387,7 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
     }
 
     //lazy open file if needed (mirror read path logic)
-    if (!file_data->is_open) {
+    if (!file_data->file.is_open) {
         if (!node->mount || !node->mount->root || !node->mount->root->private_data) {
             serial_write_string("[FAT16-VFS] No mount root for write open\n");
             return -1;
@@ -269,6 +410,7 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
             serial_write_string("[FAT16-VFS] fat16_open_file failed in write\n");
             return -1;
         }
+        file_data->file.is_open = 1;
         file_data->is_open = 1;
     }
 
@@ -278,11 +420,17 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
     //call the FAT16 write function
     int result = fat16_write_file(&file_data->file, buffer, size);
     if (result > 0) {
+    #if DEBUG_ENABLED
         serial_write_string("[FAT16-VFS] Write operation completed\n");
+    #endif
         //update node size to reflect on VFS layer
         if ((uint32_t)node->size < file_data->file.file_size) {
             node->size = file_data->file.file_size;
         }
+        //persist updated size into directory entry (handles subdirs too)
+        uint16_t dir_first_cluster = file_data->dir_first_cluster; //captured at open
+        //file_data->file.entry.file_size already updated by fat16_write_file
+        (void)fat16_update_dir_entry_in_dir(file_data->file.fs, dir_first_cluster, &file_data->file.entry);
     } else {
         serial_write_string("[FAT16-VFS] Write operation failed\n");
     }
@@ -291,10 +439,13 @@ static int fat16_vfs_write(vfs_node_t* node, uint32_t offset, uint32_t size, con
 
 //create a file in FAT16
 static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags) {
-    serial_write_string("[FAT16-VFS] Create called for: ");
-    serial_write_string(name);
-    serial_write_string("\n");
-    
+    (void)flags;
+    #if LOG_FAT16
+        serial_write_string("[FAT16-VFS] Create called for: ");
+        serial_write_string(name);
+        serial_write_string("\n");
+    #endif
+
     if (!parent || !name) {
         serial_write_string("[FAT16-VFS] Create failed - invalid parameters\n");
         return -1;
@@ -306,7 +457,7 @@ static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags
         serial_write_string("[FAT16-VFS] Create failed - no mount root\n");
         return -1;
     }
-    //always resolve FS from the mount root which may either hold a filesystem_t (before open) 
+    //always resolve FS from the mount root which may either hold a filesystem_t (before open)
     //or a fat16_dir_private_t (after open)   detect via magic
     void* pdata = parent->mount->root->private_data;
     if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
@@ -314,7 +465,7 @@ static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags
     } else {
         fs = &((filesystem_t*)pdata)->fs_data.fat16;
     }
-    
+
     if (!fs) {
         serial_write_string("[FAT16-VFS] Create failed - no filesystem\n");
         return -1;
@@ -329,7 +480,7 @@ static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags
     hex_buf[8] = '\n';
     hex_buf[9] = '\0';
     serial_write_string(hex_buf);
-    
+
     serial_write_string("[FAT16-VFS] Debug - fs->boot_sector.root_entries: ");
     for (int i = 0; i < 8; i++) {
         hex_buf[i] = "0123456789ABCDEF"[((uint32_t)fs->boot_sector.root_entries >> (28 - i*4)) & 0xF];
@@ -337,8 +488,21 @@ static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags
     hex_buf[8] = '\n';
     hex_buf[9] = '\0';
     serial_write_string(hex_buf);
-    
-    int result = fat16_create_file(fs, name);
+
+    //determine parent directory cluster (0 for root)
+    uint16_t dir_first_cluster = 0;
+    if (parent != parent->mount->root) {
+        if (parent->private_data && ((fat16_dir_private_t*)parent->private_data)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+            dir_first_cluster = ((fat16_dir_private_t*)parent->private_data)->first_cluster;
+        }
+    }
+
+    int result = 0;
+    if (dir_first_cluster == 0) {
+        result = fat16_create_file(fs, name);
+    } else {
+        result = fat16_create_file_in_dir(fs, dir_first_cluster, name);
+    }
     if (result == 0) {
         serial_write_string("[FAT16-VFS] Create succeeded\n");
     } else {
@@ -347,27 +511,66 @@ static int fat16_vfs_create(vfs_node_t* parent, const char* name, uint32_t flags
     return result;
 }
 
-//elete a file in FAT16
+//delete a file in FAT16
 static int fat16_vfs_unlink(vfs_node_t* node) {
-    (void)node;
-
-    return -1;
+    if (!node) return -1;
+    if (!node->mount || !node->mount->root || !node->mount->root->private_data) return -1;
+    fat16_fs_t* fs;
+    void* pdata = node->mount->root->private_data;
+    if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+        fs = ((fat16_dir_private_t*)pdata)->fs;
+    } else {
+        fs = &((filesystem_t*)pdata)->fs_data.fat16;
+    }
+    if (!fs) return -1;
+    if (node->type != VFS_FILE_TYPE_FILE) return -1;
+    //determine parent directory cluster (0 for root)
+    uint16_t dir_first_cluster = 0;
+    if (node->parent && node->parent != node->mount->root) {
+        if (node->parent->private_data && ((fat16_dir_private_t*)node->parent->private_data)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+            dir_first_cluster = ((fat16_dir_private_t*)node->parent->private_data)->first_cluster;
+        }
+    }
+    if (dir_first_cluster == 0) return fat16_delete_file_root(fs, node->name);
+    return fat16_delete_file_in_dir(fs, dir_first_cluster, node->name);
 }
 
 //create a directory in FAT16
 static int fat16_vfs_mkdir(vfs_node_t* parent, const char* name, uint32_t flags) {
-    (void)parent;
-    (void)name;
     (void)flags;
-
-    return -1;
+    if (!parent || !name) return -1;
+    if (!parent->mount || !parent->mount->root || !parent->mount->root->private_data) return -1;
+    fat16_fs_t* fs;
+    void* pdata = parent->mount->root->private_data;
+    if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+        fs = ((fat16_dir_private_t*)pdata)->fs;
+    } else {
+        fs = &((filesystem_t*)pdata)->fs_data.fat16;
+    }
+    if (!fs) return -1;
+    uint16_t parent_cluster = 0;
+    if (parent != parent->mount->root) {
+        if (parent->private_data && ((fat16_dir_private_t*)parent->private_data)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+            parent_cluster = ((fat16_dir_private_t*)parent->private_data)->first_cluster;
+        }
+    }
+    return fat16_create_dir_in_dir(fs, parent_cluster, name);
 }
 
 //remove a directory in FAT16
 static int fat16_vfs_rmdir(vfs_node_t* node) {
-    (void)node;
-
-    return -1;
+    if (!node) return -1;
+    if (node->type != VFS_FILE_TYPE_DIRECTORY) return -1;
+    if (!node->mount || !node->mount->root || !node->mount->root->private_data) return -1;
+    fat16_fs_t* fs;
+    void* pdata = node->mount->root->private_data;
+    if (pdata && ((fat16_dir_private_t*)pdata)->magic == FAT16_DIR_PRIVATE_MAGIC) {
+        fs = ((fat16_dir_private_t*)pdata)->fs;
+    } else {
+        fs = &((filesystem_t*)pdata)->fs_data.fat16;
+    }
+    if (!fs) return -1;
+    return fat16_remove_dir_root(fs, node->name);
 }
 
 //read a directory entry in FAT16
@@ -381,220 +584,112 @@ static int fat16_vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out)
     }
 
     fat16_dir_private_t* dir_data = (fat16_dir_private_t*)node->private_data;
-    if (!dir_data) {
-        return -1;
+    if (!dir_data) return -1;
+    fat16_dir_entry_t entry;
+    if (fat16v_dir_get_entry(dir_data, index, &entry) != 0) return -1;
+
+    char name[13];
+    fat16v_entry_make_name(&entry, name, sizeof(name));
+    uint32_t type = (entry.attributes & FAT16_ATTR_DIRECTORY) ? VFS_FILE_TYPE_DIRECTORY : VFS_FILE_TYPE_FILE;
+    vfs_node_t* entry_node = vfs_create_node(name, type, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    if (!entry_node) return -1;
+    entry_node->size = entry.file_size;
+    entry_node->ops = node->ops;
+    entry_node->device = node->device;
+    entry_node->mount = node->mount;
+    entry_node->parent = node;
+    if (type == VFS_FILE_TYPE_DIRECTORY) {
+        fat16_dir_private_t* sub = (fat16_dir_private_t*)kmalloc(sizeof(fat16_dir_private_t));
+        if (!sub) {
+            vfs_destroy_node(entry_node);
+            return -1;
+        }
+        memset(sub, 0, sizeof(*sub));
+        sub->magic = FAT16_DIR_PRIVATE_MAGIC;
+        sub->fs = dir_data->fs;
+        sub->first_cluster = entry.first_cluster;
+        sub->entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+        sub->root_dir_sectors = 0; //not used for subdir
+        sub->sectors_per_cluster = dir_data->fs->boot_sector.sectors_per_cluster;
+        entry_node->private_data = sub;
+    } else {
+        fat16_file_private_t* file_data = (fat16_file_private_t*)kmalloc(sizeof(fat16_file_private_t));
+        if (!file_data) {
+            vfs_destroy_node(entry_node);
+            return -1;
+        }
+        memset(file_data, 0, sizeof(fat16_file_private_t));
+        //seed from directory entry so later open/read dont need parent
+        file_data->file.fs = dir_data->fs;
+        memcpy(&file_data->file.entry, &entry, sizeof(entry));
+        file_data->file.current_cluster = entry.first_cluster;
+        file_data->file.current_offset = 0;
+        file_data->file.file_size = entry.file_size;
+        file_data->file.is_open = 0;
+        file_data->dir_first_cluster = dir_data->first_cluster;
+        file_data->is_open = 0;
+        entry_node->private_data = file_data;
     }
 
-    fat16_fs_t* fs = dir_data->fs;
-    if (!fs) {
-        return -1;
-    }
-
-    uint32_t current_logical_index = 0;
-    uint32_t physical_index = 0;
-    uint8_t buffer[512];
-    uint32_t current_sector = 0xFFFFFFFF;
-    
-    while (physical_index < (dir_data->root_dir_sectors * dir_data->entries_per_sector)) {
-        uint32_t sector_index = physical_index / dir_data->entries_per_sector;
-        uint32_t entry_index_in_sector = physical_index % dir_data->entries_per_sector;
-
-        if (sector_index >= dir_data->root_dir_sectors) {
-            return -1; //end of directory
-        }
-
-        //read sector if needed
-        if (sector_index != current_sector) {
-            uint32_t offset = (fs->root_dir_start + sector_index) * 512;
-            if (device_read(fs->device, offset, buffer, 512) != 512) {
-                return -1;
-            }
-            current_sector = sector_index;
-        }
-
-        fat16_dir_entry_t* entry = &((fat16_dir_entry_t*)buffer)[entry_index_in_sector];
-
-        if (entry->filename[0] == 0x00) {
-            return -1; //end of directory no more entries
-        }
-
-        physical_index++;
-
-        if (entry->filename[0] == 0xE5 || (entry->attributes & FAT16_ATTR_VOLUME_ID)) {
-            continue; //skip deleted entries and volume labels
-        }
-
-        if (current_logical_index == index) {
-            //found the entry
-            char name[13];
-            memcpy(name, entry->filename, 8);
-            name[8] = '\0';
-
-            //trim trailing spaces
-            for (int j = 7; j >= 0; j--) {
-                if (name[j] == ' ') name[j] = '\0';
-                else break;
-            }
-
-            //add extension if present
-            if (entry->extension[0] != ' ') {
-                unsigned int len = strlen(name);
-                name[len] = '.';
-                name[len + 1] = '\0';
-
-                for (int j = 0; j < 3 && entry->extension[j] != ' '; j++) {
-                    len = strlen(name);
-                    name[len] = entry->extension[j];
-                    name[len + 1] = '\0';
-                }
-            }
-
-            uint32_t type = (entry->attributes & FAT16_ATTR_DIRECTORY) ?
-                            VFS_FILE_TYPE_DIRECTORY : VFS_FILE_TYPE_FILE;
-
-            vfs_node_t* entry_node = vfs_create_node(name, type, VFS_FLAG_READ | VFS_FLAG_WRITE);
-            if (!entry_node) {
-                return -1;
-            }
-
-            entry_node->size = entry->file_size;
-            entry_node->ops = node->ops;
-            entry_node->device = node->device;
-            entry_node->mount = node->mount;
-            entry_node->parent = node;
-
-            if (type == VFS_FILE_TYPE_FILE) {
-                fat16_file_private_t* file_data = (fat16_file_private_t*)kmalloc(sizeof(fat16_file_private_t));
-                if (!file_data) {
-                    vfs_destroy_node(entry_node);
-                    return -1;
-                }
-                memset(file_data, 0, sizeof(fat16_file_private_t));
-                entry_node->private_data = file_data;
-            }
-
-            *out = entry_node;
-            return 0;
-        }
-
-        current_logical_index++;
-    }
-
-    return -1; //should not be reached
+    *out = entry_node;
+    return 0;
 }
 
-//find a directory entry by name
 static int fat16_vfs_finddir(vfs_node_t* node, const char* name, vfs_node_t** out) {
-    if (!node || !name || !out) {
-        return -1;
-    }
-
+    if (!node || !name || !out) return -1;
     fat16_dir_private_t* dir_data = (fat16_dir_private_t*)node->private_data;
-    if (!dir_data) {
-        return -1;
+    if (!dir_data) return -1;
+    fat16_dir_entry_t entry;
+    if (fat16v_dir_find(dir_data, name, &entry) != 0) return -1;
+    char entry_name[13];
+    fat16v_entry_make_name(&entry, entry_name, sizeof(entry_name));
+    uint32_t type = (entry.attributes & FAT16_ATTR_DIRECTORY) ? VFS_FILE_TYPE_DIRECTORY : VFS_FILE_TYPE_FILE;
+    vfs_node_t* entry_node = vfs_create_node(entry_name, type, VFS_FLAG_READ | VFS_FLAG_WRITE);
+    if (!entry_node) return -1;
+    entry_node->size = entry.file_size;
+    entry_node->ops = node->ops;
+    entry_node->device = node->device;
+    entry_node->mount = node->mount;
+    entry_node->parent = node;
+    if (type == VFS_FILE_TYPE_DIRECTORY) {
+        fat16_dir_private_t* sub = (fat16_dir_private_t*)kmalloc(sizeof(fat16_dir_private_t));
+        if (!sub) {
+            vfs_destroy_node(entry_node);
+            return -1;
+        }
+        memset(sub, 0, sizeof(*sub));
+        sub->magic = FAT16_DIR_PRIVATE_MAGIC;
+        sub->fs = dir_data->fs;
+        sub->first_cluster = entry.first_cluster;
+        sub->entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+        sub->root_dir_sectors = 0;
+        sub->sectors_per_cluster = dir_data->fs->boot_sector.sectors_per_cluster;
+        entry_node->private_data = sub;
+    } else {
+        fat16_file_private_t* file_data = (fat16_file_private_t*)kmalloc(sizeof(fat16_file_private_t));
+        if (!file_data) {
+            vfs_destroy_node(entry_node);
+            return -1;
+        }
+        memset(file_data, 0, sizeof(fat16_file_private_t));
+        //seed from directory entry so later open/read don't need parent
+        file_data->file.fs = dir_data->fs;
+        memcpy(&file_data->file.entry, &entry, sizeof(entry));
+        file_data->file.current_cluster = entry.first_cluster;
+        file_data->file.current_offset = 0;
+        file_data->file.file_size = entry.file_size;
+        file_data->file.is_open = 0;
+        file_data->dir_first_cluster = dir_data->first_cluster;
+        file_data->is_open = 0;
+        entry_node->private_data = file_data;
     }
-
-    fat16_fs_t* fs = dir_data->fs;
-    if (!fs) {
-        return -1;
-    }
-
-    uint8_t buffer[512];
-    uint32_t current_sector = 0xFFFFFFFF;
-    
-    //search through all directory entries directly
-    for (uint32_t physical_index = 0; physical_index < (dir_data->root_dir_sectors * dir_data->entries_per_sector); physical_index++) {
-        uint32_t sector_index = physical_index / dir_data->entries_per_sector;
-        uint32_t entry_index_in_sector = physical_index % dir_data->entries_per_sector;
-
-        if (sector_index >= dir_data->root_dir_sectors) {
-            break; //end of directory
-        }
-
-        //read sector if needed
-        if (sector_index != current_sector) {
-            uint32_t offset = (fs->root_dir_start + sector_index) * 512;
-            if (device_read(fs->device, offset, buffer, 512) != 512) {
-                return -1;
-            }
-            current_sector = sector_index;
-        }
-
-        fat16_dir_entry_t* entry = &((fat16_dir_entry_t*)buffer)[entry_index_in_sector];
-
-        if (entry->filename[0] == 0x00) {
-            break; //end of directory no more entries
-        }
-
-        if (entry->filename[0] == 0xE5 || (entry->attributes & FAT16_ATTR_VOLUME_ID)) {
-            continue; //skip deleted entries and volume labels
-        }
-
-        //extract filename
-        char entry_name[13];
-        memcpy(entry_name, entry->filename, 8);
-        entry_name[8] = '\0';
-
-        //trim trailing spaces
-        for (int j = 7; j >= 0; j--) {
-            if (entry_name[j] == ' ') entry_name[j] = '\0';
-            else break;
-        }
-
-        //add extension if present
-        if (entry->extension[0] != ' ') {
-            unsigned int len = strlen(entry_name);
-            entry_name[len] = '.';
-            entry_name[len + 1] = '\0';
-
-            for (int j = 0; j < 3 && entry->extension[j] != ' '; j++) {
-                len = strlen(entry_name);
-                entry_name[len] = entry->extension[j];
-                entry_name[len + 1] = '\0';
-            }
-        }
-
-        if (strcmp(entry_name, name) == 0) {
-            //found the file create node
-            uint32_t type = (entry->attributes & FAT16_ATTR_DIRECTORY) ?
-                            VFS_FILE_TYPE_DIRECTORY : VFS_FILE_TYPE_FILE;
-
-            vfs_node_t* entry_node = vfs_create_node(entry_name, type, VFS_FLAG_READ | VFS_FLAG_WRITE);
-            if (!entry_node) {
-                return -1;
-            }
-
-            entry_node->size = entry->file_size;
-            entry_node->ops = node->ops;
-            entry_node->device = node->device;
-            entry_node->mount = node->mount;
-            entry_node->parent = node;
-
-            if (type == VFS_FILE_TYPE_FILE) {
-                fat16_file_private_t* file_data = (fat16_file_private_t*)kmalloc(sizeof(fat16_file_private_t));
-                if (!file_data) {
-                    vfs_destroy_node(entry_node);
-                    return -1;
-                }
-                memset(file_data, 0, sizeof(fat16_file_private_t));
-                entry_node->private_data = file_data;
-            }
-
-            *out = entry_node;
-            return 0;
-        }
-    }
-
-    return -1; //not found
+    *out = entry_node;
+    return 0;
 }
 
-//get file size
 static int fat16_vfs_get_size(vfs_node_t* node) {
-    if (!node) {
-        return -1;
-    }
-
-    return node->size;
+    if (!node) return -1;
+    return (int)node->size;
 }
 
 //IOCTL operation
@@ -604,4 +699,35 @@ static int fat16_vfs_ioctl(vfs_node_t* node, uint32_t request, void* arg) {
     (void)arg;
 
     return -1;
+}
+
+//create root VFS node for mounted FAT16 filesystem
+vfs_node_t* fat16_get_root(void* mount_data) {
+    if (!mount_data) return NULL;
+
+    fat16_fs_t* fs = (fat16_fs_t*)mount_data;
+
+    vfs_node_t* root = vfs_create_node("fat16_root", VFS_FILE_TYPE_DIRECTORY, 0);
+    if (!root) return NULL;
+
+    //set up private data with magic number for proper type detection
+    fat16_dir_private_t* root_data = (fat16_dir_private_t*)kmalloc(sizeof(fat16_dir_private_t));
+    if (!root_data) {
+        vfs_destroy_node(root);
+        return NULL;
+    }
+
+    memset(root_data, 0, sizeof(fat16_dir_private_t));
+    root_data->magic = FAT16_DIR_PRIVATE_MAGIC;
+    root_data->fs = fs;
+    root_data->first_cluster = 0; //root directory
+    root_data->entries_per_sector = 512 / sizeof(fat16_dir_entry_t);
+    root_data->root_dir_sectors = (fs->boot_sector.root_entries * sizeof(fat16_dir_entry_t) + 511) / 512;
+    root_data->sectors_per_cluster = fs->boot_sector.sectors_per_cluster;
+
+    root->private_data = root_data;
+    root->ops = &fat16_vfs_ops;
+    root->mode = 0755;
+
+    return root;
 }

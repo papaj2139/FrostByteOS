@@ -2,6 +2,7 @@
 #define SERIAL_H
 
 #include <stdint.h>
+#include "../debug.h"
 
 //serial port definitions
 #define SERIAL_COM1_BASE    0x3F8
@@ -26,8 +27,16 @@ void serial_write_char(char c);
 void serial_write_string(const char* str);
 void serial_printf(const char* format, ...);
 
+//register a serial dvice with device manager returns 0 on success
+int serial_register_device(void);
+
 //macros
+#if DEBUG_ENABLED
 #define DEBUG_PRINT(str) serial_write_string("[DEBUG] " str "\n")
 #define DEBUG_PRINTF(fmt, ...) serial_printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define DEBUG_PRINT(str) do { (void)sizeof(str); } while(0)
+#define DEBUG_PRINTF(fmt, ...) do { (void)sizeof(fmt); } while(0)
+#endif
 
 #endif

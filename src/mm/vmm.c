@@ -13,29 +13,114 @@ static page_directory_t current_directory = 0;
 
 extern void enable_paging(uint32_t directory_phys);
 extern void flush_tlb(void);
+extern void switch_cr3(uint32_t directory_phys);
+
+static page_table_t map_pt_temp(uint32_t pt_phys, uint32_t* saved_entry_out);
+static void unmap_pt_temp(uint32_t saved_entry);
+
+//single temporary mapping slot for kernel helpers
+#define TEMP_MAP_VA 0x007FD000
 
 //map a physical page temporarily at a scratch VA (<8MB identity-mapped PDE/PT)
 //and zero it hen unmap the scratch VA this avoids relying on PHYSICAL_TO_VIRTUAL
 //for pages beyond the pre-mapped higher-half range
 static void zero_phys_page_temp(uint32_t phys) {
-    const uint32_t SCRATCH_VA = 0x007FF000; //within initial 0 to 8MB identity mapping
-    //use current (kernel) directory to map scratch VA to phys
-    uint32_t pd_i = PAGE_DIRECTORY_INDEX(SCRATCH_VA);
-    uint32_t pt_i = PAGE_TABLE_INDEX(SCRATCH_VA);
-
-    page_directory_t dir = current_directory ? current_directory : kernel_directory;
-    if (!dir) return;
-    if (!(dir[pd_i] & PAGE_PRESENT)) {
-        //should not happen for 0 to 8MB identity mapping
-        return;
+    //map target page into TEMP_MAP_VA safely, zero it then unmap
+    uint32_t eflags_save; 
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    uint32_t saved_entry = 0;
+    void* va = vmm_map_temp_page(phys, &saved_entry);
+    if (va) {
+        memset(va, 0, PAGE_SIZE);
+        vmm_unmap_temp_page(saved_entry);
     }
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
+}
+
+void* vmm_map_temp_page(uint32_t phys_addr, uint32_t* saved_entry_out) {
+    page_directory_t dir = current_directory ? current_directory : kernel_directory;
+    if (!dir) return NULL;
+
+    uint32_t pd_i = PAGE_DIRECTORY_INDEX(TEMP_MAP_VA);
+    uint32_t pt_i = PAGE_TABLE_INDEX(TEMP_MAP_VA);
+
+    if (!(dir[pd_i] & PAGE_PRESENT)) {
+        return NULL;
+    }
+
+    //avoid preemption while toggling TEMP_MAP_VA PTE
+    uint32_t eflags_save; 
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+
     uint32_t pt_phys = dir[pd_i] & ~0xFFF;
     page_table_t pt = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
-    pt[pt_i] = (phys & ~0xFFF) | PAGE_PRESENT | PAGE_WRITABLE;
+
+    uint32_t old = pt[pt_i];
+    pt[pt_i] = (phys_addr & ~0xFFF) | PAGE_PRESENT | PAGE_WRITABLE;
     flush_tlb();
-    memset((void*)SCRATCH_VA, 0, PAGE_SIZE);
-    pt[pt_i] = 0;
+
+    if (saved_entry_out) {
+        *saved_entry_out = old;
+    }
+
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
+    return (void*)TEMP_MAP_VA;
+}
+
+void vmm_unmap_temp_page(uint32_t saved_entry) {
+    page_directory_t dir = current_directory ? current_directory : kernel_directory;
+    if (!dir) return;
+
+    uint32_t pd_i = PAGE_DIRECTORY_INDEX(TEMP_MAP_VA);
+    uint32_t pt_i = PAGE_TABLE_INDEX(TEMP_MAP_VA);
+
+    if (!(dir[pd_i] & PAGE_PRESENT)) {
+        return;
+    }
+
+    uint32_t eflags_save; 
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    uint32_t pt_phys = dir[pd_i] & ~0xFFF;
+    page_table_t pt = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+
+    pt[pt_i] = saved_entry;
     flush_tlb();
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
+}
+
+int vmm_unmap_page_in_directory(page_directory_t directory, uint32_t virtual_addr) {
+    if (!directory) return -1;
+
+    uint32_t pd_index = PAGE_DIRECTORY_INDEX(virtual_addr);
+    uint32_t pt_index = PAGE_TABLE_INDEX(virtual_addr);
+
+    if (!(directory[pd_index] & PAGE_PRESENT)) {
+        return -1;
+    }
+
+    uint32_t pt_phys = directory[pd_index] & ~0xFFF;
+    //protect PT scratch mapping against interrupts while active
+    uint32_t eflags_save; 
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) { 
+        if (eflags_save & 0x200) __asm__ volatile ("sti"); 
+        return -1; 
+    }
+
+    if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        unmap_pt_temp(saved_entry);
+        if (eflags_save & 0x200) __asm__ volatile ("sti");
+        return -1;
+    }
+
+    page_table[pt_index] = 0;
+    unmap_pt_temp(saved_entry);
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
+    flush_tlb();
+
+    return 0;
 }
 
 //temporarily map a page table physical page into a scratch VA and return a pointer to it
@@ -53,11 +138,14 @@ static page_table_t map_pt_temp(uint32_t pt_phys, uint32_t* saved_entry_out) {
     uint32_t pt_i = PAGE_TABLE_INDEX(PT_SCRATCH);
     if (!(dir[pd_i] & PAGE_PRESENT)) return 0;
     uint32_t id_pt_phys = dir[pd_i] & ~0xFFF;
+    //protect retargeting of PT_SCRATCH against preemption
+    uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
     page_table_t id_pt = (page_table_t)PHYSICAL_TO_VIRTUAL(id_pt_phys);
     uint32_t old = id_pt[pt_i];
     id_pt[pt_i] = (pt_phys & ~0xFFF) | PAGE_PRESENT | PAGE_WRITABLE;
     flush_tlb();
     if (saved_entry_out) *saved_entry_out = old;
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
     return (page_table_t)PT_SCRATCH;
 }
 
@@ -69,9 +157,11 @@ static void unmap_pt_temp(uint32_t saved_entry) {
     uint32_t pd_i = PAGE_DIRECTORY_INDEX(PT_SCRATCH);
     uint32_t pt_i = PAGE_TABLE_INDEX(PT_SCRATCH);
     uint32_t id_pt_phys = dir[pd_i] & ~0xFFF;
+    uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
     page_table_t id_pt = (page_table_t)PHYSICAL_TO_VIRTUAL(id_pt_phys);
     id_pt[pt_i] = saved_entry;
     flush_tlb();
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
 }
 
 //this function is used before paging is enabled to map pages directly using physical addresses
@@ -164,18 +254,31 @@ int vmm_map_page(uint32_t virtual_addr, uint32_t physical_addr, uint32_t flags) 
 
         directory[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
 
-        //clear the new page table via scratch mapping
-        zero_phys_page_temp(pt_phys);
+        //clear the new page table using PT scratch mapping with interrupts disabled
+        uint32_t eflags_save_pt; 
+        __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save_pt) :: "memory");
+        uint32_t saved_entry_pt;
+        page_table_t new_pt = map_pt_temp(pt_phys, &saved_entry_pt);
+        if (!new_pt) {
+            if (eflags_save_pt & 0x200) __asm__ volatile ("sti");
+            pmm_free_page(pt_phys);
+            return -1;
+        }
+        memset(new_pt, 0, PAGE_SIZE);
+        unmap_pt_temp(saved_entry_pt);
+        if (eflags_save_pt & 0x200) __asm__ volatile ("sti");
     }
 
     //get page table and update via safe mapping
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
+    uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
     uint32_t saved_entry;
     page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
-    if (!page_table) return -1;
+    if (!page_table) { if (eflags_save & 0x200) __asm__ volatile ("sti"); return -1; }
     //map the page
     page_table[pt_index] = (physical_addr & ~0xFFF) | flags;
     unmap_pt_temp(saved_entry);
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
 
     //flush TLB entry
     flush_tlb();
@@ -195,9 +298,14 @@ int vmm_unmap_page(uint32_t virtual_addr) {
     }
 
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+    uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) { if (eflags_save & 0x200) __asm__ volatile ("sti"); return -1; }
 
     if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        unmap_pt_temp(saved_entry);
+        if (eflags_save & 0x200) __asm__ volatile ("sti");
         return -1; //page not mapped
     }
 
@@ -206,6 +314,8 @@ int vmm_unmap_page(uint32_t virtual_addr) {
 
     //clear page table entry
     page_table[pt_index] = 0;
+    unmap_pt_temp(saved_entry);
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
 
     //free physical page
     pmm_free_page(phys_addr);
@@ -228,14 +338,22 @@ int vmm_unmap_page_nofree(uint32_t virtual_addr) {
     }
 
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+    uint32_t eflags_save; 
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) { if (eflags_save & 0x200) __asm__ volatile ("sti"); return -1; }
 
     if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        unmap_pt_temp(saved_entry);
+        if (eflags_save & 0x200) __asm__ volatile ("sti");
         return -1; //page not mapped
     }
 
     //clear page table entry without freeing the physical frame
     page_table[pt_index] = 0;
+    unmap_pt_temp(saved_entry);
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
 
     //flush TLB
     flush_tlb();
@@ -255,14 +373,25 @@ uint32_t vmm_get_physical_addr(uint32_t virtual_addr) {
     }
 
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
+    uint32_t eflags_save;
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) { 
+        if (eflags_save & 0x200) __asm__ volatile ("sti"); 
+        return 0; 
+    }
 
     if (!(page_table[pt_index] & PAGE_PRESENT)) {
+        unmap_pt_temp(saved_entry);
+        if (eflags_save & 0x200) __asm__ volatile ("sti");
         return 0; //not mapped
     }
 
     uint32_t phys_page = page_table[pt_index] & ~0xFFF;
     uint32_t offset = virtual_addr & 0xFFF;
+    unmap_pt_temp(saved_entry);
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
 
     return phys_page + offset;
 }
@@ -271,29 +400,53 @@ page_directory_t vmm_create_directory(void) {
     uint32_t dir_phys = pmm_alloc_page();
     if (!dir_phys) return 0;
 
-    page_directory_t directory = (page_directory_t)PHYSICAL_TO_VIRTUAL(dir_phys);
-    //ensure the higher-half VA for this physical page is actually mapped
-    //since we only pre-mapped the first 8MB.
-    (void)vmm_map_page((uint32_t)directory, dir_phys, PAGE_PRESENT | PAGE_WRITABLE);
-    memset(directory, 0, PAGE_SIZE);
+    //calculate the virtual address for this page directory
+    page_directory_t dir_virt = (page_directory_t)PHYSICAL_TO_VIRTUAL(dir_phys);
 
-    //copy kernel mappings (higher half)
-    for (int i = 768; i < 1024; i++) { //768 = 3GB / 4MB
-        directory[i] = kernel_directory[i];
+    //map the page directory into the kernel address space so we can access it
+    //save current directory and temporarily switch to kernel directory
+    page_directory_t saved_dir = current_directory;
+    current_directory = kernel_directory;
+    
+    //this ensures the returned pointer is usable in kernel space
+    int map_result = vmm_map_page((uint32_t)dir_virt, dir_phys, PAGE_PRESENT | PAGE_WRITABLE);
+    
+    //restore previous directory
+    current_directory = saved_dir;
+    
+    if (map_result != 0) {
+        pmm_free_page(dir_phys);
+        return 0;
     }
 
-    //also copy the identity-mapped PDEs for 0..8MB used by scratch mapping helpers
-    //PDE size is 4MB so indices 0 and 1 cover 0..8MB
-    directory[0] = kernel_directory[0];
-    directory[1] = kernel_directory[1];
+    //now we can safely access it via the virtual address
+    memset(dir_virt, 0, PAGE_SIZE);
 
-    return directory;
+    //copy kernel mappings (higher half) but only if they're present
+    for (int i = 768; i < 1024; i++) { //768 = 3GB / 4MB
+        if (kernel_directory[i] & PAGE_PRESENT) {
+            dir_virt[i] = kernel_directory[i];
+        }
+    }
+
+    //copy the identity-mapped PDEs for 0..8MB used by scratch mapping helpers
+    //PDE size is 4MB so indices 0 and 1 cover 0..8MB
+    if (kernel_directory[0] & PAGE_PRESENT) {
+        dir_virt[0] = kernel_directory[0];
+    }
+    if (kernel_directory[1] & PAGE_PRESENT) {
+        dir_virt[1] = kernel_directory[1];
+    }
+
+    return dir_virt;
 }
 
 void vmm_switch_directory(page_directory_t directory) {
+    if (!directory) return;
+    if (current_directory == directory) return; //avoid redundant TLB flush
     current_directory = directory;
     uint32_t dir_phys = VIRTUAL_TO_PHYSICAL((uint32_t)directory);
-    enable_paging(dir_phys);
+    switch_cr3(dir_phys);
 }
 
 
@@ -306,27 +459,40 @@ int vmm_map_page_in_directory(page_directory_t directory, uint32_t virtual_addr,
         return -1; //invalid directory
     }
 
-    //check if page table exists
+    //ensure page table exists
     if (!(directory[pd_index] & PAGE_PRESENT)) {
-        //allocate new page table
         uint32_t pt_phys = pmm_alloc_page();
         if (!pt_phys) {
             return -1; //out of memory
         }
-
         directory[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE | (flags & PAGE_USER);
-
-        //clear the new page table
-        page_table_t pt = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
-        memset(pt, 0, PAGE_SIZE);
+        //clear the new page table using scratch mapping to avoid higher-half dependency
+        uint32_t eflags_save; __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+        uint32_t saved_entry;
+        page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+        if (!page_table) { 
+            if (eflags_save & 0x200) __asm__ volatile ("sti"); 
+            return -1; 
+        }
+        memset(page_table, 0, PAGE_SIZE);
+        unmap_pt_temp(saved_entry);
+        if (eflags_save & 0x200) __asm__ volatile ("sti");
     }
 
-    //get page table
+    //get page table via scratch mapping (robust even if pt_phys is outside higher-half direct map)
     uint32_t pt_phys = directory[pd_index] & ~0xFFF;
-    page_table_t page_table = (page_table_t)PHYSICAL_TO_VIRTUAL(pt_phys);
-
+    uint32_t eflags_save; 
+    __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save) :: "memory");
+    uint32_t saved_entry;
+    page_table_t page_table = map_pt_temp(pt_phys, &saved_entry);
+    if (!page_table) { 
+        if (eflags_save & 0x200) __asm__ volatile ("sti"); 
+        return -1; 
+    }
     //map the page
     page_table[pt_index] = (physical_addr & ~0xFFF) | flags;
+    unmap_pt_temp(saved_entry);
+    if (eflags_save & 0x200) __asm__ volatile ("sti");
 
     return 0;
 }
@@ -337,7 +503,7 @@ void vmm_map_kernel_space(page_directory_t directory) {
         return;
     }
 
-    //copy kernel mappings (higher half  starting from 3GB)
+    //copy kernel mappings (higher half starting from 3GB) by mirroring PDEs
     for (int i = 768; i < 1024; i++) { //768 = 3GB / 4MB
         directory[i] = kernel_directory[i];
     }
@@ -348,21 +514,47 @@ page_directory_t vmm_get_kernel_directory(void) {
     return kernel_directory;
 }
 
+//get the current active page directory
+page_directory_t vmm_get_current_directory(void) {
+    return current_directory ? current_directory : kernel_directory;
+}
+
 //destroy a page directory and free its resources
 void vmm_destroy_directory(page_directory_t directory) {
     if (!directory || directory == kernel_directory) {
         return; //don't destroy kernel directory or NULL pointer
     }
 
-    //free all user page tables (not kernel ones)
+    //walk all user PDEs and free mapped pages and their page tables
     for (int i = 0; i < 768; i++) { //only user space (0-3GB)
         if (!(directory[i] & PAGE_PRESENT)) continue;
         //do NOT free shared identity-mapped PTs (0..8MB) copied from kernel dir
+        //PDE size is 4MB so indices 0 and 1 cover 0..8MB
         if (i < 2 && kernel_directory && directory[i] == kernel_directory[i]) {
             continue;
         }
         uint32_t pt_phys = directory[i] & ~0xFFF;
+        //map the page table temporarily to walk PTEs
+        uint32_t eflags_save_pt; 
+        __asm__ volatile ("pushf; pop %0; cli" : "=r"(eflags_save_pt) :: "memory");
+        uint32_t saved_entry;
+        page_table_t pt = map_pt_temp(pt_phys, &saved_entry);
+        if (pt) {
+            for (int j = 0; j < 1024; j++) {
+                uint32_t pte = pt[j];
+                if (pte & PAGE_PRESENT) {
+                    uint32_t page_phys = pte & ~0xFFF;
+                    //free the mapped physical page frame
+                    pmm_free_page(page_phys);
+                    pt[j] = 0;
+                }
+            }
+            unmap_pt_temp(saved_entry);
+            if (eflags_save_pt & 0x200) __asm__ volatile ("sti");
+        }
+        //free the page table frame itself
         pmm_free_page(pt_phys);
+        directory[i] = 0;
     }
 
     //free the page directory itself

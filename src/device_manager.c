@@ -266,3 +266,19 @@ int device_ioctl(device_t* device, uint32_t cmd, void* arg) {
     
     return device->ops->ioctl(device, cmd, arg);
 }
+
+//enumerate devices by index (0-based) in registration order
+int device_enumerate(uint32_t index, device_t** out) {
+    if (!out) return -1;
+    device_t* cur = device_list_head;
+    while (cur && index > 0) {
+        cur = cur->next;
+        index--;
+    }
+    if (!cur) {
+        *out = NULL;
+        return -1;
+    }
+    *out = cur;
+    return 0;
+}

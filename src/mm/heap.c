@@ -92,7 +92,16 @@ void* kmalloc(size_t size) {
             current->free = 0;
             total_allocated += current->size;
 
-            return (void*)((uint8_t*)current + sizeof(heap_block_t));
+            void* ret_ptr = (void*)((uint8_t*)current + sizeof(heap_block_t));
+            //verify the entire block is within mapped heap range
+            uint32_t block_end = (uint32_t)ret_ptr + size;
+            if (block_end > heap_end) {
+                //block extends beyond heap this shouldn't happen
+                current->free = 1; //mark as free again
+                total_allocated -= current->size;
+                return 0;
+            }
+            return ret_ptr;
         }
         current = current->next;
     }
@@ -122,7 +131,16 @@ void* kmalloc(size_t size) {
 
     total_allocated += size;
 
-    return (void*)((uint8_t*)new_block + sizeof(heap_block_t));
+    void* ret_ptr = (void*)((uint8_t*)new_block + sizeof(heap_block_t));
+    //verify the entire block is within mapped heap range
+    uint32_t block_end = (uint32_t)ret_ptr + size;
+    if (block_end > heap_end) {
+        //this shouldn't happen after expansion but safety check
+        new_block->free = 1;
+        total_allocated -= size;
+        return 0;
+    }
+    return ret_ptr;
 }
 
 void kfree(void* ptr) {
@@ -166,3 +184,21 @@ void heap_get_stats(heap_stats_t* stats) {
         current = current->next;
     }
 }
+
+//aligned allocation  (fallback kmalloc for now)
+void* kmalloc_aligned(size_t size, uint32_t alignment) {
+    (void)alignment;
+    return kmalloc(size);
+}
+
+//allocate memory and also return the physical address of the first byte
+void* kmalloc_physical(size_t size, uint32_t* physical_addr) {
+    void* p = kmalloc(size);
+    if (!p) return 0;
+    if (physical_addr) {
+        //translate the first byte to physical address
+        *physical_addr = vmm_get_physical_addr((uint32_t)p);
+    }
+    return p;
+}
+

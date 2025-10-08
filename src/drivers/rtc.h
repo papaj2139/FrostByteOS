@@ -18,4 +18,7 @@ static inline void rtc_init(void) {}
 //read current time from CMOS RTC returns 1 on success, 0 on failure
 int rtc_read(rtc_time_t *out);
 
+//register RTC as a device with device_manager
+int rtc_register_device(void);
+
 #endif

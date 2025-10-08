@@ -20,7 +20,7 @@ typedef struct {
     device_t* device;
     union {
         fat16_fs_t fat16;
-
+        void* fat32_mount;  //pointer to fat32_mount_t
     } fs_data;
 } filesystem_t;
 
